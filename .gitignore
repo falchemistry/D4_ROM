@@ -1,0 +1,9 @@
+# Credentials -- never commit. Recreate locally from your own OBS
+# WebSocket settings (Tools > WebSocket Server Settings).
+scripts/obs_config.txt
+
+# Runtime state files written fresh by every run -- not meaningful to
+# track, just scratch output.
+scripts/_playback_state.txt
+scripts/_frame_range_state.txt
+d4_anim_sample/_cache_build_progress.txt
