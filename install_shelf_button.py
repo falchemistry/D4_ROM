@@ -28,7 +28,7 @@ for existing in cmds.shelfLayout(current_shelf, query=True, childArray=True) or 
 cmds.shelfButton(
     parent=current_shelf,
     label='ROM Port',
-    annotation='Open the Maya command port (127.0.0.1:7001) the d4 ROM tools need. Click once per Maya session.',
+    annotation='Open the Maya command port (127.0.0.1:7001) the D4 ROM tools need. Click once per Maya session.',
     image1='commandButton.png',
     command=BUTTON_COMMAND,
     sourceType='python',

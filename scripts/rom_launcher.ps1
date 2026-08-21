@@ -1,4 +1,4 @@
-# WPF launcher for the d4 ROM capture pipeline -- replaces double-clicking
+# WPF launcher for the D4 ROM capture pipeline -- replaces double-clicking
 # run_front_back.bat / run_left_right.bat / capture_front_back.bat /
 # capture_left_right.bat with a single window (axis choice + Preview /
 # Start Recording buttons), plus a Reset button
@@ -33,7 +33,7 @@ $script:ToolVersion = "1.0.0"
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="d4 ROM Capture" Width="420" Height="600" MinWidth="380" MinHeight="450"
+        Title="D4 ROM Capture" Width="420" Height="600" MinWidth="380" MinHeight="450"
         ResizeMode="CanResize" Background="#FF3C3C3C">
     <Window.Resources>
         <!-- Same dark palette as MayaSkinningCheck/MayaShelves' shared
@@ -2072,7 +2072,7 @@ $guideButton.Add_Click({
             )
         }
     )
-    Show-DarkGuide -Title "How to Use d4 ROM Capture" -Tldr $guideTldr -Sections $guideSections
+    Show-DarkGuide -Title "How to Use D4 ROM Capture" -Tldr $guideTldr -Sections $guideSections
 })
 
 $copySnippetButton.Add_Click({
