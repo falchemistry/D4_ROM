@@ -133,9 +133,11 @@ def load_cache():
         # Same fix and reasoning as maya_key_from_cache.py's own copy of
         # this check (2026-08-22 design: never quietly continue into a
         # broken recording). See maya_camera_panels.py's own copy of this
-        # for the full comment.
-        print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
-        raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
+        # for the full comment. Marker lives in the raised exception's
+        # message, not a separate print() -- print() never relays through
+        # Maya's command port, so the print()+raise split left this
+        # detection dead on the PowerShell side.
+        raise RuntimeError('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
     with open(path) as f:
         return json.load(f)
 
@@ -412,5 +414,20 @@ def open_view_panels():
     cmds.refresh(force=True)
 
 
-open_view_panels()
+try:
+    open_view_panels()
+except Exception:
+    # hide_model_editor_bars() runs first inside open_view_panels() and is a
+    # GLOBAL toggle across every model panel in the scene, not just these
+    # capture panels (see maya_clean_reset.py's comment on
+    # toggleModelEditorBarsInAllPanels). If anything after it fails --
+    # confirmed live: a scene with no animation raising CAPTURE_ABORT out of
+    # load_cache() -- the user's own main viewport was left with its icon
+    # toolbar hidden and no visual cue why, since the trailing reset step
+    # never runs on an aborted capture. Restore it here before the
+    # exception propagates. collapse=0 on an already-expanded frameLayout
+    # is a no-op, so this is safe even if hide_model_editor_bars() never
+    # got to run.
+    mel.eval('toggleModelEditorBarsInAllPanels(0)')
+    raise
 print('VIEW_PANELS_OK')

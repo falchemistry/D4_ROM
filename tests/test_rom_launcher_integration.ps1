@@ -143,7 +143,7 @@ Check "Show-DarkInput -Masked uses the real PasswordBox and returns its value, n
     if ($result -ne "typed_masked_password") { throw "expected the PasswordBox's value returned, got '$result'" }
 }
 
-Check "Show-DarkGuide is non-modal (.Show(), not .ShowDialog()), displays the given message, and its real Close button actually closes it" {
+Check "Show-DarkGuide is non-modal (.Show(), not .ShowDialog()), displays the given message, and closing it (native title-bar close, no custom Close button) clears the tracked window" {
     # No DispatcherTimer/nested-pump trick needed here the way
     # Show-DarkConfirm/Show-DarkInput's tests still need one: those block
     # on ShowDialog()'s own nested message loop, so a timer has to fire
@@ -158,7 +158,8 @@ Check "Show-DarkGuide is non-modal (.Show(), not .ShowDialog()), displays the gi
     if (-not $dlg.IsVisible) { throw "expected the guide window to actually be visible" }
     $tldrText = $dlg.FindName("TldrText")
     if ($tldrText.Text -notmatch "test guide content") { throw "expected the guide TLDR text to be set, got: $($tldrText.Text)" }
-    $dlg.FindName("CloseButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($dlg.FindName("CloseButton") -ne $null) { throw "expected no custom Close button -- the native title-bar close is the only way to close this window now" }
+    $dlg.Close()
     if ($script:openGuideWindow -ne $null) { throw "expected `$script:openGuideWindow to clear once the window is actually closed" }
 }
 
@@ -171,7 +172,7 @@ Check "Show-DarkGuide reuses one instance -- calling it again while already open
     if ($script:openGuideWindow -ne $firstWindow) { throw "expected the SAME window instance reused, not a new one created while one is already open" }
     if ($firstWindow.Title -ne "FirstGuideCall") { throw "expected the existing window's own title/content left untouched by the second, suppressed call" }
 
-    $firstWindow.FindName("CloseButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $firstWindow.Close()
     if ($script:openGuideWindow -ne $null) { throw "expected `$script:openGuideWindow to clear once closed" }
 }
 
@@ -191,6 +192,148 @@ Check "clicking the Guide button opens Show-DarkGuide with real usage content, s
     if (-not $captureSection) { throw "expected a CAPTURE section" }
     $matchesStartRecording = $captureSection.Steps | Where-Object { $_.Lead -match "Start Recording" -or $_.Text -match "Start Recording" }
     if (-not $matchesStartRecording) { throw "expected the CAPTURE section to mention Start Recording" }
+    foreach ($section in $script:guideShownSections) {
+        if (-not $section.ImagePath) { throw "expected every guide section to carry a real screenshot ImagePath, '$($section.Header)' had none" }
+        if (-not (Test-Path $section.ImagePath)) { throw "guide section '$($section.Header)' points at a missing image file: $($section.ImagePath)" }
+    }
+}
+
+Check "Show-DarkGuide opens on page 1 of N (the USAGE page), with Back disabled and Next enabled" {
+    $sections = @(
+        [PSCustomObject]@{ Header = "SECTION A"; Steps = @(@{ Lead = "Step:"; Text = "a" }) },
+        [PSCustomObject]@{ Header = "SECTION B"; Steps = @(@{ Lead = "Step:"; Text = "b" }) }
+    )
+    Show-DarkGuide -Title "RegressionTestGuidePagingTitle" -Tldr "usage text" -Sections $sections
+    try {
+        $guideWin = $script:openGuideWindow
+        if ($guideWin -eq $null) { throw "expected Show-DarkGuide to track the open window" }
+        if ($guideWin.FindName("PageLabel").Text -ne "Page 1 of 3") { throw "expected 'Page 1 of 3' (USAGE + 2 sections), got '$($guideWin.FindName('PageLabel').Text)'" }
+        if ($guideWin.FindName("BackButton").IsEnabled) { throw "expected Back disabled on the first page" }
+        if (-not $guideWin.FindName("NextButton").IsEnabled) { throw "expected Next enabled when more pages follow" }
+        if ($guideWin.FindName("TldrText").Text -ne "usage text") { throw "expected the USAGE page's own TldrText set" }
+        $pageHostChildren = $guideWin.FindName("PageHost").Children
+        if ($pageHostChildren.Count -ne 1) { throw "expected exactly one page's content showing at a time, got $($pageHostChildren.Count)" }
+        if (-not ($pageHostChildren[0].Children -contains $guideWin.FindName("TldrText"))) { throw "expected the USAGE page (containing TldrText) to be the one currently showing" }
+    } finally {
+        $guideWin.Close()
+    }
+}
+
+Check "Show-DarkGuide's Next/Back buttons actually flip pages, and the section's image renders on its own page" {
+    $imgPath = Join-Path $ScriptDir "guide_images\guide_settings_tab.png"
+    if (-not (Test-Path $imgPath)) { throw "test setup failed -- expected the real guide image to exist at $imgPath" }
+    $sections = @([PSCustomObject]@{ Header = "TEST SECTION"; ImagePath = $imgPath; Steps = @(@{ Lead = "Step:"; Text = "text" }) })
+    Show-DarkGuide -Title "RegressionTestGuideImageTitle" -Tldr "test" -Sections $sections
+    try {
+        $guideWin = $script:openGuideWindow
+        if ($guideWin -eq $null) { throw "expected Show-DarkGuide to track the open window" }
+        if ($guideWin.FindName("PageLabel").Text -ne "Page 1 of 2") { throw "expected 'Page 1 of 2' (USAGE + 1 section), got '$($guideWin.FindName('PageLabel').Text)'" }
+
+        $guideWin.FindName("NextButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        if ($guideWin.FindName("PageLabel").Text -ne "Page 2 of 2") { throw "expected Next to advance to 'Page 2 of 2', got '$($guideWin.FindName('PageLabel').Text)'" }
+        if (-not $guideWin.FindName("BackButton").IsEnabled) { throw "expected Back enabled once past the first page" }
+        if ($guideWin.FindName("NextButton").IsEnabled) { throw "expected Next disabled on the last page" }
+
+        $currentPagePanel = $guideWin.FindName("PageHost").Children[0]
+        $imageBorder = $currentPagePanel.Children | Where-Object { $_ -is [System.Windows.Controls.Border] } | Select-Object -First 1
+        if ($imageBorder -eq $null) { throw "expected an Image Border on the section's own page" }
+        if ($imageBorder.Visibility -ne [System.Windows.Visibility]::Visible) { throw "expected the image border visible" }
+        if ($imageBorder.Child.Source -eq $null) { throw "expected the Image control to have a loaded BitmapImage source" }
+
+        $guideWin.FindName("BackButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        if ($guideWin.FindName("PageLabel").Text -ne "Page 1 of 2") { throw "expected Back to return to 'Page 1 of 2', got '$($guideWin.FindName('PageLabel').Text)'" }
+        if ($guideWin.FindName("BackButton").IsEnabled) { throw "expected Back disabled again after returning to the first page" }
+    } finally {
+        $guideWin.Close()
+    }
+}
+
+function Set-ObsImageCheckPassed($value) {
+    # Bare `$script:obsImageCheckPassed = ...` inside the Tick closure
+    # below does NOT reach this file's real script scope -- same
+    # .GetNewClosure() isolation gotcha rom_launcher.ps1 itself documents
+    # for Set-ConfirmDialogResult/Clear-OpenGuideWindow (confirmed the
+    # hard way here too: without this indirection the check silently
+    # stayed $false even though the dialog was provably rendering the
+    # image correctly).
+    $script:obsImageCheckPassed = $value
+}
+
+Check "Show-DarkInput's real OBS password prompt image actually renders (ImagePath parameter)" {
+    $imgPath = Join-Path $ScriptDir "guide_images\obs_websocket_settings.jpg"
+    if (-not (Test-Path $imgPath)) { throw "test setup failed -- expected the real OBS guide image to exist at $imgPath" }
+    Set-ObsImageCheckPassed $false
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $timer.Add_Tick({
+        $timer.Stop()
+        try {
+            $dlg = $null
+            foreach ($src in [System.Windows.PresentationSource]::CurrentSources) {
+                if ($src.RootVisual -is [System.Windows.Window] -and $src.RootVisual.Title -eq "RegressionTestObsImageTitle") {
+                    $dlg = $src.RootVisual
+                    break
+                }
+            }
+            if (-not $dlg) { throw "could not locate the OBS password dialog window to inspect" }
+            $border = $dlg.FindName("GuideImageBorder")
+            $image = $dlg.FindName("GuideImage")
+            if ($border.Visibility -eq [System.Windows.Visibility]::Visible -and $image.Source -ne $null) {
+                Set-ObsImageCheckPassed $true
+            }
+            $dlg.FindName("CancelButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        } finally {
+            if ($dlg -and $dlg.IsVisible) { $dlg.Close() }
+        }
+    }.GetNewClosure())
+    $timer.Start()
+    try {
+        Show-DarkInput -Title "RegressionTestObsImageTitle" -Message "test" -ImagePath $imgPath | Out-Null
+    } finally {
+        $timer.Stop()
+    }
+    if (-not $script:obsImageCheckPassed) { throw "expected the OBS guide image border/source to be visible/loaded while the dialog was open" }
+}
+
+function Set-MayaPortImageCheckPassed($value) {
+    # Same GetNewClosure() isolation reasoning as Set-ObsImageCheckPassed above.
+    $script:mayaPortImageCheckPassed = $value
+}
+
+Check "Show-DarkNotice's real Maya port setup image actually renders (ImagePath parameter)" {
+    $imgPath = Join-Path $ScriptDir "guide_images\maya_port_setup.jpg"
+    if (-not (Test-Path $imgPath)) { throw "test setup failed -- expected the real Maya port guide image to exist at $imgPath" }
+    Set-MayaPortImageCheckPassed $false
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $timer.Add_Tick({
+        $timer.Stop()
+        try {
+            $dlg = $null
+            foreach ($src in [System.Windows.PresentationSource]::CurrentSources) {
+                if ($src.RootVisual -is [System.Windows.Window] -and $src.RootVisual.Title -eq "RegressionTestMayaPortImageTitle") {
+                    $dlg = $src.RootVisual
+                    break
+                }
+            }
+            if (-not $dlg) { throw "could not locate the Maya port notice window to inspect" }
+            $border = $dlg.FindName("GuideImageBorder")
+            $image = $dlg.FindName("GuideImage")
+            if ($border.Visibility -eq [System.Windows.Visibility]::Visible -and $image.Source -ne $null) {
+                Set-MayaPortImageCheckPassed $true
+            }
+            $dlg.FindName("OkButton").RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        } finally {
+            if ($dlg -and $dlg.IsVisible) { $dlg.Close() }
+        }
+    }.GetNewClosure())
+    $timer.Start()
+    try {
+        Show-DarkNotice -Title "RegressionTestMayaPortImageTitle" -Message "test" -ImagePath $imgPath
+    } finally {
+        $timer.Stop()
+    }
+    if (-not $script:mayaPortImageCheckPassed) { throw "expected the Maya port guide image border/source to be visible/loaded while the dialog was open" }
 }
 
 Check "a two-step fake sequence runs both steps in order and reaches Done" {
@@ -207,6 +350,8 @@ Check "a two-step fake sequence runs both steps in order and reaches Done" {
 }
 
 Check "a step printing CAPTURE_ABORT stops the whole run there -- later steps never execute (design 2026-08-22: never quietly stop)" {
+    $script:taskbarsShownCount = 0
+    function Show-AllTaskbars { $script:taskbarsShownCount++ }
     $fakeSteps = @(
         [PSCustomObject]@{ FilePath = "cmd"; Arguments = @("/c", "echo", "CAPTURE_ABORT:", "no", "real", "ROM", "animation", "found") },
         [PSCustomObject]@{ FilePath = "cmd"; Arguments = @("/c", "echo", "should_never_run") }
@@ -218,6 +363,19 @@ Check "a step printing CAPTURE_ABORT stops the whole run there -- later steps ne
     if ($logBox.Text -notmatch "no real ROM animation found") { throw "expected the actual abort reason text preserved in the log, got:`n$($logBox.Text)" }
     if ($logBox.Text -match "should_never_run") { throw "expected the second step to NEVER run once the first one aborted the whole run, but it did:`n$($logBox.Text)" }
     if ($logBox.Text -match "All steps finished") { throw "an aborted run should not also claim it finished normally:`n$($logBox.Text)" }
+    if ($script:taskbarsShownCount -ne 1) { throw "expected an aborted run to restore the Windows taskbar exactly once (it may have been hidden by this run's own first step, with no later step left to un-hide it), got $script:taskbarsShownCount call(s)" }
+}
+
+Check "a normal (non-aborted) run completing does NOT call Show-AllTaskbars -- that restore is abort-specific, not unconditional" {
+    $script:taskbarsShownCount = 0
+    function Show-AllTaskbars { $script:taskbarsShownCount++ }
+    $fakeSteps = @(
+        [PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") }
+    )
+    Start-Steps $fakeSteps
+    $reachedDone = Wait-ForStatus "Done" 15
+    if (-not $reachedDone) { throw "status never reached Done, log so far:`n$($logBox.Text)" }
+    if ($script:taskbarsShownCount -ne 0) { throw "expected Show-AllTaskbars NOT to be called on a normal completion (Get-CaptureSteps's own paired 'show' step already handles that when relevant), got $script:taskbarsShownCount call(s)" }
 }
 
 Check "buttons are re-enabled after the run completes" {
@@ -336,6 +494,11 @@ Check "Start Recording appends a Reset step automatically once the recording fin
     # real Maya and leave $cacheStatusLabel/$forceRebuildMenuItem set from
     # a genuine scene check, contaminating whatever test runs next.
     function Test-MayaPortReachable { return $true }
+    # Start Recording's own requirements gate (Get-StartRecordingRequirementFailures)
+    # also needs these two satisfied, or this click would be blocked with a
+    # Show-DarkNotice prompt before ever reaching Get-CaptureClickResult.
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
     function Get-CacheStatus { return [PSCustomObject]@{ Status = "Missing"; AnimationReference = "D:/fake/auto_reset_test.ma"; CachePath = $null; ErrorMessage = $null } }
     $allFramesRadio.IsChecked = $true
     function Get-AnimationRange { return [PSCustomObject]@{ Success = $true; Start = 0; End = 10; ErrorMessage = $null } }
@@ -351,6 +514,22 @@ Check "Start Recording appends a Reset step automatically once the recording fin
     $reachedDone = Wait-ForStatus "Done" 15
     if (-not $reachedDone) { throw "status never reached Done, log so far:`n$($logBox.Text)" }
     if ($logBox.Text -notmatch "auto_reset_ran") { throw "expected the Reset step to run automatically after the recording finished naturally, log:`n$($logBox.Text)" }
+}
+
+Check "Start Recording is blocked with a notice when a requirement isn't met, instead of starting a doomed run" {
+    function Test-MayaPortReachable { return $false }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    $script:noticeShownWith = $null
+    function Show-DarkNotice { param([string]$Message, [string]$Title) $script:noticeShownWith = $Message }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        throw "Get-CaptureSteps should never be called -- the requirements gate should have stopped this click first"
+    }
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($script:noticeShownWith -eq $null) { throw "expected Show-DarkNotice to be called with the missing-requirements message" }
+    if ($script:noticeShownWith -notmatch "Maya connection") { throw "expected the Maya connection failure listed, got '$($script:noticeShownWith)'" }
+    if ($script:currentProcess -ne $null) { throw "no run should have started" }
 }
 
 Check "clicking Stop with nothing running logs a no-op instead of erroring" {
@@ -498,7 +677,12 @@ Check "Update-CacheProgress shows and populates the panel from a real-format pro
 }
 
 Check "Start-Steps deletes any stale progress file and collapses the panel before a run begins" {
-    Set-Content -Path $script:cacheProgressPath -Value @("frames_done=999", "frames_total=999", "percent=100.0") -Encoding UTF8
+    # Mid-build (done < total), not done=total -- a completed progress file
+    # is now collapsed immediately by Update-CacheProgress itself (see
+    # ConvertFrom-CacheProgressOutput's IsComplete), so this fixture
+    # represents a stale run that was still in flight (e.g. the app was
+    # closed mid-build) to actually exercise Start-Steps's own cleanup.
+    Set-Content -Path $script:cacheProgressPath -Value @("frames_done=500", "frames_total=999", "percent=50.0") -Encoding UTF8
     Update-CacheProgress
     if ($cacheProgressPanel.Visibility -ne [System.Windows.Visibility]::Visible) { throw "test setup failed -- expected the panel visible before starting a new run" }
 
@@ -859,11 +1043,19 @@ Check "Update-PortStatusIndicator sets the dot to a valid color and a matching t
     }
 }
 
-Check "clicking Copy port-open snippet puts the real file content on the clipboard" {
+Check "clicking Copy port-open snippet puts the real file content on the clipboard and shows a setup guide" {
+    $script:mayaPortNoticeShown = $null
+    function Show-DarkNotice {
+        param([string]$Message, [string]$Title, [string]$ImagePath)
+        $script:mayaPortNoticeShown = [PSCustomObject]@{ Title = $Title; Message = $Message; ImagePath = $ImagePath }
+    }
     $copySnippetButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     $clipboardText = [System.Windows.Clipboard]::GetText()
     if ($clipboardText -notmatch "commandPort") { throw "clipboard should contain the port-open snippet, got: $clipboardText" }
     if ($logBox.Text -notmatch "Copied the port-open snippet") { throw "expected a confirmation message logged after copying" }
+    if ($script:mayaPortNoticeShown -eq $null) { throw "expected Show-DarkNotice to be called with Maya port setup steps" }
+    if ($script:mayaPortNoticeShown.Message -notmatch "Script Editor") { throw "expected the steps to mention the Script Editor, got: $($script:mayaPortNoticeShown.Message)" }
+    if (-not (Test-Path $script:mayaPortNoticeShown.ImagePath)) { throw "expected a real image file at $($script:mayaPortNoticeShown.ImagePath)" }
 }
 
 Check "Update-ObsPasswordStatusIndicator reflects a temp config file's real content, never touching the real project file" {

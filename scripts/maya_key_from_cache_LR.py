@@ -209,8 +209,11 @@ if not os.path.exists(CACHE_PATH):
     # See maya_key_from_cache.py's own copy of this check for the full
     # reasoning -- same fix, same design (2026-08-22): never quietly
     # continue into a broken recording when no cache could be built.
-    print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
-    raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
+    # Marker lives in the raised exception's message, not a separate
+    # print() -- print() output never relays back through Maya's command
+    # port, so the print()+raise split left this detection dead on the
+    # PowerShell side. See maya_key_from_cache.py for the full story.
+    raise RuntimeError('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
 
 with open(CACHE_PATH) as f:
     cache = json.load(f)

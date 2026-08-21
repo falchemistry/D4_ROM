@@ -56,6 +56,12 @@ try {
         $excludedFromScripts -notcontains $_.Name
     } | Copy-Item -Destination (Join-Path $DistDir "scripts")
 
+    # Real screenshots (OBS WebSocket Server Settings, this tool's own
+    # Settings/Capture tabs) shown inline in the OBS password prompt and
+    # the Guide window -- end users need these just as much as the
+    # scripts themselves, unlike everything else excluded above.
+    Copy-Item (Join-Path $PSScriptRoot "scripts\guide_images") (Join-Path $DistDir "scripts\guide_images") -Recurse
+
     @"
 OBS WebSocket connection info for d4_rom capture automation.
 

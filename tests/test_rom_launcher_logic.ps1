@@ -157,6 +157,51 @@ Check "Get-PortSnippetContent returns null for a missing file, not an exception"
     if ($content -ne $null) { throw "expected null when open_maya_port.py doesn't exist at the derived path" }
 }
 
+Check "Get-NoteworthyMayaOutput returns empty for the routine success case" {
+    $result = Get-NoteworthyMayaOutput -Stdout "Sent to Maya command port 127.0.0.1:7001`n"
+    if ($result -ne "") { throw "expected empty string for a routine success, got '$result'" }
+}
+
+Check "Get-NoteworthyMayaOutput returns empty for blank input" {
+    $result = Get-NoteworthyMayaOutput -Stdout ""
+    if ($result -ne "") { throw "expected empty string for blank input, got '$result'" }
+}
+
+Check "Get-NoteworthyMayaOutput surfaces a relayed exception's text" {
+    $result = Get-NoteworthyMayaOutput -Stdout "Maya response: No file references found in this scene.`nSent to Maya command port 127.0.0.1:7001`n"
+    if ($result -ne "Maya response: No file references found in this scene.") { throw "expected the exception text alone, got '$result'" }
+}
+
+Check "Get-NoteworthyMayaOutput surfaces a timeout notice" {
+    $result = Get-NoteworthyMayaOutput -Stdout "No response from Maya within 6000ms -- it may still be running.`nSent to Maya command port 127.0.0.1:7001`n"
+    if ($result -ne "No response from Maya within 6000ms -- it may still be running.") { throw "expected the timeout notice alone, got '$result'" }
+}
+
+Check "ConvertFrom-CacheProgressOutput reports incomplete mid-build" {
+    $result = ConvertFrom-CacheProgressOutput -Lines @("animation_reference=D:/anim/barM_rom_anim.ma", "frames_done=100", "frames_total=400", "percent=25.0")
+    if ($result.IsComplete) { throw "expected IsComplete false while done < total" }
+    if ($result.Done -ne 100) { throw "expected Done 100, got $($result.Done)" }
+    if ($result.Total -ne 400) { throw "expected Total 400, got $($result.Total)" }
+    if ($result.Percent -ne 25.0) { throw "expected Percent 25.0, got $($result.Percent)" }
+}
+
+Check "ConvertFrom-CacheProgressOutput reports complete once done reaches total" {
+    $result = ConvertFrom-CacheProgressOutput -Lines @("frames_done=400", "frames_total=400", "percent=100.0", "note=done")
+    if (-not $result.IsComplete) { throw "expected IsComplete true once done >= total" }
+}
+
+Check "ConvertFrom-CacheProgressOutput reports complete for the no-motion-detected case" {
+    # maya_cache_bbox.py writes done == total here too -- still means
+    # sampling itself is finished, just with a different note.
+    $result = ConvertFrom-CacheProgressOutput -Lines @("frames_done=400", "frames_total=400", "percent=100.0", "note=no_motion_detected")
+    if (-not $result.IsComplete) { throw "expected IsComplete true for the no-motion-detected case" }
+}
+
+Check "ConvertFrom-CacheProgressOutput does not treat a zero total as complete" {
+    $result = ConvertFrom-CacheProgressOutput -Lines @("frames_done=0", "frames_total=0")
+    if ($result.IsComplete) { throw "expected IsComplete false when total is 0" }
+}
+
 Check "ConvertFrom-CacheCheckOutput parses a CACHE_EXISTS line" {
     $result = ConvertFrom-CacheCheckOutput -Output "Sent to Maya command port 127.0.0.1:7001`nCACHE_EXISTS animation_reference=D:/anim/barM_rom_anim.ma cache_path=D:/cache/barM__abc123.json`n"
     if ($result.Status -ne "Exists") { throw "expected Status 'Exists', got '$($result.Status)'" }
@@ -360,6 +405,37 @@ Check "Set-ObsConfigPassword writes a full templated file when no config exists 
     if ($updated -notmatch "password:\s*brand_new_password") { throw "expected the new password in the fresh template: $updated" }
     if ($updated -notmatch "host:\s*127\.0\.0\.1") { throw "expected a default host in the fresh template: $updated" }
     if ($updated -notmatch "port:\s*4455") { throw "expected a default port in the fresh template: $updated" }
+}
+
+Check "Get-StartRecordingRequirementFailures returns no failures when everything is satisfied" {
+    $result = Get-StartRecordingRequirementFailures -MayaReachable $true -ObsPasswordConfigured $true -MonitorSelected $true
+    if ($result.Count -ne 0) { throw "expected zero failures, got $($result.Count): $($result -join ' | ')" }
+}
+
+Check "Get-StartRecordingRequirementFailures reports Maya unreachable" {
+    $result = Get-StartRecordingRequirementFailures -MayaReachable $false -ObsPasswordConfigured $true -MonitorSelected $true
+    if ($result.Count -ne 1) { throw "expected exactly one failure, got $($result.Count)" }
+    if ($result[0] -notmatch "^Maya connection") { throw "expected a Maya connection failure, got '$($result[0])'" }
+}
+
+Check "Get-StartRecordingRequirementFailures reports OBS password not configured" {
+    $result = Get-StartRecordingRequirementFailures -MayaReachable $true -ObsPasswordConfigured $false -MonitorSelected $true
+    if ($result.Count -ne 1) { throw "expected exactly one failure, got $($result.Count)" }
+    if ($result[0] -notmatch "^OBS WebSocket") { throw "expected an OBS WebSocket failure, got '$($result[0])'" }
+}
+
+Check "Get-StartRecordingRequirementFailures reports no monitor selected" {
+    $result = Get-StartRecordingRequirementFailures -MayaReachable $true -ObsPasswordConfigured $true -MonitorSelected $false
+    if ($result.Count -ne 1) { throw "expected exactly one failure, got $($result.Count)" }
+    if ($result[0] -notmatch "^Recording Monitor") { throw "expected a Recording Monitor failure, got '$($result[0])'" }
+}
+
+Check "Get-StartRecordingRequirementFailures reports all three at once, in order" {
+    $result = Get-StartRecordingRequirementFailures -MayaReachable $false -ObsPasswordConfigured $false -MonitorSelected $false
+    if ($result.Count -ne 3) { throw "expected all three failures, got $($result.Count): $($result -join ' | ')" }
+    if ($result[0] -notmatch "^Maya connection") { throw "expected Maya connection first, got '$($result[0])'" }
+    if ($result[1] -notmatch "^OBS WebSocket") { throw "expected OBS WebSocket second, got '$($result[1])'" }
+    if ($result[2] -notmatch "^Recording Monitor") { throw "expected Recording Monitor third, got '$($result[2])'" }
 }
 
 Write-Output "$passed passed, $($failures.Count) failed"

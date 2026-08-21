@@ -112,6 +112,64 @@ function Get-StopCleanupSteps {
     return $steps
 }
 
+function Get-NoteworthyMayaOutput {
+    # Filters a "quick check" subprocess's raw stdout down to whatever is
+    # actually worth a log line. Deliberately does NOT surface the routine
+    # success case: Maya's command port only relays an exception's text
+    # back over the socket (confirmed live 2026-08-22 -- print() output
+    # never crosses it), so a script that completes normally without
+    # raising leaves $Stdout containing only send_to_maya.ps1's own
+    # generic "Sent to Maya command port..." line -- filtered out on
+    # purpose here, since that RESULT is already reflected in the UI
+    # (status dot/label) and re-logging it on every routine check would
+    # be noise, not signal. What survives filtering is exactly the
+    # interesting cases: a relayed exception's text, or a
+    # "No response from Maya within Xms" timeout notice. Returns "" (not
+    # $null) when there's nothing noteworthy, so callers can just check
+    # truthiness.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Stdout
+    )
+    $lines = $Stdout -split "`n" | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and $_ -notmatch "^Sent to Maya command port" }
+    return ($lines -join ' ')
+}
+
+function ConvertFrom-CacheProgressOutput {
+    # Parses _cache_build_progress.txt's key=value lines (written by
+    # maya_cache_bbox.py) into a structured result -- kept separate from
+    # the WPF polling code so this can be unit-tested directly.
+    #
+    # IsComplete is true once Done >= Total: maya_cache_bbox.py writes
+    # that exact state (note=done or note=no_motion_detected) the moment
+    # frame sampling itself finishes, well before the run's remaining
+    # steps (e.g. the post-cache clean reset) actually exit. Callers
+    # should hide the progress UI right here, not wait for the whole run
+    # to finish, or it sits frozen at 100% for however long those later
+    # steps take.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Lines
+    )
+    $data = @{}
+    foreach ($line in $Lines) {
+        $parts = $line -split '=', 2
+        if ($parts.Count -eq 2) { $data[$parts[0]] = $parts[1] }
+    }
+    $done = 0
+    $total = 1
+    $percent = 0.0
+    [void][int]::TryParse($data['frames_done'], [ref]$done)
+    [void][int]::TryParse($data['frames_total'], [ref]$total)
+    [void][double]::TryParse($data['percent'], [ref]$percent)
+    return [PSCustomObject]@{
+        Done = $done
+        Total = $total
+        Percent = $percent
+        IsComplete = ($total -gt 0 -and $done -ge $total)
+        Label = "Building animation cache: $done / $total frames ($($percent.ToString('0.0'))%) -- one time only, future runs reuse this"
+    }
+}
+
 function ConvertFrom-CacheCheckOutput {
     # Parses maya_check_cache.py's stdout (relayed back through
     # send_to_maya.ps1's now-working response read) into a structured
@@ -370,4 +428,37 @@ function Get-PortSnippetContent {
         return $null
     }
     return Get-Content $snippetPath -Raw
+}
+
+function Get-StartRecordingRequirementFailures {
+    # Pure decision logic for the Start Recording pre-flight gate: given
+    # the current state of the three hard requirements, returns the list
+    # of human-readable failure messages, or an empty array if everything
+    # is satisfied. None of these three are things a recording could
+    # succeed without, so this is a hard block, not a dismissible warning
+    # (design confirmed 2026-08-22). Kept separate from the live status
+    # checks (Test-MayaPortReachable, Get-ObsPasswordStatus,
+    # Test-RecordingMonitorSelected) so this can be unit-tested without a
+    # real Maya/OBS connection.
+    param(
+        [Parameter(Mandatory=$true)][bool]$MayaReachable,
+        [Parameter(Mandatory=$true)][bool]$ObsPasswordConfigured,
+        [Parameter(Mandatory=$true)][bool]$MonitorSelected
+    )
+    $failures = @()
+    if (-not $MayaReachable) {
+        $failures += "Maya connection: NOT reachable -- paste open_maya_port.py into Maya's Script Editor (Python tab) and run it."
+    }
+    if (-not $ObsPasswordConfigured) {
+        $failures += "OBS WebSocket: not configured -- open the Settings tab and set this machine's OBS WebSocket password."
+    }
+    if (-not $MonitorSelected) {
+        $failures += "Recording Monitor: not selected -- open the Settings tab and choose a Recording Monitor (OBS must be running)."
+    }
+    # comma operator: PowerShell can unwrap a 0- or 1-element array to
+    # $null/a scalar across a function return (same footgun
+    # Get-CleanResetStep's own header comment documents) -- this keeps
+    # $failures a real array for every caller, regardless of how many
+    # requirements failed.
+    return ,$failures
 }

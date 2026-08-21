@@ -66,10 +66,12 @@ cache_path = cache_path_for(anim_ref)
 print('Animation reference: %s' % anim_ref)
 print('Cache path: %s' % cache_path)
 
+anim_curves = cmds.ls(type='animCurve')
+
 if os.path.exists(cache_path):
     print('Cache already exists, skipping sampling.')
     print('CACHE_OK')
-elif not cmds.ls(type='animCurve'):
+elif not anim_curves:
     # Checked BEFORE touching the timeline at all, not after -- a scene
     # with the ROM animation reference not actually loaded/connected
     # still has a real playbackOptions min/maxTime (often some large
@@ -89,8 +91,19 @@ else:
     cmds.select(clear=True)
     original_time = cmds.currentTime(query=True)
 
-    start = cmds.playbackOptions(query=True, minTime=True)
-    end = cmds.playbackOptions(query=True, maxTime=True)
+    # Actual keyframed extent, not playbackOptions minTime/maxTime -- the
+    # Time Slider can be scrubbed to any arbitrary range independent of what
+    # was actually keyed (that's exactly what the FATAL infinite-loop bug
+    # above was: a real min/maxTime, just not one grounded in real
+    # animation). This is a stricter, self-contained version of the same
+    # guard -- it can't drift out of sync with whatever the slider happens
+    # to show, and doesn't depend on the user having set the slider
+    # correctly in the first place.
+    keyframe_times = cmds.keyframe(anim_curves, query=True, timeChange=True)
+    if not keyframe_times:
+        raise RuntimeError('Animation curves exist but have no keyframes -- cannot determine a sampling range.')
+    start = min(keyframe_times)
+    end = max(keyframe_times)
 
     # This step is a single long, synchronous command-port call with no
     # other feedback -- from outside, several genuine minutes of sampling

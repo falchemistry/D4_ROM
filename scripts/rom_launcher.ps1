@@ -650,7 +650,7 @@ $script:ToolVersion = "1.0.0"
              log getting squeezed to nothing while the Auto rows above it
              keep their full size. -->
         <TextBox x:Name="LogBox" Grid.Row="3" MinHeight="80" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
-                 HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap" FontFamily="Consolas" FontSize="11"/>
+                 HorizontalScrollBarVisibility="Disabled" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11"/>
         </Grid>
         </Border>
     </Grid>
@@ -906,8 +906,9 @@ function Get-CacheStatus {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
-    $proc.StandardOutput.ReadToEnd() | Out-Null
+    $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit(6000) | Out-Null
+    Write-NoteworthyMayaOutput "Cache check" $stdout
 
     if (-not (Test-Path $resultPath)) {
         return ConvertFrom-CacheCheckOutput -Output ""
@@ -938,8 +939,9 @@ function Get-TimeSliderRange {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
-    $proc.StandardOutput.ReadToEnd() | Out-Null
+    $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit(6000) | Out-Null
+    Write-NoteworthyMayaOutput "Time Slider range check" $stdout
 
     if (-not (Test-Path $resultPath)) {
         return ConvertFrom-TimeSliderOutput -Output ""
@@ -969,8 +971,9 @@ function Get-AnimationRange {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
-    $proc.StandardOutput.ReadToEnd() | Out-Null
+    $stdout = $proc.StandardOutput.ReadToEnd()
     $proc.WaitForExit(6000) | Out-Null
+    Write-NoteworthyMayaOutput "Animation range check" $stdout
 
     if (-not (Test-Path $resultPath)) {
         return ConvertFrom-AnimationRangeOutput -Output ""
@@ -1106,7 +1109,14 @@ function Confirm-AndBuildCache {
         Write-Log "Building cache for the first time..."
     }
     $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
-    $steps = Get-CaptureSteps -Axis $axis -Recording $false -ScriptDir $ScriptDir
+    # Cache's step list is the same open-panels-and-key-cameras sequence
+    # Preview uses -- appending the clean-reset step here mirrors what
+    # Start Recording already does for itself (see its own handler:
+    # "a completed recording should always end with a clean scene"). Cache
+    # previously had no equivalent, so a cache build left Maya sitting in
+    # "preview" state (floating tracked-camera panels, keyed cameras)
+    # afterward, with nothing to clear it.
+    $steps = @(Get-CaptureSteps -Axis $axis -Recording $false -ScriptDir $ScriptDir) + (Get-CleanResetStep -ScriptDir $ScriptDir)
     $script:pendingCacheRefresh = $true
     Start-Steps $steps $false $cacheActionButton "Stop Rebuilding"
 }
@@ -1178,6 +1188,56 @@ function Show-DarkConfirm {
     $confirmWindow.FindName("YesButton").Add_Click({ Set-ConfirmDialogResult $true; $confirmWindow.Close() }.GetNewClosure())
     $confirmWindow.ShowDialog() | Out-Null
     return $script:confirmDialogResult
+}
+
+function Show-DarkNotice {
+    # Single-button ("OK") sibling of Show-DarkConfirm -- for messages that
+    # only need acknowledgment, not a yes/no decision (e.g. the Start
+    # Recording requirements gate: there's nothing to confirm, the run
+    # just isn't starting until the listed items are fixed). Same dark
+    # styling and overridable-top-level-function pattern so tests can stub
+    # this instead of blocking on a real modal .ShowDialog() call.
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [Parameter(Mandatory=$true)][string]$Title,
+        [string]$ImagePath
+    )
+    [xml]$noticeXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="360" MinWidth="360" SizeToContent="Height" WindowStartupLocation="CenterOwner"
+        ResizeMode="CanResize" Background="#FF3C3C3C">
+    <StackPanel Margin="16">
+        <TextBlock x:Name="MessageText" TextWrapping="Wrap" Foreground="#FFE6E6E6" Margin="0,0,0,16"/>
+        <Border x:Name="GuideImageBorder" BorderBrush="#FF4C4C4C" BorderThickness="1" Margin="0,0,0,12" Visibility="Collapsed">
+            <Image x:Name="GuideImage" Stretch="Uniform" MaxHeight="260"/>
+        </Border>
+        <Button x:Name="OkButton" Content="OK" Width="90" Height="28" HorizontalAlignment="Right"
+                Background="#FFE07868" Foreground="White" FontWeight="Bold" BorderThickness="0"/>
+    </StackPanel>
+</Window>
+"@
+    $noticeReader = New-Object System.Xml.XmlNodeReader $noticeXaml
+    $noticeWindow = [Windows.Markup.XamlReader]::Load($noticeReader)
+    $noticeWindow.Title = $Title
+    if ($window.IsVisible) {
+        $noticeWindow.Owner = $window
+    }
+    $noticeWindow.FindName("MessageText").Text = $Message
+
+    if ($ImagePath -and (Test-Path $ImagePath)) {
+        # Same OnLoad-cached BitmapImage loading as Show-DarkInput/
+        # Show-DarkMonitorResult's own guide images.
+        $guideBitmap = New-Object System.Windows.Media.Imaging.BitmapImage
+        $guideBitmap.BeginInit()
+        $guideBitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $guideBitmap.UriSource = New-Object System.Uri($ImagePath)
+        $guideBitmap.EndInit()
+        $noticeWindow.FindName("GuideImage").Source = $guideBitmap
+        $noticeWindow.FindName("GuideImageBorder").Visibility = [System.Windows.Visibility]::Visible
+    }
+    $noticeWindow.FindName("OkButton").Add_Click({ $noticeWindow.Close() }.GetNewClosure())
+    $noticeWindow.ShowDialog() | Out-Null
 }
 
 function Show-DarkMonitorResult {
@@ -1265,7 +1325,8 @@ function Show-DarkInput {
         [Parameter(Mandatory=$true)][string]$Title,
         [string]$InitialValue = "",
         [string]$ConfirmLabel = "Save",
-        [switch]$Masked
+        [switch]$Masked,
+        [string]$ImagePath
     )
     [xml]$inputXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1274,6 +1335,9 @@ function Show-DarkInput {
         ResizeMode="CanResize" Background="#FF3C3C3C">
     <StackPanel Margin="16">
         <TextBlock x:Name="MessageText" TextWrapping="Wrap" Foreground="#FFE6E6E6" Margin="0,0,0,10"/>
+        <Border x:Name="GuideImageBorder" BorderBrush="#FF4C4C4C" BorderThickness="1" Margin="0,0,0,12" Visibility="Collapsed">
+            <Image x:Name="GuideImage" Stretch="Uniform" MaxHeight="260"/>
+        </Border>
         <TextBox x:Name="InputBox" Padding="4" Margin="0,0,0,16"/>
         <PasswordBox x:Name="InputPasswordBox" Padding="4" Margin="0,0,0,16" Background="#FF1C1C1C" Foreground="White" BorderBrush="#FF4C4C4C" BorderThickness="1"/>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -1299,6 +1363,20 @@ function Show-DarkInput {
     $inputBoxRef = $inputWindow.FindName("InputBox")
     $passwordBoxRef = $inputWindow.FindName("InputPasswordBox")
     $inputWindow.FindName("SaveButton").Content = $ConfirmLabel
+
+    if ($ImagePath -and (Test-Path $ImagePath)) {
+        # Same CacheOption OnLoad reasoning as Show-DarkMonitorResult's own
+        # image loading -- reads the file into memory immediately and
+        # releases the handle, so this dialog never holds the guide image
+        # file locked open.
+        $guideBitmap = New-Object System.Windows.Media.Imaging.BitmapImage
+        $guideBitmap.BeginInit()
+        $guideBitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $guideBitmap.UriSource = New-Object System.Uri($ImagePath)
+        $guideBitmap.EndInit()
+        $inputWindow.FindName("GuideImage").Source = $guideBitmap
+        $inputWindow.FindName("GuideImageBorder").Visibility = [System.Windows.Visibility]::Visible
+    }
 
     if ($Masked) {
         $inputBoxRef.Visibility = [System.Windows.Visibility]::Collapsed
@@ -1542,6 +1620,17 @@ function Update-MonitorList([switch]$EnsureRunning) {
     }
 }
 
+function Test-RecordingMonitorSelected {
+    # Own overridable function (same pattern as Test-MayaPortReachable /
+    # Get-ObsPasswordStatus), used by the Start Recording requirements
+    # gate. IsEnabled only ever becomes true inside Update-MonitorList's
+    # confirmed-response-from-OBS branch -- the Gray/disabled states (OBS
+    # not running, showing a stale last-used entry) do NOT count as
+    # satisfied here, since starting a recording against one of those
+    # would not actually work.
+    return $monitorComboBox.IsEnabled -and $monitorComboBox.SelectedIndex -ge 0
+}
+
 function New-GuideStepRow([string]$Number, [string]$Lead, [string]$Text) {
     # One numbered step, laid out as a 2-column Grid (fixed-width number
     # column + wrapping text column) instead of plain "1. Lead: text"
@@ -1690,22 +1779,65 @@ function Show-DarkGuide {
                 </Setter.Value>
             </Setter>
         </Style>
+        <!-- Same implicit Button style as the main window's own copy,
+             needed because this is a separate XamlReader.Load() document
+             that does not inherit that one. Without this, Back/Next fell
+             back to WPF's default Button chrome, which (unlike this
+             template) renders a disabled button as plain white; confirmed
+             live: Back looked "totally white" on page 1, where it is
+             disabled by design. -->
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#FF1F1F1F"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="9,2"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#FF2D2D2D"/>
+                </Trigger>
+                <Trigger Property="IsPressed" Value="True">
+                    <Setter Property="Background" Value="#FF161616"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#FF1A1A1A"/>
+                    <Setter Property="Foreground" Value="#FF808080"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
     </Window.Resources>
     <Grid Margin="16">
-        <!-- Grid instead of the old StackPanel + fixed MaxHeight="420":
-             now that the window itself resizes, the ScrollViewer's row is
-             "*" so dragging the dialog taller actually reveals more text
-             at once instead of just growing empty space around a
-             capped-height scroll box. -->
+        <!-- Book-style pagination (design 2026-08-22, requested to cut
+             down on scrolling through unrelated sections just to reach
+             one): one page visible at a time in PageHost, flipped via
+             Back/Next instead of everything stacked in one long scroll. -->
         <Grid.RowDefinitions>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" Margin="0,0,0,16">
-            <StackPanel x:Name="ContentPanel"/>
+        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10">
+            <StackPanel x:Name="PageHost"/>
         </ScrollViewer>
-        <Button Grid.Row="1" x:Name="CloseButton" Content="Close" Width="90" Height="28" HorizontalAlignment="Right"
-                Background="#FF1F1F1F" Foreground="White" BorderThickness="0"/>
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="0" x:Name="BackButton" Content="Back" Width="80" Height="26"/>
+            <TextBlock Grid.Column="1" x:Name="PageLabel" Foreground="#FFA0A0A0" FontSize="11"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Button Grid.Column="2" x:Name="NextButton" Content="Next" Width="80" Height="26"/>
+        </Grid>
     </Grid>
 </Window>
 "@
@@ -1716,8 +1848,15 @@ function Show-DarkGuide {
         $guideWindow.Owner = $window
     }
 
-    $contentPanel = $guideWindow.FindName("ContentPanel")
+    $pageHost = $guideWindow.FindName("PageHost")
 
+    # Page 0 = a short "USAGE" intro (the old always-on TLDR line, now its
+    # own page instead of pinned above everything else) -- Page 1..N = one
+    # page per $Sections entry. RegisterName on TldrText specifically:
+    # Show-DarkGuide's own regression tests FindName() it directly, and
+    # XamlReader's auto-generated NameScope only covers elements that were
+    # part of the original static markup, not ones added via code later.
+    $usagePage = New-Object System.Windows.Controls.StackPanel
     $tldrText = New-Object System.Windows.Controls.TextBlock
     $tldrText.Name = "TldrText"
     $tldrText.Text = $Tldr
@@ -1725,11 +1864,13 @@ function Show-DarkGuide {
     $tldrText.FontWeight = "Bold"
     $tldrText.FontSize = 14
     $tldrText.Foreground = "#FFE6E6E6"
-    $tldrText.Margin = "0,0,0,14"
-    $contentPanel.RegisterName($tldrText.Name, $tldrText)
-    $contentPanel.Children.Add($tldrText) | Out-Null
+    $pageHost.RegisterName($tldrText.Name, $tldrText)
+    $usagePage.Children.Add($tldrText) | Out-Null
+    $pages = @($usagePage)
 
     foreach ($section in $Sections) {
+        $sectionPage = New-Object System.Windows.Controls.StackPanel
+
         $headerText = New-Object System.Windows.Controls.TextBlock
         $headerText.Text = $section.Header
         $headerText.TextWrapping = "Wrap"
@@ -1737,25 +1878,85 @@ function Show-DarkGuide {
         $headerText.FontSize = 13
         $headerText.Foreground = "#FFE6E6E6"
         $headerText.Margin = "0,0,0,8"
-        $contentPanel.Children.Add($headerText) | Out-Null
+        $sectionPage.Children.Add($headerText) | Out-Null
+
+        if ($section.ImagePath -and (Test-Path $section.ImagePath)) {
+            # Real screenshot of this section's own tab, shown once above
+            # its numbered steps -- "here's what it actually looks like,"
+            # not a per-step diagram (the bold Lead text in each step
+            # already does the pointing-at-a-specific-control job in
+            # prose). Same OnLoad-cached BitmapImage loading as
+            # Show-DarkMonitorResult/Show-DarkInput's own guide image.
+            $sectionBitmap = New-Object System.Windows.Media.Imaging.BitmapImage
+            $sectionBitmap.BeginInit()
+            $sectionBitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+            $sectionBitmap.UriSource = New-Object System.Uri($section.ImagePath)
+            $sectionBitmap.EndInit()
+            $sectionImage = New-Object System.Windows.Controls.Image
+            $sectionImage.Source = $sectionBitmap
+            $sectionImage.Stretch = "Uniform"
+            $sectionImage.MaxHeight = 280
+            $sectionImage.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+            $sectionBorder = New-Object System.Windows.Controls.Border
+            $sectionBorder.BorderBrush = "#FF4C4C4C"
+            $sectionBorder.BorderThickness = 1
+            $sectionBorder.Margin = "0,0,0,10"
+            $sectionBorder.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+            $sectionBorder.Child = $sectionImage
+            $sectionPage.Children.Add($sectionBorder) | Out-Null
+        }
 
         $stepNumber = 1
         foreach ($step in $section.Steps) {
             $stepRow = New-GuideStepRow -Number $stepNumber -Lead $step.Lead -Text $step.Text
-            $contentPanel.Children.Add($stepRow) | Out-Null
+            $sectionPage.Children.Add($stepRow) | Out-Null
             $stepNumber++
         }
+
+        $pages += $sectionPage
     }
 
-    $guideWindow.FindName("CloseButton").Add_Click({ $guideWindow.Close() }.GetNewClosure())
+    # No custom Close button (removed 2026-08-22, redundant with the
+    # window's own native title-bar close) -- Closed still covers however
+    # the user actually closes it (native X, Alt+F4, etc).
     # Clears the tracked reference once actually closed, so a LATER click
     # creates a fresh window rather than trying to Activate() a disposed
     # one -- Closed (not Closing) since this only needs to run once the
     # window is genuinely gone. Routed through Clear-OpenGuideWindow, not
     # a bare $script: write inline -- see the NOTE above.
     $guideWindow.Add_Closed({ Clear-OpenGuideWindow }.GetNewClosure())
+    # Back/Next are each their own separate .GetNewClosure() scriptblock,
+    # so (same isolation reasoning as Clear-OpenGuideWindow) they cannot
+    # reliably share a plain local page-index variable with each other --
+    # both routed through Get-/Set-GuideCurrentPage instead.
+    $guideWindow.FindName("BackButton").Add_Click({ Set-GuideCurrentPage ((Get-GuideCurrentPage) - 1) }.GetNewClosure())
+    $guideWindow.FindName("NextButton").Add_Click({ Set-GuideCurrentPage ((Get-GuideCurrentPage) + 1) }.GetNewClosure())
+
+    $script:guidePages = $pages
     $script:openGuideWindow = $guideWindow
+    Set-GuideCurrentPage 0
     $guideWindow.Show()
+}
+
+function Get-GuideCurrentPage {
+    return $script:guideCurrentPageIndex
+}
+
+function Set-GuideCurrentPage([int]$Index) {
+    # Real top-level function, not inline logic in a closure -- see the
+    # NOTE on Clear-OpenGuideWindow above; this is the same fix applied to
+    # Back/Next page navigation.
+    if ($script:guidePages -eq $null -or $script:guidePages.Count -eq 0) { return }
+    $Index = [Math]::Max(0, [Math]::Min($Index, $script:guidePages.Count - 1))
+    $script:guideCurrentPageIndex = $Index
+
+    $guideWin = $script:openGuideWindow
+    $pageHost = $guideWin.FindName("PageHost")
+    $pageHost.Children.Clear()
+    $pageHost.Children.Add($script:guidePages[$Index]) | Out-Null
+    $guideWin.FindName("BackButton").IsEnabled = ($Index -gt 0)
+    $guideWin.FindName("NextButton").IsEnabled = ($Index -lt ($script:guidePages.Count - 1))
+    $guideWin.FindName("PageLabel").Text = "Page $($Index + 1) of $($script:guidePages.Count)"
 }
 
 function Clear-OpenGuideWindow {
@@ -1785,6 +1986,22 @@ function Write-Log([string]$text) {
         $logBox.AppendText("$text`r`n")
         $logBox.ScrollToEnd()
     }.GetNewClosure())
+}
+
+function Write-NoteworthyMayaOutput([string]$Label, [string]$Stdout) {
+    # Shared by the synchronous "quick check" round-trips (Get-CacheStatus,
+    # Get-TimeSliderRange, Get-AnimationRange), which previously discarded
+    # their subprocess's stdout entirely via `| Out-Null` -- meaning a
+    # genuine failure during one of these checks (Maya raising an
+    # exception, or a timeout) produced no log entry at all, success or
+    # failure. The actual filtering logic lives in Get-NoteworthyMayaOutput
+    # (rom_launcher_logic.ps1) -- kept pure/unit-testable, same split as
+    # every other Convert-From-*/Get-* function there; this is just the
+    # thin WPF-side wrapper that performs the Write-Log side effect.
+    $noteworthy = Get-NoteworthyMayaOutput -Stdout $Stdout
+    if ($noteworthy) {
+        Write-Log "[$Label] $noteworthy"
+    }
 }
 
 function Set-ButtonsEnabled([bool]$enabled, $activeButton = $null) {
@@ -1852,7 +2069,28 @@ function Set-ButtonRunningVisual($button, [bool]$running, [string]$runningLabel 
     }
 }
 
-function Complete-Run([string]$FinalMessage = "=== All steps finished ===") {
+function Show-AllTaskbars {
+    # Restores every Windows taskbar via the same standalone utility
+    # Get-CaptureSteps's own "hide" step (Recording only) uses. Own
+    # overridable top-level function (same pattern as
+    # Test-MayaPortReachable/Get-ObsPasswordStatus) so tests can stub this
+    # instead of actually hiding/showing the real desktop taskbar during a
+    # headless run. Safe to call unconditionally even when this run never
+    # hid the taskbar in the first place (Preview, or a Recording run that
+    # aborted before its own hide step) -- showing an already-visible
+    # taskbar is a no-op.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Join-Path $ScriptDir 'taskbar_control.ps1')`" -Action show"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.Start() | Out-Null
+    $proc.WaitForExit(5000) | Out-Null
+}
+
+function Complete-Run([string]$FinalMessage = "=== All steps finished ===", [bool]$Aborted = $false) {
     # Factored out of Start-NextStep's own "ran out of steps" branch so
     # the pollTimer's abort path (see Set-CaptureAbortReason) can share
     # the exact same cleanup instead of a second, easy-to-drift copy.
@@ -1862,6 +2100,25 @@ function Complete-Run([string]$FinalMessage = "=== All steps finished ===") {
     Set-ButtonsEnabled $true
     $script:activeButton = $null
     Write-Log $FinalMessage
+    if ($Aborted) {
+        # An aborted run (CAPTURE_ABORT -- e.g. the scene has no animation
+        # to key off of) can happen AFTER Get-CaptureSteps's own taskbar-hide
+        # step (its very first step, Recording only) but BEFORE the paired
+        # "show" step later in that same queue -- confirmed live: this left
+        # the Windows taskbar missing indefinitely, with nothing left in
+        # the queue to ever restore it (Get-CleanResetStep only reaches
+        # Maya over the command port, which cannot touch the Windows
+        # taskbar at all).
+        Show-AllTaskbars
+    }
+    # Stopping pollTimer above also stops Update-CacheProgress from ever
+    # running again -- previously the ONLY thing that hid CacheProgressPanel
+    # was Start-Steps deleting the progress file at the START of the NEXT
+    # run, so a cache build left the bar frozen at ~100% until the user
+    # began something else. Hide it here, as part of THIS run actually
+    # finishing, not as an accidental side effect of starting a new one.
+    Remove-Item $script:cacheProgressPath -ErrorAction SilentlyContinue
+    $cacheProgressPanel.Visibility = [System.Windows.Visibility]::Collapsed
     if ($script:pendingCacheRefresh) {
         $script:pendingCacheRefresh = $false
         Update-CacheStatusIndicator
@@ -1951,20 +2208,18 @@ function Update-CacheProgress {
     }
     $lines = Get-Content $script:cacheProgressPath -ErrorAction SilentlyContinue
     if (-not $lines) { return }
-    $data = @{}
-    foreach ($line in $lines) {
-        $parts = $line -split '=', 2
-        if ($parts.Count -eq 2) { $data[$parts[0]] = $parts[1] }
+    $info = ConvertFrom-CacheProgressOutput $lines
+    if ($info.IsComplete) {
+        # Sampling itself is done -- hide right here instead of waiting for
+        # Complete-Run, which only fires once the whole run (including any
+        # steps queued after the cache build, e.g. the post-cache clean
+        # reset) finishes. See ConvertFrom-CacheProgressOutput.
+        $cacheProgressPanel.Visibility = [System.Windows.Visibility]::Collapsed
+        return
     }
-    $done = 0
-    $total = 1
-    $percent = 0.0
-    [void][int]::TryParse($data['frames_done'], [ref]$done)
-    [void][int]::TryParse($data['frames_total'], [ref]$total)
-    [void][double]::TryParse($data['percent'], [ref]$percent)
     $cacheProgressPanel.Visibility = [System.Windows.Visibility]::Visible
-    $cacheProgressBar.Value = $percent
-    $cacheProgressLabel.Text = "Building animation cache: $done / $total frames ($($percent.ToString('0.0'))%) -- one time only, future runs reuse this"
+    $cacheProgressBar.Value = $info.Percent
+    $cacheProgressLabel.Text = $info.Label
 }
 
 $script:pollTimer.Add_Tick({
@@ -1979,7 +2234,7 @@ $script:pollTimer.Add_Tick({
             # run to stop here, not just itself, so this skips straight
             # to Complete-Run instead of advancing $script:currentStepIndex
             # into the remaining steps (camera panels, OBS recording).
-            Complete-Run "=== Run aborted: $($script:captureAbortReason) ==="
+            Complete-Run "=== Run aborted: $($script:captureAbortReason) ===" -Aborted $true
             return
         }
         $script:currentStepIndex++
@@ -2139,6 +2394,22 @@ $startRecordingButton.Add_Click({
         Stop-CurrentRun
         return
     }
+    # Hard-block gate (design confirmed 2026-08-22): none of these three
+    # are things a recording could succeed without, so failing any of them
+    # stops the click here with an actionable prompt instead of starting a
+    # run that's doomed to fail partway through. Update-PortStatusIndicator
+    # is called fresh, not read from the last poll, since a recording is
+    # long enough to be worth a genuinely current answer; the other two are
+    # already cheap/local.
+    $mayaReachable = Update-PortStatusIndicator
+    $obsConfigured = (Get-ObsPasswordStatus).Configured
+    $monitorSelected = Test-RecordingMonitorSelected
+    $requirementFailures = Get-StartRecordingRequirementFailures -MayaReachable $mayaReachable -ObsPasswordConfigured $obsConfigured -MonitorSelected $monitorSelected
+    if ($requirementFailures.Count -gt 0) {
+        Write-Log "Start Recording blocked: $($requirementFailures.Count) requirement(s) not met."
+        Show-DarkNotice -Title "Cannot Start Recording" -Message ("Fix the following before starting a recording:`n`n" + ($requirementFailures -join "`n`n"))
+        return
+    }
     $result = Get-CaptureClickResult
     if ($result.ErrorMessage -ne $null) {
         Write-Log $result.ErrorMessage
@@ -2183,6 +2454,7 @@ $guideButton.Add_Click({
     $guideSections = @(
         [PSCustomObject]@{
             Header = "SETTINGS (one-time or rarely-touched setup, its own tab)"
+            ImagePath = Join-Path $ScriptDir "guide_images\guide_settings_tab.png"
             Steps = @(
                 @{ Lead = "Maya connection:"; Text = "green means ready. If red/gray, click the clipboard icon to copy the setup snippet, paste it into Maya's Script Editor (Python tab), and run it." },
                 @{ Lead = "Cache button:"; Text = "click checks whether a cache already exists. If not, it asks permission to build one right there (10-16 minutes, one-time). Right-click for `"Force Rebuild`" if the character or animation changed without renaming its file, since a plain check can't tell that apart from an up-to-date cache." },
@@ -2192,6 +2464,7 @@ $guideButton.Add_Click({
         },
         [PSCustomObject]@{
             Header = "CAPTURE (what you use every run, its own tab)"
+            ImagePath = Join-Path $ScriptDir "guide_images\guide_capture_tab.png"
             Steps = @(
                 @{ Lead = "Pick an Axis:"; Text = "Front/Back or Left/Right." },
                 @{ Lead = "Pick a Time Range:"; Text = "All (full ROM video), Time Slider (Maya's current Range Slider), or Start/End (type exact frame numbers)." },
@@ -2212,13 +2485,17 @@ $copySnippetButton.Add_Click({
     }
     [System.Windows.Clipboard]::SetText($content)
     Write-Log "Copied the port-open snippet to your clipboard -- paste it into Maya's Script Editor (Python tab) and run it."
+    $mayaPortSteps = "1. In Maya, open the Script Editor (the icon at the bottom-right of the status line, or Windows > General Editors > Script Editor)`n2. Click the Python tab`n3. Paste the snippet -- already copied to your clipboard`n4. Click Execute All (or press Ctrl+Enter) to run it`n`nMust be re-run every time Maya is restarted -- the port does not persist across sessions."
+    $mayaPortImage = Join-Path $ScriptDir "guide_images\maya_port_setup.jpg"
+    Show-DarkNotice -Title "Open Maya's Command Port" -Message $mayaPortSteps -ImagePath $mayaPortImage
 })
 
 $obsPasswordButton.Add_Click({
     $current = (Get-ObsPasswordStatus).CurrentPassword
     if ($current -eq "REPLACE_ME") { $current = "" }
     $obsPasswordSteps = "1. Open OBS Studio`n2. Tools > WebSocket Server Settings`n3. Check `"Enable WebSocket Server`" if it isn't already`n4. Click `"Show Connect Info`" to reveal the password (or set one if empty)`n5. Copy it and paste below`n`nEvery machine's OBS has its own independent password."
-    $newPassword = Show-DarkInput -Title "OBS WebSocket Password" -ConfirmLabel "Save" -InitialValue $current -Message $obsPasswordSteps -Masked
+    $obsPasswordImage = Join-Path $ScriptDir "guide_images\obs_websocket_settings.jpg"
+    $newPassword = Show-DarkInput -Title "OBS WebSocket Password" -ConfirmLabel "Save" -InitialValue $current -Message $obsPasswordSteps -Masked -ImagePath $obsPasswordImage
     if ($newPassword -eq $null) {
         Write-Log "OBS password edit cancelled."
         return

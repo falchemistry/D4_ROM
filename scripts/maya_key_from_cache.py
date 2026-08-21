@@ -250,8 +250,15 @@ if not os.path.exists(CACHE_PATH):
     # watches for specifically to stop the whole run here, not just this
     # one step -- recording is genuinely not possible without a cache, so
     # continuing would only ever produce a broken result.
-    print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
-    raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
+    #
+    # The marker lives in the RAISED exception's own message, not a
+    # separate print() -- confirmed live (2026-08-22) that Maya's command
+    # port does not relay print() output back over the socket on a
+    # successful run, only an exception's text (or the bare exec() return
+    # value, always None). The print()+raise split meant this marker could
+    # never actually reach rom_launcher.ps1 at all -- the detection code
+    # on the PowerShell side was correctly written but structurally dead.
+    raise RuntimeError('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
 
 with open(CACHE_PATH) as f:
     cache = json.load(f)
