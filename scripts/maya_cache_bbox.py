@@ -68,7 +68,22 @@ print('Cache path: %s' % cache_path)
 
 if os.path.exists(cache_path):
     print('Cache already exists, skipping sampling.')
-    print('CLAUDE_CACHE_OK')
+    print('CACHE_OK')
+elif not cmds.ls(type='animCurve'):
+    # Checked BEFORE touching the timeline at all, not after -- a scene
+    # with the ROM animation reference not actually loaded/connected
+    # still has a real playbackOptions min/maxTime (often some large
+    # leftover default), so without this the loop below would walk that
+    # whole range one frame at a time with nothing driving the rig,
+    # taking a genuinely impractical amount of time (confirmed live,
+    # 2026-08-21/22 -- reported as "[FATAL] infinite loop"). Worse, it
+    # can't be cancelled from the launcher UI once started: this runs
+    # inside Maya's own blocked command-port exec(), so killing the
+    # PowerShell wrapper does not stop Maya's side. Failing here, before
+    # the loop, costs nothing and can't hang.
+    print('No animation curves found in this scene -- the ROM animation reference may not be loaded/connected (wrong scene, or Cache pressed before the reference finished loading?).')
+    print('Not building a cache -- nothing to sample.')
+    print('CACHE_NO_ANIMATION')
 else:
     os.makedirs(CACHE_DIR, exist_ok=True)
     cmds.select(clear=True)
@@ -117,19 +132,37 @@ else:
 
     cmds.currentTime(original_time)
 
-    with open(cache_path, 'w') as f:
-        json.dump({
-            'animation_reference': anim_ref,
-            'source_character_scene': cmds.file(query=True, sceneName=True),
-            'start': start,
-            'end': end,
-            'frames': frames,
-            'x_center': x_centers,
-            'x_width': x_widths,
-            'z_center': z_centers,
-            'z_width': z_widths,
-        }, f)
+    x_range = (max(x_centers) - min(x_centers)) if x_centers else 0.0
+    z_range = (max(z_centers) - min(z_centers)) if z_centers else 0.0
+    # Below this, the character's bounding box center barely moves across
+    # the WHOLE sampled range -- almost always means the referenced
+    # animation isn't actually driving the rig (nothing keyed/connected,
+    # wrong reference, or a stuck T-pose), not that a real ROM genuinely
+    # holds still for its entire length. Caching this would silently bake
+    # in a static/broken framing result as if it were a valid, reusable
+    # cache. Threshold is deliberately small and absolute, not scaled to
+    # character size -- real ROM motion spans many units even for subtle
+    # movement, so 0.5 is conservative headroom, not a tight cutoff.
+    MOTION_EPSILON = 0.5
+    if x_range < MOTION_EPSILON and z_range < MOTION_EPSILON:
+        _write_progress(len(frames), total_frames, note='no_motion_detected')
+        print('No animation motion detected across frames %s-%s (bbox barely moved: x_range=%.4f, z_range=%.4f).' % (start, end, x_range, z_range))
+        print('Not caching -- check that the ROM animation is actually applied/keyed in this scene, then try again.')
+        print('CACHE_EMPTY_ANIMATION')
+    else:
+        with open(cache_path, 'w') as f:
+            json.dump({
+                'animation_reference': anim_ref,
+                'source_character_scene': cmds.file(query=True, sceneName=True),
+                'start': start,
+                'end': end,
+                'frames': frames,
+                'x_center': x_centers,
+                'x_width': x_widths,
+                'z_center': z_centers,
+                'z_width': z_widths,
+            }, f)
 
-    _write_progress(len(frames), total_frames, note='done')
-    print('Cached %d frames (%s to %s) -> %s' % (len(frames), start, end, cache_path))
-    print('CLAUDE_CACHE_OK')
+        _write_progress(len(frames), total_frames, note='done')
+        print('Cached %d frames (%s to %s) -> %s' % (len(frames), start, end, cache_path))
+        print('CACHE_OK')

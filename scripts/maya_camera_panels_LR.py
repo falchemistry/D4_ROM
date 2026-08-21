@@ -35,7 +35,10 @@ ALL_KNOWN_VIEWS = ['front', 'back', 'side', 'left']
 TITLE_OVERRIDES = {'side': 'Right'}  # Maya calls the right-side camera 'side'
 WINDOW_NAME = {v: 'claude_view_' + v for v in ALL_KNOWN_VIEWS}
 
-# Secondary monitor bounds (Windows virtual-desktop pixels). Regenerate with:
+# Fallback secondary monitor bounds (Windows virtual-desktop pixels), used
+# only if _recording_monitor_rect.txt (below) doesn't exist yet -- e.g.
+# the very first run before the launcher's Recording Monitor dropdown has
+# ever written one. Regenerate with:
 #   Add-Type -AssemblyName System.Windows.Forms
 #   [System.Windows.Forms.Screen]::AllScreens
 # if the monitor layout ever changes.
@@ -67,6 +70,36 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
 
 
 def get_secondary_monitor_rect():
+    # Reads the same rect rom_launcher.ps1's Recording Monitor dropdown
+    # just wrote (see Write-RecordingMonitorRect) -- keeps the panels'
+    # spawn location in sync with whichever monitor OBS is actually set
+    # to record, instead of a hardcoded constant independent of that
+    # setting (a real gap: switching monitors in the launcher used to
+    # move what OBS records but not where these panels appeared, silently
+    # recording the wrong screen). Falls back to the hardcoded constant
+    # if the file doesn't exist yet or is malformed, so this still works
+    # standalone (e.g. run directly, without ever having opened the
+    # launcher).
+    rect_path = os.path.join(CACHE_DIR, '_recording_monitor_rect.txt')
+    try:
+        with open(rect_path) as f:
+            content = f.read()
+        # Belt-and-suspenders: the writer (rom_launcher.ps1) is fixed to
+        # never emit a byte-order mark, but this strips one anyway if a
+        # future change or a hand-edit ever reintroduces one -- confirmed
+        # the hard way (2026-08-21) that a leading BOM makes int() raise
+        # ValueError on the first number, silently falling through to the
+        # hardcoded fallback below with zero visible error, which is
+        # exactly what made switching monitors look like it wasn't
+        # working at all. chr(0xFEFF), not a literal/escaped char in this
+        # source file, to keep this file plain ASCII (an em-dash caused a
+        # UnicodeDecodeError in Maya once before -- same class of risk).
+        content = content.lstrip(chr(0xFEFF))
+        parts = [int(p.strip()) for p in content.strip().split(',')]
+        if len(parts) == 4:
+            return tuple(parts)
+    except (IOError, OSError, ValueError):
+        pass
     return SECONDARY_MONITOR_RECT
 
 
@@ -216,6 +249,12 @@ def apply_mesh_only_display(panel):
                       displayTextures=True,
                       wireframeOnShaded=False,
                       selectionHiliteDisplay=False,
+                      # Off, not left at whatever the artist's own viewport
+                      # prefs happen to be -- poly count and other HUD text
+                      # burned into a ROM capture video looks unprofessional
+                      # and isn't something the recording can fix after the
+                      # fact.
+                      headsUpDisplay=False,
                       rendererName='vp2Renderer')
 
 
@@ -233,6 +272,12 @@ def make_borderless_fullsize(title, x, y, w, h):
     the capture -- and the title bar would show up in the recording too.
     Must run BEFORE the panel is measured for framing, so orthographicWidth
     is computed against the final panel size.
+
+    Also brings the window to the front (see bring_window_to_front) --
+    these panels commonly live on a second monitor the artist isn't
+    actively looking at, so a run that gets buried under something else
+    open on that monitor previously gave no visual cue at all that it had
+    even started.
 
     Only plain ctypes function calls here, no ctypes.Structure subclasses --
     class bodies can't see module-level imports under the command port's
@@ -252,7 +297,34 @@ def make_borderless_fullsize(title, x, y, w, h):
     style = get_long(hwnd, GWL_STYLE)
     set_long(hwnd, GWL_STYLE, style & ~WS_CAPTION & ~WS_THICKFRAME)
     user32.SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED)
+    bring_window_to_front(hwnd)
     return True
+
+
+def bring_window_to_front(hwnd):
+    """Flashes the window to the top of the z-order once, the standard
+    "topmost then not-topmost" idiom: SetWindowPos with HWND_TOPMOST
+    followed immediately by HWND_NOTOPMOST moves the window to the front
+    and releases it there, rather than pinning it permanently above
+    everything else (which would be its own annoyance, floating over
+    whatever the artist opens on that monitor next). This is a pure
+    z-order operation any process can do to its own windows -- no
+    permission Windows can silently deny the way it sometimes blocks
+    SetForegroundWindow from a background process, which is attempted
+    afterward as a bonus, best-effort step only."""
+    user32 = ctypes.windll.user32
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_SHOWWINDOW = 0x0040
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+    user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+    try:
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
 
 
 def hide_model_editor_bars():
@@ -334,4 +406,4 @@ def open_view_panels():
 
 
 open_view_panels()
-print('CLAUDE_VIEW_PANELS_OK')
+print('VIEW_PANELS_OK')

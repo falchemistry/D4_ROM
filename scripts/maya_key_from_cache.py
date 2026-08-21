@@ -236,6 +236,23 @@ if not os.path.exists(CACHE_PATH):
     cache_script = os.path.join(SCRIPTS_DIR, 'maya_cache_bbox.py')
     exec(compile(open(cache_script).read(), cache_script, 'exec'), {})
 
+if not os.path.exists(CACHE_PATH):
+    # The build attempt above ran to completion but deliberately did NOT
+    # write a cache (CACHE_NO_ANIMATION / CACHE_EMPTY_ANIMATION -- see
+    # maya_cache_bbox.py's own printed reason just above this). Design
+    # (2026-08-22): the tool must never quietly stop here -- previously
+    # this fell straight through into `open(CACHE_PATH)` below, raising a
+    # bare FileNotFoundError with no context, which (a) gave no
+    # actionable reason and (b) the launcher's step queue doesn't gate on
+    # a step's exit code, so it silently continued into spawning camera
+    # panels and starting an OBS recording of a scene with no real ROM
+    # motion. CAPTURE_ABORT is a marker rom_launcher.ps1's step runner
+    # watches for specifically to stop the whole run here, not just this
+    # one step -- recording is genuinely not possible without a cache, so
+    # continuing would only ever produce a broken result.
+    print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
+    raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
+
 with open(CACHE_PATH) as f:
     cache = json.load(f)
 
@@ -266,4 +283,4 @@ elapsed = time.time() - _t0
 print('Elapsed: %.2f sec' % elapsed)
 with open(r'D:\__backup\claude\maya_debug.txt', 'w') as f:
     f.write('elapsed_sec=%.2f threshold_pct=%s scales=%s' % (elapsed, THRESHOLD_PCT, scale_cache))
-print('CLAUDE_KEY_FROM_CACHE_OK')
+print('KEY_FROM_CACHE_OK')

@@ -23,6 +23,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
+Add-Type -AssemblyName System.Drawing
 
 if (($StartFrame -eq $null) -ne ($EndFrame -eq $null)) {
     throw "StartFrame and EndFrame must both be given, or neither."
@@ -128,10 +129,19 @@ function Send-WsMessage($ws, $obj) {
 }
 
 function Receive-WsMessage($ws) {
-    $buffer = New-Object byte[] 8192
+    # Loops until EndOfMessage instead of trusting one ReceiveAsync call to
+    # return the whole thing -- a single 8192-byte read was fine for the
+    # short StartRecord/StopRecord responses this originally handled, but
+    # GetSourceScreenshot's base64 image payload (added 2026-08-22, see
+    # Get-SourceAvgBrightness) can span more than one WebSocket frame.
+    $buffer = New-Object byte[] 65536
     $segment = [System.ArraySegment[byte]]::new($buffer)
-    $result = $ws.ReceiveAsync($segment, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()
-    $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $result.Count)
+    $all = New-Object System.IO.MemoryStream
+    do {
+        $result = $ws.ReceiveAsync($segment, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        $all.Write($buffer, 0, $result.Count)
+    } while (-not $result.EndOfMessage)
+    $text = [System.Text.Encoding]::UTF8.GetString($all.ToArray())
     return $text | ConvertFrom-Json
 }
 
@@ -196,7 +206,11 @@ function Ensure-ObsRunning() {
     Write-Host "OBS is up and reachable (waited ${waited}s)."
 }
 
-function Invoke-ObsRecordAction($action) {
+function Connect-ObsWebSocket() {
+    # Shared connect+identify dance, factored out of Invoke-ObsRecordAction
+    # so Repair-MonitorCaptureSourceBinding (below) can open its own
+    # separate connection the same way, instead of duplicating this block
+    # a second time.
     $configText = Get-Content (Join-Path $ScriptDir "obs_config.txt") -Raw
     $obsHost = ([regex]::Match($configText, 'host:\s*(\S+)')).Groups[1].Value
     $port = ([regex]::Match($configText, 'port:\s*(\S+)')).Groups[1].Value
@@ -214,7 +228,139 @@ function Invoke-ObsRecordAction($action) {
     Send-WsMessage $ws $identify
     $identified = Receive-WsMessage $ws
     if ($identified.op -ne 2) { throw "Failed to identify with OBS WebSocket." }
+    return $ws
+}
 
+function Invoke-ObsRequest($ws, $requestType, $requestData = @{}) {
+    $requestId = [Guid]::NewGuid().ToString()
+    Send-WsMessage $ws @{ op = 6; d = @{ requestType = $requestType; requestId = $requestId; requestData = $requestData } }
+    for ($i = 0; $i -lt 15; $i++) {
+        $msg = Receive-WsMessage $ws
+        if ($msg.op -eq 7 -and $msg.d.requestId -eq $requestId) { return $msg.d }
+    }
+    throw "No RequestResponse received for $requestType after 15 messages."
+}
+
+function Find-ActiveMonitorCaptureSource($ws) {
+    # Same "in the current program scene AND sceneItemEnabled=true" filter
+    # as obs_monitor.ps1's own Find-ActiveMonitorCaptureSource -- see that
+    # file's header comment for why scene membership alone isn't enough.
+    $sceneResp = Invoke-ObsRequest $ws "GetCurrentProgramScene"
+    $sceneName = $sceneResp.responseData.currentProgramSceneName
+    $itemsResp = Invoke-ObsRequest $ws "GetSceneItemList" @{ sceneName = $sceneName }
+    $candidates = $itemsResp.responseData.sceneItems | Where-Object { $_.inputKind -eq "monitor_capture" -and $_.sceneItemEnabled -eq $true }
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        return $null
+    }
+    return $candidates[0].sourceName
+}
+
+function Get-SourceAvgBrightness($ws, $sourceName) {
+    # Ground truth, not a proxy: GetSourceScreenshot returns the source's
+    # actual rendered pixels. Replaces an earlier check (2026-08-22) that
+    # compared the source's monitor_id against OBS's list of enumerable
+    # monitors -- confirmed live, twice, that this reported "bound" while
+    # the real recorded frame was solid black (OBS can report a valid,
+    # resolvable monitor_id well before its capture backend is actually
+    # delivering pixels, and in at least one case never did within the
+    # observed window at all). A small 64x36 image sampled every 4th
+    # pixel is plenty to tell "black" from "real image" and stays fast
+    # enough to poll several times per repair attempt.
+    $resp = Invoke-ObsRequest $ws "GetSourceScreenshot" @{ sourceName = $sourceName; imageFormat = "png"; imageWidth = 64; imageHeight = 36 }
+    $base64 = $resp.responseData.imageData -replace '^data:image/\w+;base64,', ''
+    $bytes = [Convert]::FromBase64String($base64)
+    $ms = New-Object System.IO.MemoryStream(,$bytes)
+    try {
+        $bmp = New-Object System.Drawing.Bitmap($ms)
+        try {
+            $total = 0
+            $count = 0
+            for ($x = 0; $x -lt $bmp.Width; $x += 4) {
+                for ($y = 0; $y -lt $bmp.Height; $y += 4) {
+                    $px = $bmp.GetPixel($x, $y)
+                    $total += ($px.R + $px.G + $px.B)
+                    $count++
+                }
+            }
+            return $total / $count
+        } finally {
+            $bmp.Dispose()
+        }
+    } finally {
+        $ms.Dispose()
+    }
+}
+
+function Repair-MonitorCaptureSourceBinding() {
+    # Never capture an empty/disconnected display. Design agreed
+    # 2026-08-22 after live testing ruled out the original approach: only
+    # touch OBS at all if the real screenshot shows it's actually broken
+    # (skip entirely if already fine, no unconditional side effects on a
+    # working setup); if broken, only attempt repair actions confirmed
+    # SAFE by live testing -- re-applying the current monitor_id and
+    # toggling the scene item's enabled state. Neither is proven to
+    # reliably fix a genuinely stuck WGC (Windows Graphics Capture)
+    # source (both failed against one live-reproduced stuck case), but
+    # both are free and carry no known risk, unlike forcing the capture
+    # method to DXGI -- that looked promising in one test but coincided
+    # with OBS shutting down in a way that was never confirmed safe, so
+    # it is NOT attempted here unattended; it's a manual fix a user can
+    # apply themselves (Properties > Capture Method) if this still fails.
+    # Bounded retry budget (a handful of 500ms polls per repair action,
+    # not 10+ seconds of blind waiting) so a broken run fails fast with a
+    # concrete, actionable message instead of hanging or silently
+    # recording a black clip.
+    $ws = Connect-ObsWebSocket
+    try {
+        $sourceName = Find-ActiveMonitorCaptureSource $ws
+        if (-not $sourceName) {
+            throw "No enabled monitor_capture source found in OBS's current scene -- nothing to record into."
+        }
+
+        $brightness = Get-SourceAvgBrightness $ws $sourceName
+        if ($brightness -gt 3) {
+            Write-Host "Monitor capture source '$sourceName' is already showing real content (brightness=$brightness) -- no repair needed."
+            return
+        }
+        Write-Host "Monitor capture source '$sourceName' appears black (brightness=$brightness) -- attempting safe repairs..."
+
+        $settingsResp = Invoke-ObsRequest $ws "GetInputSettings" @{ inputName = $sourceName }
+        $monitorId = $settingsResp.responseData.inputSettings.monitor_id
+        Invoke-ObsRequest $ws "SetInputSettings" @{ inputName = $sourceName; inputSettings = @{ monitor_id = $monitorId }; overlay = $true } | Out-Null
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $brightness = Get-SourceAvgBrightness $ws $sourceName
+            if ($brightness -gt 3) {
+                Write-Host "Monitor capture source '$sourceName' recovered after re-applying its monitor selection (attempt $attempt, brightness=$brightness)."
+                return
+            }
+        }
+
+        Write-Host "Re-applying the monitor selection did not help -- trying a scene-item toggle..."
+        $sceneResp = Invoke-ObsRequest $ws "GetCurrentProgramScene"
+        $sceneName = $sceneResp.responseData.currentProgramSceneName
+        $itemsResp = Invoke-ObsRequest $ws "GetSceneItemList" @{ sceneName = $sceneName }
+        $item = $itemsResp.responseData.sceneItems | Where-Object { $_.sourceName -eq $sourceName }
+        Invoke-ObsRequest $ws "SetSceneItemEnabled" @{ sceneName = $sceneName; sceneItemId = $item.sceneItemId; sceneItemEnabled = $false } | Out-Null
+        Start-Sleep -Milliseconds 500
+        Invoke-ObsRequest $ws "SetSceneItemEnabled" @{ sceneName = $sceneName; sceneItemId = $item.sceneItemId; sceneItemEnabled = $true } | Out-Null
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $brightness = Get-SourceAvgBrightness $ws $sourceName
+            if ($brightness -gt 3) {
+                Write-Host "Monitor capture source '$sourceName' recovered after a scene-item toggle (attempt $attempt, brightness=$brightness)."
+                return
+            }
+        }
+
+        throw "Monitor capture source '$sourceName' is still showing a black/empty image (brightness=$brightness) after re-applying its monitor selection and toggling it -- not starting the recording. In OBS, try right-click '$sourceName' > Properties > Capture Method, and switch it from Automatic to DXGI Desktop Duplication."
+    } finally {
+        try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).Wait() } catch {}
+    }
+}
+
+function Invoke-ObsRecordAction($action) {
+    $ws = Connect-ObsWebSocket
     $requestType = if ($action -eq "start") { "StartRecord" } else { "StopRecord" }
     $requestId = [Guid]::NewGuid().ToString()
     Send-WsMessage $ws @{ op = 6; d = @{ requestType = $requestType; requestId = $requestId } }
@@ -240,6 +386,7 @@ Hide-Taskbar
 $originalRange = $null
 try {
     Ensure-ObsRunning
+    Repair-MonitorCaptureSourceBinding
 
     $resetFrame = 0
     if ($StartFrame -ne $null) {

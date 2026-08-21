@@ -18,7 +18,7 @@ function Get-CaptureSteps {
         [Parameter(Mandatory=$true)][string]$ScriptDir,
         # Both optional, both-or-neither (same contract as
         # maya_obs_capture.ps1's own params) -- only meaningful when
-        # $Recording is true; "Run Only" never touches maya_obs_capture.ps1
+        # $Recording is true; "Preview" never touches maya_obs_capture.ps1
         # at all, so a range has nothing to apply to there.
         [Nullable[int]]$StartFrame = $null,
         [Nullable[int]]$EndFrame = $null
@@ -71,6 +71,291 @@ function Get-CleanResetStep {
     # array back to a scalar when a function returns it via `return`,
     # which broke callers expecting to always get an array back
     return ,@([PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", $cleanReset) })
+}
+
+function Get-StopCleanupSteps {
+    # Run after killing the currently-active step process. Process.Kill()
+    # bypasses .NET/PowerShell `finally` blocks entirely (confirmed by
+    # reading maya_obs_capture.ps1 -- its taskbar-restore/OBS-stop cleanup
+    # lives in a `finally` that never runs if the process is terminated
+    # externally rather than exiting on its own), so a hard stop mid-capture
+    # would otherwise leave the taskbar hidden and OBS still recording.
+    # Reuses the same standalone, already-proven utility scripts
+    # maya_obs_capture.ps1 itself calls internally, rather than duplicating
+    # their logic here.
+    #
+    # KNOWN GAP: if a custom sample frame range was set for this capture,
+    # the ORIGINAL range (saved inside maya_obs_capture.ps1's own local
+    # variable) is lost when that process is killed -- this cleanup does
+    # not attempt to restore it. Only maya_obs_capture.ps1 finishing
+    # naturally restores a custom range correctly.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+
+    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
+    $stopPlayback = Join-Path $ScriptDir "maya_stop_playback.py"
+    $taskbarControl = Join-Path $ScriptDir "taskbar_control.ps1"
+    $obsControl = Join-Path $ScriptDir "obs_control.ps1"
+
+    $steps = @()
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", $stopPlayback) }
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $taskbarControl, "-Action", "show") }
+    # obs_control.ps1 has $ErrorActionPreference = "Stop" and errors if OBS
+    # isn't actually recording (e.g. Stop was clicked before recording
+    # started, or after it already finished) -- run it as its own process
+    # regardless (a failing child process here just logs [stderr]/a
+    # nonzero exit code, same as any other step, and does not abort the
+    # rest of this cleanup sequence, since each step in the queue always
+    # runs independently of the previous step's exit code).
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $obsControl, "-Action", "stop") }
+    return $steps
+}
+
+function ConvertFrom-CacheCheckOutput {
+    # Parses maya_check_cache.py's stdout (relayed back through
+    # send_to_maya.ps1's now-working response read) into a structured
+    # result -- kept separate from the live process-launching code so this
+    # parsing logic can be unit-tested without a real Maya connection.
+    # Expected lines look like:
+    #   CACHE_EXISTS animation_reference=D:/.../barM_rom_anim.ma cache_path=D:/.../barM__abc123.json
+    #   CACHE_MISSING animation_reference=... cache_path=...
+    #   CACHE_NO_REFERENCE <message>
+    #   CACHE_CHECK_ERROR <message>
+    # Anything else (empty output, a hung/no-response case, an unrelated
+    # send_to_maya.ps1 log line) is reported as Status "Unknown" rather
+    # than guessing.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
+    )
+
+    $line = ($Output -split "`n" | Where-Object { $_ -match "^CACHE_(EXISTS|MISSING|NO_REFERENCE|CHECK_ERROR)" } | Select-Object -First 1)
+    if (-not $line) {
+        return [PSCustomObject]@{ Status = "Unknown"; AnimationReference = $null; CachePath = $null; ErrorMessage = $null }
+    }
+    $line = $line.Trim()
+
+    if ($line -match "^CACHE_CHECK_ERROR\s+(.*)$") {
+        return [PSCustomObject]@{ Status = "Error"; AnimationReference = $null; CachePath = $null; ErrorMessage = $Matches[1] }
+    }
+    if ($line -match "^CACHE_NO_REFERENCE\s+(.*)$") {
+        # A DIFFERENT case from Error above: not a failure, the expected
+        # result of the wrong scene being loaded (or nothing referenced in
+        # yet) -- ConvertFrom-CacheCheckOutput's caller routes this to the
+        # Maya-connection indicator as a "wrong scene" warning, not a
+        # generic check-failed error.
+        return [PSCustomObject]@{ Status = "NoReference"; AnimationReference = $null; CachePath = $null; ErrorMessage = $Matches[1] }
+    }
+
+    $status = if ($line -match "^CACHE_EXISTS") { "Exists" } else { "Missing" }
+    $animRef = $null
+    $cachePath = $null
+    if ($line -match "animation_reference=(\S+)") { $animRef = $Matches[1] }
+    if ($line -match "cache_path=(\S+)") { $cachePath = $Matches[1] }
+    return [PSCustomObject]@{ Status = $status; AnimationReference = $animRef; CachePath = $cachePath; ErrorMessage = $null }
+}
+
+function ConvertFrom-TimeSliderOutput {
+    # Same split-purpose reasoning as ConvertFrom-CacheCheckOutput: parses
+    # maya_get_time_slider.py's result-file content, kept separate from
+    # the live process-launching code so it is unit-testable without a
+    # real Maya connection. Expected lines:
+    #   TIME_RANGE min=0 max=3240
+    #   TIME_RANGE_ERROR <message>
+    # Anything else (empty, unrelated, a hung/no-response case) is
+    # reported as Success=$false with a generic ErrorMessage rather than
+    # guessing.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
+    )
+
+    $line = ($Output -split "`n" | Where-Object { $_ -match "^TIME_RANGE" } | Select-Object -First 1)
+    if (-not $line) {
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "No response from Maya." }
+    }
+    $line = $line.Trim()
+
+    if ($line -match "^TIME_RANGE_ERROR\s+(.*)$") {
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = $Matches[1] }
+    }
+    if ($line -match "^TIME_RANGE min=(-?\d+) max=(-?\d+)") {
+        return [PSCustomObject]@{ Success = $true; Start = [int]$Matches[1]; End = [int]$Matches[2]; ErrorMessage = $null }
+    }
+    return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Unrecognized response: $line" }
+}
+
+function ConvertFrom-AnimationRangeOutput {
+    # Same split-purpose reasoning as ConvertFrom-TimeSliderOutput, for
+    # maya_get_animation_range.py's result instead -- the outer
+    # animationStartTime/animationEndTime bounds (what "All" now
+    # explicitly captures), not the Range Slider's current minTime/maxTime.
+    # Expected lines:
+    #   ANIM_RANGE min=0 max=3240
+    #   ANIM_RANGE_ERROR <message>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
+    )
+
+    $line = ($Output -split "`n" | Where-Object { $_ -match "^ANIM_RANGE" } | Select-Object -First 1)
+    if (-not $line) {
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "No response from Maya." }
+    }
+    $line = $line.Trim()
+
+    if ($line -match "^ANIM_RANGE_ERROR\s+(.*)$") {
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = $Matches[1] }
+    }
+    if ($line -match "^ANIM_RANGE min=(-?\d+) max=(-?\d+)") {
+        return [PSCustomObject]@{ Success = $true; Start = [int]$Matches[1]; End = [int]$Matches[2]; ErrorMessage = $null }
+    }
+    return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Unrecognized response: $line" }
+}
+
+function ConvertFrom-ObsConfigContent {
+    # Parses obs_config.txt's content (same "host:/port:/password:" format
+    # obs_control.ps1 itself reads) into a structured status -- kept
+    # separate from file I/O so it is unit-testable without touching disk.
+    # A password that is missing, empty, or still the literal placeholder
+    # written by build_dist.ps1's template counts as NOT configured.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Content
+    )
+    $password = ""
+    if ($Content -match "password:\s*(\S+)") { $password = $Matches[1] }
+    $configured = [bool]($password -and $password -ne "REPLACE_ME")
+    return [PSCustomObject]@{ Configured = $configured; CurrentPassword = $password }
+}
+
+function Set-ObsConfigPassword {
+    # Preserves the existing host:/port:/password: file's other lines
+    # (comments, host, port) when one already exists -- only the password
+    # value itself is replaced. Writes a fresh, fully-templated file only
+    # when no config file exists yet at all.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$ExistingContent,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$NewPassword
+    )
+    if (-not $ExistingContent) {
+        return @"
+OBS WebSocket connection info for d4_rom capture automation.
+
+host: 127.0.0.1
+port: 4455
+password: $NewPassword
+
+Set under OBS > Tools > WebSocket Server Settings on this machine. If this
+ever needs to change, update it there and here together -- the capture
+scripts read the password from this file.
+"@
+    }
+    if ($ExistingContent -match "password:\s*\S+") {
+        return $ExistingContent -replace "password:\s*\S+", "password: $NewPassword"
+    }
+    return $ExistingContent.TrimEnd() + "`r`npassword: $NewPassword`r`n"
+}
+
+function ConvertFrom-ObsMonitorListOutput {
+    # Parses obs_monitor.ps1 -Action list's stdout into a structured
+    # result -- kept separate from the live process-launching code so this
+    # parsing logic can be unit-tested without a real OBS connection.
+    # Expected lines:
+    #   MONITOR_ITEM name="Display Name" value="raw_monitor_id" current="true|false"
+    #   MONITOR_SOURCE_NOT_FOUND
+    #   MONITOR_LIST_ERROR <message>
+    # One line per monitor when successful; empty/unrelated output is
+    # reported as Success=$false rather than guessing.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
+    )
+
+    $lines = $Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if (-not $lines -or $lines.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No response." }
+    }
+
+    $errorLine = $lines | Where-Object { $_ -match "^MONITOR_LIST_ERROR\s+(.*)$" } | Select-Object -First 1
+    if ($errorLine) {
+        $errorLine -match "^MONITOR_LIST_ERROR\s+(.*)$" | Out-Null
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = $Matches[1] }
+    }
+    if ($lines | Where-Object { $_ -match "^MONITOR_SOURCE_NOT_FOUND" }) {
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No enabled monitor-capture source found in OBS's active scene." }
+    }
+
+    $monitors = @()
+    foreach ($line in $lines) {
+        if ($line -match 'MONITOR_ITEM name="(.*)" value="(.*)" current="(true|false)"') {
+            $monitors += [PSCustomObject]@{ Name = $Matches[1]; Value = $Matches[2]; IsCurrent = ($Matches[3] -eq "true") }
+        }
+    }
+    if ($monitors.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "Unrecognized response: $($lines -join ' | ')" }
+    }
+    return [PSCustomObject]@{ Success = $true; Monitors = $monitors; ErrorMessage = $null }
+}
+
+function ConvertFrom-ObsMonitorSetOutput {
+    # Parses obs_monitor.ps1 -Action set's stdout (2026-08-22 rework) into
+    # a structured result -- separate from the live process-launching code
+    # for the same reason as ConvertFrom-ObsMonitorListOutput. Expected
+    # lines on success:
+    #   MONITOR_SET_OK
+    #   MONITOR_SET_VERIFIED true|false
+    #   MONITOR_SET_BRIGHTNESS <number>
+    #   MONITOR_SET_MESSAGE <text, possibly containing spaces>
+    #   MONITOR_SET_PREVIEW <path>
+    # or MONITOR_SET_ERROR <message> if the whole operation failed.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
+    )
+
+    $lines = $Output -split "`n" | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ }
+    if (-not $lines -or $lines.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $false; Verified = $false; Brightness = $null; Message = "No response."; PreviewPath = $null }
+    }
+
+    $errorLine = $lines | Where-Object { $_ -match "^MONITOR_SET_ERROR\s+(.*)$" } | Select-Object -First 1
+    if ($errorLine) {
+        $errorLine -match "^MONITOR_SET_ERROR\s+(.*)$" | Out-Null
+        return [PSCustomObject]@{ Success = $false; Verified = $false; Brightness = $null; Message = $Matches[1]; PreviewPath = $null }
+    }
+    if (-not ($lines | Where-Object { $_ -match "^MONITOR_SET_OK" })) {
+        return [PSCustomObject]@{ Success = $false; Verified = $false; Brightness = $null; Message = "Unrecognized response: $($lines -join ' | ')"; PreviewPath = $null }
+    }
+
+    $verifiedLine = $lines | Where-Object { $_ -match "^MONITOR_SET_VERIFIED\s+(true|false)" } | Select-Object -First 1
+    $verified = $verifiedLine -and ($Matches[1] -eq "true")
+    $brightnessLine = $lines | Where-Object { $_ -match "^MONITOR_SET_BRIGHTNESS\s+([\d.]+)" } | Select-Object -First 1
+    $brightness = if ($brightnessLine) { [double]$Matches[1] } else { $null }
+    $messageLine = $lines | Where-Object { $_ -match "^MONITOR_SET_MESSAGE\s+(.*)$" } | Select-Object -First 1
+    $message = if ($messageLine) { $messageLine -replace "^MONITOR_SET_MESSAGE\s+", "" } else { $null }
+    $previewLine = $lines | Where-Object { $_ -match "^MONITOR_SET_PREVIEW\s+(.*)$" } | Select-Object -First 1
+    $previewPath = if ($previewLine) { $previewLine -replace "^MONITOR_SET_PREVIEW\s+", "" } else { $null }
+
+    return [PSCustomObject]@{ Success = $true; Verified = $verified; Brightness = $brightness; Message = $message; PreviewPath = $previewPath }
+}
+
+function ConvertFrom-ObsMonitorName {
+    # Extracts (X, Y, Width, Height) directly out of an OBS monitor item's
+    # own display Name string -- e.g. "Artist22R Pro: 1920x1080 @ 0,0
+    # (Primary Monitor)" or "LG FHD: 1920x1080 @ 1920,0". OBS already
+    # includes the monitor's Windows virtual-desktop position/size in this
+    # exact human-readable format (confirmed live against a real OBS
+    # instance), so this is enough to drive maya_camera_panels.py's own
+    # SECONDARY_MONITOR_RECT without any extra Windows API call or a
+    # second source of truth to keep in sync -- OBS's monitor_id string
+    # itself has no usable position info, only this Name does.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Name
+    )
+    if ($Name -match '(-?\d+)x(-?\d+)\s*@\s*(-?\d+),(-?\d+)') {
+        $width = [int]$Matches[1]
+        $height = [int]$Matches[2]
+        $x = [int]$Matches[3]
+        $y = [int]$Matches[4]
+        return [PSCustomObject]@{ Success = $true; Left = $x; Top = $y; Right = ($x + $width); Bottom = ($y + $height) }
+    }
+    return [PSCustomObject]@{ Success = $false; Left = $null; Top = $null; Right = $null; Bottom = $null }
 }
 
 function Get-PortSnippetContent {

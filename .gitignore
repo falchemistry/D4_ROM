@@ -3,7 +3,15 @@
 scripts/obs_config.txt
 
 # Runtime state files written fresh by every run -- not meaningful to
-# track, just scratch output.
-scripts/_playback_state.txt
-scripts/_frame_range_state.txt
-d4_anim_sample/_cache_build_progress.txt
+# track, just scratch output. Broadened 2026-08-22 from individually
+# named files to the whole underscore-prefixed pattern this project uses
+# for anything written by a live run (recording-monitor selection, cache
+# progress, and every ad-hoc diagnostic dump), since new ones keep
+# getting added and each was getting missed here one at a time.
+scripts/_*.txt
+d4_anim_sample/_*.txt
+d4_anim_sample/_*.png
+
+# Sampled ROM caches -- generated data keyed by animation-reference path
+# on this machine, not source. Rebuildable via the Cache button.
+d4_anim_sample/*.json

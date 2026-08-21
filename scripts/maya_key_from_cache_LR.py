@@ -205,6 +205,13 @@ if not os.path.exists(CACHE_PATH):
     cache_script = os.path.join(SCRIPTS_DIR, 'maya_cache_bbox.py')
     exec(compile(open(cache_script).read(), cache_script, 'exec'), {})
 
+if not os.path.exists(CACHE_PATH):
+    # See maya_key_from_cache.py's own copy of this check for the full
+    # reasoning -- same fix, same design (2026-08-22): never quietly
+    # continue into a broken recording when no cache could be built.
+    print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
+    raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
+
 with open(CACHE_PATH) as f:
     cache = json.load(f)
 
@@ -235,4 +242,4 @@ elapsed = time.time() - _t0
 print('Elapsed: %.2f sec' % elapsed)
 with open(r'D:\__backup\claude\maya_debug.txt', 'w') as f:
     f.write('elapsed_sec=%.2f threshold_pct=%s scales=%s' % (elapsed, THRESHOLD_PCT, scale_cache))
-print('CLAUDE_KEY_FROM_CACHE_OK')
+print('KEY_FROM_CACHE_OK')
