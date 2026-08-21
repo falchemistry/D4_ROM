@@ -129,6 +129,13 @@ def load_cache():
         print('No bbox cache for this animation -- sampling now (one time, several minutes)...')
         cache_script = os.path.join(SCRIPT_DIR, 'maya_cache_bbox.py')
         exec(compile(open(cache_script).read(), cache_script, 'exec'), {})
+    if not os.path.exists(path):
+        # Same fix and reasoning as maya_key_from_cache.py's own copy of
+        # this check (2026-08-22 design: never quietly continue into a
+        # broken recording). See maya_camera_panels.py's own copy of this
+        # for the full comment.
+        print('CAPTURE_ABORT: no cache could be built for this animation -- check that the ROM animation reference is actually loaded and keyed in this scene, then try again.')
+        raise RuntimeError('No cache available after a build attempt -- aborting rather than recording an empty/broken ROM.')
     with open(path) as f:
         return json.load(f)
 
