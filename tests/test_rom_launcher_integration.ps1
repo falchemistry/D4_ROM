@@ -57,6 +57,36 @@ Check "Capture is the default active tab at startup, Settings hidden" {
     if ($settingsPanel.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "expected Settings panel collapsed by default" }
 }
 
+Check "Magnifier always starts at the safe 0% default, not a value restored from an earlier launch" {
+    # Must run before any later Check moves $zoomSlider -- this is checking
+    # the state set once at launch, right after dot-sourcing rom_launcher.ps1
+    # above (design 2026-09-02: a forgotten non-zero magnifier from a past
+    # session must never silently carry into this one). ZoomSlider's own
+    # XAML default is already 0, so this also proves the box text got set
+    # explicitly rather than left blank (a same-value 0->0 assignment would
+    # never fire ValueChanged, which is what normally fills the box).
+    if ($zoomSlider.Value -ne 0) { throw "expected the magnifier slider to start at 0, got $($zoomSlider.Value)" }
+    if ($zoomValueBox.Text -ne "0") { throw "expected the magnifier box to read '0' at startup, got '$($zoomValueBox.Text)'" }
+}
+
+Check "Pixel offset starts at its safe/off default too, not a value restored from an earlier launch" {
+    # Same reasoning and same "must run before any later Check touches
+    # these controls" caveat as the Magnifier startup check above.
+    if ($offsetXBox.Text -ne "0") { throw "expected the X offset box to read '0' at startup, got '$($offsetXBox.Text)'" }
+    if ($offsetYBox.Text -ne "0") { throw "expected the Y offset box to read '0' at startup, got '$($offsetYBox.Text)'" }
+}
+
+Check "Recenter at start frame's state file is cleared at startup (mandatory now, no checkbox to check)" {
+    # Runs against the REAL project path deliberately -- Clear-RecenterStartFrame
+    # was already called at startup (dot-source time), before any test override
+    # could exist, so this is the only way to observe that it actually ran.
+    $realPath = Get-RecenterStartFramePath
+    if (Test-Path $realPath) {
+        $content = (Get-Content $realPath -Raw -ErrorAction SilentlyContinue)
+        if ($content -and $content.Trim() -ne "") { throw "expected the recenter-start-frame file cleared at startup, got '$content'" }
+    }
+}
+
 Check "startup writes a consolidated situation summary to the Logs box, visible regardless of active tab (design 2026-08-22)" {
     # Must run before any later Check clears $logBox (e.g. via Start-Steps)
     # -- this is checking the ORIGINAL content written once at launch,
@@ -1074,8 +1104,57 @@ Check "Update-ObsPasswordStatusIndicator reflects a temp config file's real cont
 
     Set-Content -Path $script:obsConfigTestPath -Value "host: 127.0.0.1`nport: 4455`npassword: a_real_test_password`n" -Encoding UTF8
     Update-ObsPasswordStatusIndicator
-    if ($obsPasswordStatusLabel.Text -notmatch "password set") { throw "expected 'password set' once a real password is in the file, got '$($obsPasswordStatusLabel.Text)'" }
-    if ($obsPasswordStatusDot.Fill.Color -ne [System.Windows.Media.Colors]::LimeGreen) { throw "expected the OBS status dot green once configured, got '$($obsPasswordStatusDot.Fill.Color)'" }
+    # User report: this dot used to go straight to green the instant SOME
+    # password string existed, even a wrong one -- "the auto finding...
+    # need to check whether the tools can really access the obs before
+    # updating the green signal." A configured-but-unverified password
+    # must land on the SAME amber used for "no cache yet" elsewhere
+    # ($script:cacheWarningBrush), never green -- green is now earned
+    # only by Update-ObsPasswordVerificationIndicator, from a REAL
+    # connect+identify handshake result (see the checks below).
+    if ($obsPasswordStatusLabel.Text -notmatch "not yet verified") { throw "expected 'not yet verified' once a password is in the file but never checked, got '$($obsPasswordStatusLabel.Text)'" }
+    if ($obsPasswordStatusDot.Fill.Color -ne $script:cacheWarningBrush.Color) { throw "expected the OBS status dot amber (unverified), not green, got '$($obsPasswordStatusDot.Fill.Color)'" }
+}
+
+Check "Update-ObsPasswordVerificationIndicator turns the dot green only on a REAL successful handshake, red on a confirmed wrong password, and amber (not red) when OBS just isn't reachable to check at all" {
+    $script:obsConfigTestPath = Join-Path $env:TEMP "rom_launcher_test_obs_config_verify.txt"
+    function Get-ObsConfigFilePath { return $script:obsConfigTestPath }
+    Set-Content -Path $script:obsConfigTestPath -Value "host: 127.0.0.1`nport: 4455`npassword: a_real_test_password`n" -Encoding UTF8
+
+    Update-ObsPasswordVerificationIndicator ([PSCustomObject]@{ Success = $true; AuthFailed = $false })
+    if ($obsPasswordStatusDot.Fill.Color -ne [System.Windows.Media.Colors]::LimeGreen) { throw "expected green on a real successful handshake, got '$($obsPasswordStatusDot.Fill.Color)'" }
+    if ($obsPasswordStatusLabel.Text -notmatch "verified") { throw "expected the label to say 'verified', got '$($obsPasswordStatusLabel.Text)'" }
+
+    Update-ObsPasswordVerificationIndicator ([PSCustomObject]@{ Success = $false; AuthFailed = $true })
+    if ($obsPasswordStatusDot.Fill.Color -ne [System.Windows.Media.Colors]::Red) { throw "expected red when OBS was reachable but authentication failed, got '$($obsPasswordStatusDot.Fill.Color)'" }
+    if ($obsPasswordStatusLabel.Text -notmatch "incorrect") { throw "expected the label to say the password looks incorrect, got '$($obsPasswordStatusLabel.Text)'" }
+
+    Update-ObsPasswordVerificationIndicator ([PSCustomObject]@{ Success = $false; AuthFailed = $false })
+    if ($obsPasswordStatusDot.Fill.Color -ne $script:cacheWarningBrush.Color) { throw "expected amber (not red) when OBS itself isn't reachable -- that's 'can't tell', not 'confirmed wrong', got '$($obsPasswordStatusDot.Fill.Color)'" }
+    if ($obsPasswordStatusLabel.Text -notmatch "can't verify") { throw "expected the label to say it can't verify, got '$($obsPasswordStatusLabel.Text)'" }
+
+    # No password configured at all -- must NOT let a stale/incoming
+    # check result override Update-ObsPasswordStatusIndicator's own gray.
+    Remove-Item $script:obsConfigTestPath -ErrorAction SilentlyContinue
+    Update-ObsPasswordStatusIndicator
+    Update-ObsPasswordVerificationIndicator ([PSCustomObject]@{ Success = $true; AuthFailed = $false })
+    if ($obsPasswordStatusDot.Fill.Color -ne [System.Windows.Media.Colors]::Gray) { throw "expected gray to survive when no password is configured at all, got '$($obsPasswordStatusDot.Fill.Color)'" }
+}
+
+Check "Update-MonitorList's own real handshake result also drives the OBS password dot, not just the Monitor dropdown" {
+    $script:obsConfigTestPath = Join-Path $env:TEMP "rom_launcher_test_obs_config_combined.txt"
+    function Get-ObsConfigFilePath { return $script:obsConfigTestPath }
+    Set-Content -Path $script:obsConfigTestPath -Value "host: 127.0.0.1`nport: 4455`npassword: a_real_test_password`n" -Encoding UTF8
+
+    function Get-ObsMonitorList {
+        return [PSCustomObject]@{ Success = $false; ErrorMessage = "the OBS WebSocket password is incorrect."; Monitors = @(); AuthFailed = $true }
+    }
+    $script:recordingMonitorNameTestPath = Join-Path $env:TEMP "rom_launcher_test_monitor_name_authfail.txt"
+    function Get-RecordingMonitorNamePath { return $script:recordingMonitorNameTestPath }
+    Remove-Item $script:recordingMonitorNameTestPath -ErrorAction SilentlyContinue
+
+    Update-MonitorList
+    if ($obsPasswordStatusDot.Fill.Color -ne [System.Windows.Media.Colors]::Red) { throw "expected Update-MonitorList's own auth-failed result to turn the password dot red, got '$($obsPasswordStatusDot.Fill.Color)'" }
 }
 
 Check "Update-MonitorList populates the ComboBox and pre-selects whichever monitor OBS reports as current" {
@@ -1315,6 +1394,265 @@ Check "clicking the Recording Monitor refresh button calls Update-MonitorList wi
     if ($script:refreshCalledWithEnsureRunning -ne $true) { throw "expected the Refresh button to call Update-MonitorList -EnsureRunning" }
     if (-not $previewButton.IsEnabled) { throw "expected other buttons re-enabled once the refresh finished" }
     if (-not $monitorRefreshButton.IsEnabled) { throw "expected the Refresh button itself re-enabled once its own refresh finished" }
+}
+
+Check "Write-CameraZoomPct writes the value to disk, no byte-order mark" {
+    # Read by get_zoom_pct() in maya_camera_panels.py/_LR.py -- same BOM
+    # risk class already fixed for Write-RecordingMonitorRect (a BOM makes
+    # Python's float() raise, silently falling back to the 0% default).
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    Write-CameraZoomPct -Value 25
+    $bytes = [System.IO.File]::ReadAllBytes($script:cameraZoomPctTestPath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "expected no UTF-8 byte-order-mark at the start of the file, found EF BB BF"
+    }
+    $written = (Get-Content $script:cameraZoomPctTestPath -Raw).Trim()
+    if ($written -ne "25") { throw "expected '25', got '$written'" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+
+Check "moving the Magnifier slider writes the value and updates the typed-entry box to match" {
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct_slider.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    $zoomSlider.Value = 20
+    $written = (Get-Content $script:cameraZoomPctTestPath -Raw).Trim()
+    if ($written -ne "20") { throw "expected '20' written for a +20 slider move, got '$written'" }
+    if ($zoomValueBox.Text -ne "+20") { throw "expected box '+20', got '$($zoomValueBox.Text)'" }
+
+    $zoomSlider.Value = -15
+    $written = (Get-Content $script:cameraZoomPctTestPath -Raw).Trim()
+    if ($written -ne "-15") { throw "expected '-15' written for a -15 slider move, got '$written'" }
+    if ($zoomValueBox.Text -ne "-15") { throw "expected box '-15', got '$($zoomValueBox.Text)'" }
+
+    $zoomSlider.Value = 0
+    if ($zoomValueBox.Text -ne "0") { throw "expected box '0' at the safe default, got '$($zoomValueBox.Text)'" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+Check "typing a value into the Magnifier box commits it: moves the slider, writes the file, normalizes the display" {
+    # This drives Commit-ZoomValueBox directly, the same function BOTH
+    # LostFocus and the Enter-key handler call -- a real KeyDown routed
+    # event needs a live PresentationSource (only exists once a window has
+    # actually been Show()n), which this suite's -NoShow window never has;
+    # confirmed live, constructing one throws "Value cannot be null.
+    # Parameter name: inputSource". The Enter-key handler itself is just a
+    # one-line `if ($e.Key -eq Return) { Commit-ZoomValueBox }` on top of
+    # this already-tested function, not independently risky logic.
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct_typed_enter.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    $zoomValueBox.Text = "35"
+    Commit-ZoomValueBox
+
+    if ($zoomSlider.Value -ne 35) { throw "expected the typed value to move the slider to 35, got $($zoomSlider.Value)" }
+    $written = (Get-Content $script:cameraZoomPctTestPath -Raw).Trim()
+    if ($written -ne "35") { throw "expected '35' written after committing the typed box value, got '$written'" }
+    if ($zoomValueBox.Text -ne "+35") { throw "expected the box normalized to '+35' after commit, got '$($zoomValueBox.Text)'" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+Check "typing a value into the Magnifier box and losing focus (Commit-ZoomValueBox) applies it the same way" {
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct_typed_lostfocus.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    # Drives Commit-ZoomValueBox directly rather than raising a real
+    # LostFocus event -- WPF only fires LostFocus with real keyboard focus
+    # in play, which a headless -NoShow window never has, so this is the
+    # same technique already used for other logic-only event handlers in
+    # this suite. The KeyDown/Return check above already proves the wiring
+    # from a real routed event; this proves the handler's own parsing.
+    $zoomValueBox.Text = "-40"
+    Commit-ZoomValueBox
+    if ($zoomSlider.Value -ne -40) { throw "expected the slider to move to -40, got $($zoomSlider.Value)" }
+    $written = (Get-Content $script:cameraZoomPctTestPath -Raw).Trim()
+    if ($written -ne "-40") { throw "expected '-40' written, got '$written'" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+Check "typing an out-of-range value clamps to +/-50, typing garbage reverts to the last valid value" {
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct_typed_invalid.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    $zoomValueBox.Text = "500"
+    Commit-ZoomValueBox
+    if ($zoomSlider.Value -ne 50) { throw "expected an out-of-range typed value clamped to 50, got $($zoomSlider.Value)" }
+
+    $zoomValueBox.Text = "abc"
+    Commit-ZoomValueBox
+    if ($zoomSlider.Value -ne 50) { throw "expected garbage input to leave the slider unchanged at 50, got $($zoomSlider.Value)" }
+    if ($zoomValueBox.Text -ne "+50") { throw "expected the box reverted to the last valid '+50', got '$($zoomValueBox.Text)'" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+Check "typing a value with a trailing percent sign is accepted" {
+    $script:cameraZoomPctTestPath = Join-Path $env:TEMP "rom_launcher_test_zoom_pct_typed_percent.txt"
+    function Get-CameraZoomPctPath { return $script:cameraZoomPctTestPath }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+
+    $zoomValueBox.Text = "10%"
+    Commit-ZoomValueBox
+    if ($zoomSlider.Value -ne 10) { throw "expected '10%' to parse as 10, got $($zoomSlider.Value)" }
+    Remove-Item $script:cameraZoomPctTestPath -ErrorAction SilentlyContinue
+}
+
+Check "Write-CameraOffsetPx writes 'X,Y' to disk, no byte-order mark" {
+    $script:cameraOffsetTestPath = Join-Path $env:TEMP "rom_launcher_test_offset_px.txt"
+    function Get-CameraOffsetPxPath { return $script:cameraOffsetTestPath }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+
+    Write-CameraOffsetPx -X 25 -Y -10
+    $bytes = [System.IO.File]::ReadAllBytes($script:cameraOffsetTestPath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "expected no UTF-8 byte-order-mark at the start of the file, found EF BB BF"
+    }
+    $written = (Get-Content $script:cameraOffsetTestPath -Raw).Trim()
+    if ($written -ne "25,-10") { throw "expected '25,-10', got '$written'" }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+}
+
+Check "committing the X offset box also writes the Y box's current value (shared 'X,Y' file, not a half-updated pair)" {
+    $script:cameraOffsetTestPath = Join-Path $env:TEMP "rom_launcher_test_offset_px_combined.txt"
+    function Get-CameraOffsetPxPath { return $script:cameraOffsetTestPath }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+    $offsetXBox.Text = "0"; $offsetYBox.Text = "0"
+    $script:lastValidOffsetX = 0; $script:lastValidOffsetY = 0
+
+    $offsetYBox.Text = "40"
+    Commit-OffsetBoxes
+    $written = (Get-Content $script:cameraOffsetTestPath -Raw).Trim()
+    if ($written -ne "0,40") { throw "expected '0,40' after committing just the Y box, got '$written'" }
+
+    $offsetXBox.Text = "-30"
+    Commit-OffsetBoxes
+    $written = (Get-Content $script:cameraOffsetTestPath -Raw).Trim()
+    if ($written -ne "-30,40") { throw "expected '-30,40' (X changed, Y still carried through), got '$written'" }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+}
+
+Check "invalid input in one offset box reverts just that box, without disturbing the other's valid value" {
+    $script:cameraOffsetTestPath = Join-Path $env:TEMP "rom_launcher_test_offset_px_invalid.txt"
+    function Get-CameraOffsetPxPath { return $script:cameraOffsetTestPath }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+    $offsetXBox.Text = "0"; $offsetYBox.Text = "0"
+    $script:lastValidOffsetX = 0; $script:lastValidOffsetY = 0
+
+    $offsetXBox.Text = "15"
+    Commit-OffsetBoxes
+    $offsetXBox.Text = "not a number"
+    Commit-OffsetBoxes
+    if ($offsetXBox.Text -ne "15") { throw "expected X to revert to its last valid '15', got '$($offsetXBox.Text)'" }
+    $written = (Get-Content $script:cameraOffsetTestPath -Raw).Trim()
+    if ($written -ne "15,0") { throw "expected '15,0' after reverting garbage input, got '$written'" }
+    Remove-Item $script:cameraOffsetTestPath -ErrorAction SilentlyContinue
+}
+
+Check "Write-RecenterStartFrame writes the frame number; Clear-RecenterStartFrame writes an empty file (the 'disabled' state)" {
+    $script:recenterFrameTestPath = Join-Path $env:TEMP "rom_launcher_test_recenter_frame.txt"
+    function Get-RecenterStartFramePath { return $script:recenterFrameTestPath }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+
+    Write-RecenterStartFrame -Frame 1500
+    $written = (Get-Content $script:recenterFrameTestPath -Raw).Trim()
+    if ($written -ne "1500") { throw "expected '1500', got '$written'" }
+
+    Clear-RecenterStartFrame
+    $written = (Get-Content $script:recenterFrameTestPath -Raw)
+    if ($written.Trim() -ne "") { throw "expected an empty file after Clear-RecenterStartFrame, got '$written'" }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+}
+
+Check "Preview always writes the resolved Start frame (mandatory now, no checkbox)" {
+    # Get-CaptureSteps overridden to a harmless ping step, same reasoning
+    # as the Start Recording tests -- the REAL one would have Start-Steps
+    # (called right after the code under test here) launch a real
+    # send_to_maya.ps1 process against whatever Maya session is actually
+    # live right now.
+    $script:recenterFrameTestPath = Join-Path $env:TEMP "rom_launcher_test_recenter_preview.txt"
+    function Get-RecenterStartFramePath { return $script:recenterFrameTestPath }
+    function Get-ResolvedTimeRange { return [PSCustomObject]@{ Success = $true; Start = 250; End = 400; ErrorMessage = $null } }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+
+    $previewButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    # The recenter file write happens synchronously in the click handler,
+    # before Start-Steps -- but still wait for the run to finish so it
+    # can't bleed a lingering async process into the next Check.
+    Wait-ForStatus "Done" 15 | Out-Null
+    $written = (Get-Content $script:recenterFrameTestPath -Raw).Trim()
+    if ($written -ne "250") { throw "expected the resolved Start (250) written, got '$written'" }
+    # Real bug fixed (2026-09-02): this confirmation used to be logged
+    # BEFORE Start-Steps, which clears the log box as one of its own first
+    # actions -- the message was silently wiped every time, so nothing
+    # ever confirmed a resolved Start frame even on runs where recentering
+    # DID apply. User-reported as "the tool didn't calculate my start
+    # frame" when the file write (proven above) shows it actually did.
+    if ($logBox.Text -notmatch "Recenter at start frame: resolved Start=250") { throw "expected a visible confirmation of the resolved Start frame in the log, got:`n$($logBox.Text)" }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+}
+
+Check "Preview logs a warning and proceeds without recentering when the Time Range can't be resolved (not a hard block)" {
+    $script:recenterFrameTestPath = Join-Path $env:TEMP "rom_launcher_test_recenter_preview_fail.txt"
+    function Get-RecenterStartFramePath { return $script:recenterFrameTestPath }
+    function Get-ResolvedTimeRange { return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "No response from Maya." } }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+
+    $previewButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    Wait-ForStatus "Done" 15 | Out-Null
+    if ($logBox.Text -notmatch "previewing without recentering") { throw "expected a warning logged instead of blocking Preview, got:`n$($logBox.Text)" }
+    $written = (Get-Content $script:recenterFrameTestPath -Raw)
+    if ($written.Trim() -ne "") { throw "expected no recenter frame written when resolution fails, got '$written'" }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+}
+
+Check "Start Recording writes the SAME resolved Start frame Get-CaptureClickResult already found, no second Maya round trip" {
+    # Get-CaptureSteps overridden to a single harmless ping step -- same
+    # technique as the other Start Recording click tests in this suite
+    # (see "Start Recording is blocked..." above) -- the REAL Get-CaptureSteps
+    # would build args pointing at send_to_maya.ps1/maya_obs_capture.ps1,
+    # which Start-Steps would then actually launch as real processes.
+    $script:recenterFrameTestPath = Join-Path $env:TEMP "rom_launcher_test_recenter_start.txt"
+    function Get-RecenterStartFramePath { return $script:recenterFrameTestPath }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+    $script:resolveCallCount = 0
+    function Get-ResolvedTimeRange {
+        $script:resolveCallCount++
+        return [PSCustomObject]@{ Success = $true; Start = 700; End = 900; ErrorMessage = $null }
+    }
+    function Update-PortStatusIndicator { return $true }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($script:resolveCallCount -ne 1) { throw "expected exactly 1 range resolution (shared with Get-CaptureClickResult), got $($script:resolveCallCount)" }
+    $written = (Get-Content $script:recenterFrameTestPath -Raw).Trim()
+    if ($written -ne "700") { throw "expected the resolved Start (700) written, got '$written'" }
+
+    $reachedDone = Wait-ForStatus "Done" 15
+    if (-not $reachedDone) { throw "status never reached Done, log so far:`n$($logBox.Text)" }
+    # Same bug/fix as Preview's own confirmation message -- see that Check's
+    # comment for the full story.
+    if ($logBox.Text -notmatch "Recenter at start frame: resolved Start=700") { throw "expected a visible confirmation of the resolved Start frame in the log, got:`n$($logBox.Text)" }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
 }
 
 Check "Show-DarkInput's real Save button actually returns the typed text (same GetNewClosure class of risk as Show-DarkConfirm)" {

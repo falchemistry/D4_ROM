@@ -17,24 +17,85 @@ import maya.mel as mel
 # --- configuration -----------------------------------------------------
 VIEWS = ['front', 'back']       # any of: front, back, side (=right), left
 
-# Tolerance the camera keyer will use. MUST match EDGE_OVERFLOW_PCT in
-# maya_key_from_cache.py -- the margin below is derived from it, so if the
-# two drift apart the framing will be wrong (too tight -> camera thrashes).
-EDGE_OVERFLOW_PCT = 0.08
-
-# MARGIN_PX = None  -> derive the top/bottom margin automatically so that the
-#                      subject's widest pose still fits within
-#                      frame + 2*EDGE_OVERFLOW_PCT (i.e. the camera stays
-#                      stable at that tolerance). Set an int to override.
-# The character's arm span is wider than a height-fit portrait frame, so a
-# low tolerance is only stable if the frame is widened -- which is what the
-# margin does. Bigger margin -> fewer usable pixels for the character ->
-# wider orthographicWidth -> arms fit. See the note in maya_key_from_cache.py.
+# MARGIN_PX = None  -> derive the top/bottom margin automatically so the
+#                      frame is sized directly from the subject's true
+#                      widest pose across the whole animation (max_w in the
+#                      bbox cache), PLUS enough extra room for edge_guard's
+#                      own drift tolerance (EDGE_OVERFLOW_PCT below). Set an
+#                      int to override.
+#
+# Design (2026-09-02, revised): a frame sized for max_w ALONE is not
+# actually clip-proof -- edge_guard is reactive (see maya_key_from_cache.py),
+# so it lets the subject drift up to EDGE_OVERFLOW_PCT of the frame width
+# before it reacts at all. If a max-width pose happens to coincide with
+# near-max drift, the two combine and the subject still clips, even though
+# the frame is "wide enough" for the pose alone -- confirmed live against
+# palM_rom_anim's real cache (width-only sizing: 582 clipped frames, worst
+# clip 19.2 units = 8% of orthoWidth, exactly EDGE_OVERFLOW_PCT -- not a
+# coincidence, see the derivation below).
+#
+# EDGE_OVERFLOW_PCT is therefore back in this formula (previously decoupled
+# entirely -- that was wrong; the two constants have a real mathematical
+# relationship). The worst case is: subject drifted to the edge of
+# tolerance (overflow_pct * orthoWidth) AND simultaneously at max_w width.
+# For that to still fit inside the frame:
+#     overflow_pct * orthoWidth + max_w/2 <= orthoWidth/2
+#     orthoWidth >= max_w / (1 - 2*overflow_pct)
+# (Note the MINUS, unlike the pre-redesign formula's PLUS -- that older
+# version deliberately UNDERSIZED the frame below max_w, relying entirely
+# on panning to compensate; this sizes ABOVE max_w, with panning only
+# handling drift, not pose width.) This still can't reach exactly zero
+# clipping -- by construction, edge_guard only reacts once overflow_pct is
+# exceeded, so a residual clip of up to overflow_pct * orthoWidth is
+# structurally unavoidable with any reactive tolerance. What this DOES fix
+# is the SEVERITY: with EDGE_OVERFLOW_PCT lowered to 2% (see below), worst
+# case drops to ~5.0 units on palM (a fingertip, not a hand) instead of
+# 22.8 units, while only widening the frame by ~4%.
 MARGIN_PX = None
 MARGIN_PX_MIN = 30              # floor, so framing never goes edge-to-edge
 MARGIN_PX_MAX = 260             # ceiling, so a freak-wide pose can't zoom way out
 MARGIN_SAFETY = 1.02            # 2% extra frame width over exact break-even
+
+# Edge-guard's own drift-tolerance threshold (see maya_key_from_cache.py's
+# key_edge_guard) -- MUST match EDGE_OVERFLOW_PCT there, the formula above
+# is only correct if the two stay in sync. Lowered from 0.08 to 0.02
+# (2026-09-02): at 8%, a max-width pose combined with max drift could clip
+# by up to 8% of the frame width (a visibly obvious hand poking
+# off-screen, user-reported); at 2%, the same worst case drops to ~2% of
+# frame width, at the tradeoff of somewhat more frequent (but still small,
+# nudge-sized) camera corrections -- validated against palM's real cache:
+# 88 nudges across 3241 frames (~1 every 37 frames) vs 11 at 8%. 2% chosen
+# over an even tighter 1% (130 nudges, ~1 every 25 frames) to keep
+# corrections less frequent, at the cost of a somewhat larger (though
+# still small) worst-case residual clip -- 5.0 units vs 2.4.
+EDGE_OVERFLOW_PCT = 0.02
 AUTO_MARGIN_AXIS = 'x'          # cache axis this view pair pans along
+
+# Magnifier: user-adjustable +/-50% zoom on top of the safe default above.
+# Positive = zoom in (narrower orthoWidth, character bigger); negative =
+# zoom out (wider orthoWidth, more headroom). ZOOM_PCT is only the fallback
+# used before the launcher's magnifier control has ever written a value --
+# see get_zoom_pct().
+ZOOM_PCT = 0.0
+ZOOM_PCT_MIN = -50.0
+ZOOM_PCT_MAX = 50.0
+
+# Manual pixel-space nudge on top of everything above -- for a short
+# Start/End or Time Slider capture where the automatic framing (anchored to
+# the FULL animation's bbox) doesn't happen to center that particular
+# sub-range. OFFSET_X_PX/OFFSET_Y_PX are only the fallback used before the
+# launcher's Offset boxes have ever written a value -- see
+# get_pixel_offset(). Positive X shifts the framing so the subject appears
+# further right on screen; positive Y shifts it further up.
+OFFSET_X_PX = 0.0
+OFFSET_Y_PX = 0.0
+
+# Recenter at start frame: when set (a frame number, via the launcher's
+# checkbox), bbox is measured at THAT frame instead of whatever frame
+# happens to be current when this script runs -- see get_recenter_start_frame().
+# Fixes off-center framing on a short capture whose Start value differs from
+# wherever the artist last left the timeline (the Range Slider's own
+# min/max is independent of the current-time cursor in Maya).
 
 ALL_KNOWN_VIEWS = ['front', 'back', 'side', 'left']
 TITLE_OVERRIDES = {'side': 'Right'}  # Maya calls the right-side camera 'side'
@@ -108,6 +169,60 @@ def get_secondary_monitor_rect():
     return SECONDARY_MONITOR_RECT
 
 
+def get_zoom_pct():
+    """Reads the magnifier value rom_launcher.ps1's zoom slider last wrote
+    (see Write-CameraZoomPct), the same file-based hand-off pattern as
+    get_secondary_monitor_rect() above. Falls back to ZOOM_PCT if the file
+    doesn't exist yet (e.g. before the launcher's magnifier control has
+    ever been touched) or is malformed, so this still works standalone."""
+    path = os.path.join(CACHE_DIR, '_camera_zoom_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        value = float(content)
+        return max(ZOOM_PCT_MIN, min(ZOOM_PCT_MAX, value))
+    except (IOError, OSError, ValueError):
+        return ZOOM_PCT
+
+
+def get_pixel_offset():
+    """Reads the X/Y pixel offset rom_launcher.ps1's Offset boxes last
+    wrote (see Write-CameraOffsetPx) as a single 'X,Y' line -- same
+    file-based hand-off pattern as get_zoom_pct(). Falls back to
+    (OFFSET_X_PX, OFFSET_Y_PX) if the file doesn't exist yet or is
+    malformed."""
+    path = os.path.join(CACHE_DIR, '_camera_offset_px.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        parts = content.split(',')
+        if len(parts) == 2:
+            return float(parts[0]), float(parts[1])
+    except (IOError, OSError, ValueError):
+        pass
+    return OFFSET_X_PX, OFFSET_Y_PX
+
+
+def get_recenter_start_frame():
+    """Reads the frame number rom_launcher.ps1 wrote for 'Recenter at start
+    frame' (see Write-RecenterStartFrame) -- the capture range's resolved
+    Start value (Time Slider min, typed Start/End, or the full animation's
+    start), NOT necessarily wherever Maya's current-time cursor happens to
+    be. Returns None (disabled -- use whatever frame is current, the
+    original behavior) if the file is empty, missing, or malformed; this is
+    the deliberate "off" state Clear-RecenterStartFrame writes when the
+    launcher's checkbox is unchecked, not just an error fallback."""
+    path = os.path.join(CACHE_DIR, '_camera_recenter_start_frame.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
 # --- automatic margin ------------------------------------------------------
 def find_animation_reference():
     refs = cmds.file(query=True, reference=True) or []
@@ -153,29 +268,98 @@ def load_cache():
         return json.load(f)
 
 
-def compute_margin_px(world_h, panel_w, panel_h):
-    """Smallest top/bottom margin (i.e. tightest framing) at which the
-    subject's widest pose still fits inside frame + 2*EDGE_OVERFLOW_PCT.
+def compute_effective_world_h(world_h, cache):
+    """Widens world_h to the cache's own max height when that's taller --
+    there is no vertical equivalent of edge_guard's horizontal panning, so
+    a single frame's live-measured height was never protected by a
+    whole-animation guarantee the way max_w is. Design (2026-09-02):
+    confirmed real on palM_rom_anim (a clean, integer-frame-only sweep --
+    an earlier check using fractional sample points found what looked
+    like a severe glitch, but that turned out to be an artifact of
+    evaluating animation curves AT a non-keyed time, not a real risk;
+    capture/recenter always land on real, integer frames) -- height
+    varies ~11% across the animation (226 baseline vs 253 at a
+    raised-arms pose), so sizing off a short-pose frame risked the same
+    class of vertical clipping the max_w fix already prevents
+    horizontally. Falls back to plain world_h for a cache built before
+    this field existed (`heights` missing) -- old caches need a Force
+    Rebuild to pick this up, not a silent KeyError.
 
-    Break-even is  tol = (max_width / orthoWidth - 1) / 2, so the frame width
-    we need is     orthoWidth = max_width / (1 + 2*tol).
+    MUST be called with the SAME value compute_margin_px used to derive
+    margin_px, and the result passed into frame_camera's world_h_override
+    -- margin_px and the final orthoWidth are two halves of one formula
+    (orthoWidth = world_h * panel_w / (panel_h - 2*margin)), so using a
+    narrower world_h in one half than the other silently produces an
+    orthoWidth NARROWER than intended instead of wider (confirmed by
+    working through the algebra before shipping this -- not obvious from
+    either half in isolation)."""
+    cached_heights = cache.get('heights')
+    if cached_heights:
+        return max(world_h, max(cached_heights) * MARGIN_SAFETY)
+    return world_h
+
+
+def compute_margin_px(world_h, panel_w, panel_h):
+    """Top/bottom margin sized so the frame contains the subject's widest
+    pose (max_w in the bbox cache) EVEN AT full edge_guard drift tolerance,
+    plus MARGIN_SAFETY headroom -- see the module-level comment above
+    EDGE_OVERFLOW_PCT for the derivation. world_h should already be the
+    WIDENED value from compute_effective_world_h, not a raw live
+    measurement -- see that function's docstring for why.
+
     Framing ties orthoWidth to the margin via
                    orthoWidth = world_h * panel_w / (panel_h - 2*margin)
-    which rearranges to the margin below."""
-    if MARGIN_PX is not None:
-        return int(MARGIN_PX)
+    which rearranges to the margin below.
 
+    Returns (margin, max_w, needed_ortho) -- the caller also needs max_w
+    and needed_ortho to work out how much of this margin the magnifier's
+    zoom eats into (see compute_effective_overflow_pct)."""
     cache = load_cache()
     max_w = max(cache[AUTO_MARGIN_AXIS + '_width'])
-    needed_ortho = (max_w / (1.0 + 2.0 * EDGE_OVERFLOW_PCT)) * MARGIN_SAFETY
+    needed_ortho = (max_w / (1.0 - 2.0 * EDGE_OVERFLOW_PCT)) * MARGIN_SAFETY
+
+    if MARGIN_PX is not None:
+        return int(MARGIN_PX), max_w, needed_ortho
+
     margin = (panel_h - (world_h * float(panel_w) / needed_ortho)) / 2.0
     margin = int(round(max(MARGIN_PX_MIN, min(margin, MARGIN_PX_MAX))))
 
-    print('Auto margin: widest %s-span=%.1f, tol=%.0f%% -> orthoWidth=%.1f -> margin=%dpx '
+    print('Auto margin: widest %s-span=%.1f, drift tol=%.0f%% -> orthoWidth=%.1f -> margin=%dpx '
           '(character fills %d of %d px)'
           % (AUTO_MARGIN_AXIS, max_w, EDGE_OVERFLOW_PCT * 100, needed_ortho,
              margin, panel_h - 2 * margin, panel_h))
-    return margin
+    return margin, max_w, needed_ortho
+
+
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct):
+    """The magnifier multiplies the final orthoWidth AFTER compute_margin_px
+    has already sized the frame assuming zero zoom -- zooming in narrows
+    the frame below what compute_margin_px promised, silently eating into
+    (or entirely consuming) the drift-tolerance headroom EDGE_OVERFLOW_PCT
+    was sized around. A fixed EDGE_OVERFLOW_PCT then becomes wrong at
+    nonzero zoom: at +10% zoom with the shipped 2% tolerance and 2%
+    MARGIN_SAFETY, the frame narrows to LESS than max_w alone, before any
+    drift at all -- confirmed by this same formula going negative there.
+
+    Re-derives the tolerance that's actually consistent with the ZOOMED
+    frame, so edge_guard reacts to drift more eagerly exactly when zoom has
+    left less room to spare (and tolerates more when zooming out gives
+    extra room instead). Clamped to a floor of 0 -- past a large enough
+    zoom-in, even the driftless max-width pose no longer fits in the frame
+    at all, which no tolerance value can fix; that residual is an inherent
+    consequence of the user's own zoom choice, not something this can
+    compensate away."""
+    final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
+    if final_ortho <= 0:
+        return 0.0
+    effective = (1.0 - (max_w * MARGIN_SAFETY / final_ortho)) / 2.0
+    return max(0.0, effective)
+
+
+def write_effective_overflow_pct(value):
+    path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
+    with open(path, 'w') as f:
+        f.write('%.6f' % value)
 
 
 def view_title(view_name):
@@ -242,18 +426,45 @@ def get_target_bbox():
     return cmds.exactWorldBoundingBox(sel)
 
 
-def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, margin_px):
+def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, margin_px, zoom_pct=0.0, offset_x_px=0.0, offset_y_px=0.0, world_h_override=None):
     h_axis, v_axis = VIEW_AXES[view_name]
     hmin, hmax = AXIS_BBOX_INDEX[h_axis]
     vmin, vmax = AXIS_BBOX_INDEX[v_axis]
 
-    world_h = bbox[vmax] - bbox[vmin]
+    # world_h_override, when given, MUST be the same widened value
+    # compute_margin_px derived margin_px from (see compute_effective_world_h)
+    # -- margin_px and orthoWidth are two halves of the same formula, and
+    # using the raw bbox height here instead would silently make orthoWidth
+    # narrower than intended rather than wider. center_v still comes from
+    # THIS bbox, not the cache -- vertical CENTERING stays a live/per-frame
+    # concern (and is guaranteed exact at the recenter frame specifically
+    # by maya_key_from_cache.py's apply_recenter_override), only the frame
+    # SIZE needs the whole-animation max.
+    world_h = world_h_override if world_h_override is not None else (bbox[vmax] - bbox[vmin])
     center_h = (bbox[hmax] + bbox[hmin]) / 2.0
     center_v = (bbox[vmax] + bbox[vmin]) / 2.0
 
     usable_px = max(panel_height - 2 * margin_px, 1)
     view_height_world = world_h * (panel_height / float(usable_px))
     ortho_width = view_height_world * (panel_width / float(panel_height))
+    # Magnifier: scales the whole visible frame (Maya derives the vertical
+    # extent from orthoWidth + panel aspect), so this is a true zoom, not
+    # just a horizontal crop.
+    ortho_width *= (1.0 - zoom_pct / 100.0)
+
+    # Pixel offset: converted using the FINAL (post-zoom) orthoWidth, so a
+    # "pixel" here means an actual pixel on the rendered panel, matching
+    # what the artist sees. world_per_px is the same in both directions --
+    # panel_width/panel_height and orthoWidth's implied vertical extent
+    # share one aspect ratio, so this one ratio covers both axes. Subtracted
+    # (not added): center_h/center_v are the CAMERA's own position, and
+    # moving the camera's position in the positive axis direction reveals
+    # what's on that axis's negative side -- i.e. shifts the subject the
+    # OTHER way on screen. Subtracting makes +X move the subject right and
+    # +Y move it up, the intuitive reading of a "pixel offset" control.
+    world_per_px = ortho_width / float(panel_width)
+    center_h -= offset_x_px * world_per_px
+    center_v -= offset_y_px * world_per_px
 
     shape = cmds.listRelatives(cam_transform, shapes=True)[0]
     cmds.setAttr(shape + '.orthographicWidth', ortho_width)
@@ -389,12 +600,55 @@ def open_view_panels():
     hide_model_editor_bars()
 
     cmds.select(clear=True)  # avoid framing a stray selection (cmds.camera() also auto-selects)
+
+    # Recenter at start frame: measure the bbox at the capture range's
+    # resolved Start value instead of whatever frame happens to be current
+    # -- the Range Slider's min/max is independent of the current-time
+    # cursor in Maya, so without this a short Start/End or Time Slider
+    # capture can be framed against a completely unrelated pose.
+    #
+    # Design (2026-09-02, revised): deliberately NOT restored afterward,
+    # unlike maya_key_from_cache.py's own size-scale measurement -- the
+    # whole point of this checkbox is for Preview to actually SHOW the
+    # artist their capture's starting pose, not just use it as an invisible
+    # internal reference. The first version restored the original time,
+    # which computed the correct framing but left the artist looking at
+    # whatever frame they started on -- indistinguishable from the feature
+    # doing nothing at all. maya_key_from_cache.py (the next step in the
+    # Preview/Start Recording sequence) captures ITS OWN current time at
+    # its own start and restores THAT at its own end, so leaving Maya here
+    # at recenter_frame carries through to the end of the whole run rather
+    # than snapping back.
+    recenter_frame = get_recenter_start_frame()
+    if recenter_frame is not None:
+        cmds.currentTime(recenter_frame)
+        print('Recenter at start frame: showing frame %s' % recenter_frame)
     bbox = get_target_bbox()
 
     # Panels are forced to exactly col_width x mon_height below, so the
-    # margin can be derived up front from those dimensions.
-    world_h = bbox[4] - bbox[1]
-    margin_px = compute_margin_px(world_h, col_width, mon_height)
+    # margin can be derived up front from those dimensions. Widened to the
+    # cache's own max height BEFORE computing margin (see
+    # compute_effective_world_h) -- this SAME widened value also has to
+    # reach frame_camera below (its world_h_override param), or margin_px
+    # and the final orthoWidth end up derived from two different heights
+    # and the frame comes out narrower than intended, not wider.
+    world_h = compute_effective_world_h(bbox[4] - bbox[1], load_cache())
+    margin_px, max_w, needed_ortho = compute_margin_px(world_h, col_width, mon_height)
+    zoom_pct = get_zoom_pct()
+    if zoom_pct:
+        print('Magnifier: %+.0f%%' % zoom_pct)
+    offset_x_px, offset_y_px = get_pixel_offset()
+    if offset_x_px or offset_y_px:
+        print('Pixel offset: X=%+.0f Y=%+.0f' % (offset_x_px, offset_y_px))
+
+    # Zoom changes how much of EDGE_OVERFLOW_PCT's built-in headroom is
+    # actually left -- write the value that ACTUALLY applies at the current
+    # zoom level so maya_key_from_cache.py's edge_guard uses it instead of
+    # its own static constant. See compute_effective_overflow_pct.
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct)
+    write_effective_overflow_pct(effective_overflow_pct)
+    if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+        print('Effective drift tolerance at this zoom: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
 
     close_all_view_panels()
 
@@ -427,7 +681,7 @@ def open_view_panels():
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
-        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px)
+        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
 
     cmds.refresh(force=True)
 

@@ -604,6 +604,47 @@ $script:ToolVersion = "1.0.0"
             <TextBlock Text="Only applies to Start Recording -- Preview never records."
                        TextWrapping="Wrap" FontSize="10" Foreground="#FFA0A0A0" Margin="0,2,0,10"/>
 
+            <!-- Frame Offsets (2026-09-02, renamed from "Frame Settings"):
+                 groups every manual override on top of the automatic "safe"
+                 framing (sized to always fit the animation's widest pose)
+                 into one place: zoom and a pixel nudge for off-center
+                 short-range captures. "Recenter at start frame" (the third
+                 control that used to live here) is no longer a checkbox:
+                 it's mandatory now, always applied by Preview/Start
+                 Recording, since it just fixes a real mismatch (Maya's
+                 current-time cursor vs. the capture range's actual Start)
+                 rather than being an optional creative choice. -->
+            <TextBlock Text="Frame Offsets" FontWeight="Bold" Margin="0,0,0,4"/>
+
+            <!-- Zoom and Offset share one row (2026-09-02): compact,
+                 left-aligned, no full-panel stretch. Zoom order is label,
+                 typed value, slider: the exact value box comes right
+                 after the label since typing is the precise way to set
+                 this, with the slider last for casual dragging. -->
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                <TextBlock Text="Zoom" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                <!-- Editable, not just the slider: typing an exact value and
+                     pressing Enter (or clicking away) is more precise than
+                     dragging for repeatable settings. Commits go through the
+                     SAME Write-CameraZoomPct path as the slider (see
+                     Commit-ZoomValueBox below), just by moving the slider to
+                     match, so there is only one place that writes the file. -->
+                <TextBox x:Name="ZoomValueBox" Width="36" Height="24" VerticalContentAlignment="Center" TextAlignment="Right" Margin="0,0,2,0"
+                         ToolTip="Type an exact magnifier value from -50 to 50, then press Enter or click away to apply. 0 is the safe default sized to fit the widest pose."/>
+                <TextBlock Text="%" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Slider x:Name="ZoomSlider" Width="60" Minimum="-50" Maximum="50" Value="0"
+                        TickFrequency="10" IsSnapToTickEnabled="False" VerticalAlignment="Center" Margin="0,0,16,0"
+                        ToolTip="Adjusts the camera framing +/-50% around the safe default (0%), which is sized to always fit the animation's widest pose. Positive zooms in, negative zooms out for more headroom. Type an exact value in the box instead of dragging if you prefer."/>
+                <TextBlock Text="X" FontWeight="Bold" Foreground="Red" VerticalAlignment="Center" Margin="0,0,4,0"
+                           ToolTip="Horizontal pixel offset, +/- (positive moves the subject right on screen)."/>
+                <TextBox x:Name="OffsetXBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center" Margin="0,0,10,0"
+                         ToolTip="Type a horizontal pixel offset, then press Enter or click away to apply."/>
+                <TextBlock Text="Y" FontWeight="Bold" Foreground="LimeGreen" VerticalAlignment="Center" Margin="0,0,4,0"
+                           ToolTip="Vertical pixel offset, +/- (positive moves the subject up on screen)."/>
+                <TextBox x:Name="OffsetYBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center"
+                         ToolTip="Type a vertical pixel offset, then press Enter or click away to apply."/>
+            </StackPanel>
+
             <!-- Only Start Recording toggles into Stop Recording, matching
                  that this is the one action that mirrors OBS's own
                  Start/Stop Recording button: a long-running recording a
@@ -704,6 +745,10 @@ $startEndRadio = $window.FindName("StartEndRadio")
 $startEndPanel = $window.FindName("StartEndPanel")
 $startFrameBox = $window.FindName("StartFrameBox")
 $endFrameBox = $window.FindName("EndFrameBox")
+$zoomSlider = $window.FindName("ZoomSlider")
+$zoomValueBox = $window.FindName("ZoomValueBox")
+$offsetXBox = $window.FindName("OffsetXBox")
+$offsetYBox = $window.FindName("OffsetYBox")
 $previewButton = $window.FindName("PreviewButton")
 $startRecordingButton = $window.FindName("StartRecordingButton")
 $resetButton = $window.FindName("ResetButton")
@@ -1411,17 +1456,55 @@ function Get-ObsPasswordStatus {
 }
 
 function Update-ObsPasswordStatusIndicator {
-    # Genuinely binary (configured or not -- there is no live "checking"
-    # state the way Maya/Cache have), so this dot only ever needs
-    # green/dim, unlike the richer gray/green/amber/red range the other
-    # two rows use.
+    # Only ever shows what's knowable WITHOUT a network round-trip: gray
+    # if no password is set at all. A configured password can no longer
+    # promise green here by itself -- a typo'd password looks byte-for-
+    # byte identical to a correct one until OBS actually authenticates
+    # it, which is exactly what used to make this dot go green on a
+    # WRONG password (user report: "it gives green indicator even though
+    # we entered the wrong password... need to check whether the tools
+    # can really access the obs before updating the green signal"). A
+    # configured-but-unverified password gets the same amber used
+    # elsewhere for "known but not yet confirmed working" (see
+    # $script:cacheWarningBrush), not green. Real verification comes from
+    # Update-ObsPasswordVerificationIndicator, called with the result of
+    # an ACTUAL connect+identify handshake (Get-ObsMonitorList, already
+    # run by Update-MonitorList -- no separate check invented here).
     $status = Get-ObsPasswordStatus
     if ($status.Configured) {
-        $obsPasswordStatusDot.Fill = "LimeGreen"
-        $obsPasswordStatusLabel.Text = "OBS WebSocket: password set"
+        $obsPasswordStatusDot.Fill = $script:cacheWarningBrush
+        $obsPasswordStatusLabel.Text = "OBS WebSocket: password set, not yet verified"
     } else {
         $obsPasswordStatusDot.Fill = "Gray"
         $obsPasswordStatusLabel.Text = "OBS WebSocket: not configured"
+    }
+}
+
+function Update-ObsPasswordVerificationIndicator($result) {
+    # $result is a Get-ObsMonitorList return value -- this function adds
+    # NO network call of its own, it just reinterprets a real
+    # connect+identify handshake Update-MonitorList already ran for the
+    # Recording Monitor dropdown's own sake. Skips updating anything if
+    # no password is configured at all, so a stale check result from
+    # before the password was ever set can't paint over
+    # Update-ObsPasswordStatusIndicator's own "not configured" gray.
+    if (-not (Get-ObsPasswordStatus).Configured) {
+        return
+    }
+    if ($result.Success) {
+        $obsPasswordStatusDot.Fill = "LimeGreen"
+        $obsPasswordStatusLabel.Text = "OBS WebSocket: password verified"
+    } elseif ($result.AuthFailed) {
+        # Reachable, but authentication itself failed -- this IS a wrong
+        # password, not ambiguous the way "OBS isn't running" is.
+        $obsPasswordStatusDot.Fill = "Red"
+        $obsPasswordStatusLabel.Text = "OBS WebSocket: password appears incorrect"
+    } else {
+        # Every other failure (OBS not running, no capture source, bad
+        # host/port, etc) means the password genuinely CAN'T be verified
+        # right now either way -- not the same claim as "confirmed wrong."
+        $obsPasswordStatusDot.Fill = $script:cacheWarningBrush
+        $obsPasswordStatusLabel.Text = "OBS WebSocket: can't verify (OBS not running)"
     }
 }
 
@@ -1523,6 +1606,72 @@ function Write-RecordingMonitorRect([string]$MonitorName) {
     Set-Content -Path $rectPath -Value "$($parsed.Left),$($parsed.Top),$($parsed.Right),$($parsed.Bottom)" -Encoding ASCII
 }
 
+function Get-CameraZoomPctPath {
+    # Own function, same reasoning as Get-RecordingMonitorRectPath -- lets
+    # tests override just the path without touching real project state.
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_zoom_pct.txt"
+}
+
+function Write-CameraZoomPct([double]$Value) {
+    # Read by get_zoom_pct() in maya_camera_panels.py/_LR.py -- see those
+    # for the full explanation. Same plain-ASCII, no-BOM reasoning as
+    # Write-RecordingMonitorRect above (a BOM makes Python's float() raise,
+    # silently falling back to the 0% default with no visible error).
+    $zoomPath = Get-CameraZoomPctPath
+    $zoomDir = Split-Path $zoomPath -Parent
+    if (-not (Test-Path $zoomDir)) {
+        New-Item -ItemType Directory -Path $zoomDir | Out-Null
+    }
+    Set-Content -Path $zoomPath -Value "$Value" -Encoding ASCII
+}
+
+function Get-CameraOffsetPxPath {
+    # Own function, same reasoning as Get-CameraZoomPctPath.
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_offset_px.txt"
+}
+
+function Write-CameraOffsetPx([double]$X, [double]$Y) {
+    # Read by get_pixel_offset() in maya_camera_panels.py/_LR.py as a single
+    # "X,Y" line -- same plain-ASCII, no-BOM reasoning as Write-CameraZoomPct.
+    $offsetPath = Get-CameraOffsetPxPath
+    $offsetDir = Split-Path $offsetPath -Parent
+    if (-not (Test-Path $offsetDir)) {
+        New-Item -ItemType Directory -Path $offsetDir | Out-Null
+    }
+    Set-Content -Path $offsetPath -Value "$X,$Y" -Encoding ASCII
+}
+
+function Get-RecenterStartFramePath {
+    # Own function, same reasoning as Get-CameraZoomPctPath.
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_recenter_start_frame.txt"
+}
+
+function Write-RecenterStartFrame([double]$Frame) {
+    # Read by get_recenter_start_frame() in maya_camera_panels.py/_LR.py.
+    $framePath = Get-RecenterStartFramePath
+    $frameDir = Split-Path $framePath -Parent
+    if (-not (Test-Path $frameDir)) {
+        New-Item -ItemType Directory -Path $frameDir | Out-Null
+    }
+    Set-Content -Path $framePath -Value "$Frame" -Encoding ASCII
+}
+
+function Clear-RecenterStartFrame {
+    # Writes an EMPTY file, not just skipping the write -- get_recenter_
+    # start_frame() reads an empty file as "disabled" (returns None). A
+    # stale non-empty value from a PREVIOUS run must never keep silently
+    # applying after the checkbox is unchecked (same "explicitly reset,
+    # don't rely on stale state" lesson as the magnifier's 0%-at-startup
+    # fix, 2026-09-02) -- this is called every Preview/Start Recording
+    # click when the checkbox is unchecked, not just once at startup.
+    $framePath = Get-RecenterStartFramePath
+    $frameDir = Split-Path $framePath -Parent
+    if (-not (Test-Path $frameDir)) {
+        New-Item -ItemType Directory -Path $frameDir | Out-Null
+    }
+    Set-Content -Path $framePath -Value "" -Encoding ASCII
+}
+
 function Get-RecordingMonitorNamePath {
     # Own function, same reasoning as Get-RecordingMonitorRectPath --
     # lets tests override the path without touching real project state.
@@ -1582,6 +1731,12 @@ function Update-MonitorList([switch]$EnsureRunning) {
     # for a minute with no visible explanation, not "launching OBS."
     $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
     $result = Get-ObsMonitorList -EnsureRunning:$EnsureRunning
+    # Same connect+identify handshake this call just performed for the
+    # Recording Monitor dropdown's own sake also proves (or disproves)
+    # the configured password -- feed it into that dot too instead of
+    # letting it sit on whatever Update-ObsPasswordStatusIndicator's own
+    # network-free guess last showed.
+    Update-ObsPasswordVerificationIndicator $result
     $script:suppressMonitorSelectionChanged = $true
     try {
         $monitorComboBox.Items.Clear()
@@ -2316,15 +2471,98 @@ $startEndRadio.Add_Checked({
 $timeSliderRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
 $allFramesRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
 
-# Reads the real WPF controls' current values (and, for Time Slider, makes
-# a real bounded round-trip to Maya) but returns a result object instead
-# of starting anything -- lets tests verify the Time Range validation
-# without ever calling Start-Steps (which would launch real
-# send_to_maya.ps1/maya_obs_capture.ps1 processes against whatever's live
-# in Maya right now).
-function Get-CaptureClickResult {
-    $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+$zoomSlider.Add_ValueChanged({
+    # Snap to whole percent -- the underlying framing math has no use for
+    # fractional percent, and a whole number is simpler to type back in.
+    # "+0;-0;0" is a 3-section custom numeric format (positive;negative;
+    # zero) -- the only place this is worth relying on .NET's own sign
+    # handling rather than an if/else, since it needs to run every time
+    # the slider moves (dragging fires this continuously).
+    $pct = [Math]::Round($zoomSlider.Value)
+    $zoomValueBox.Text = "{0:+0;-0;0}" -f $pct
+    Write-CameraZoomPct -Value $pct
+})
 
+function Commit-ZoomValueBox {
+    # Typed entry, alongside the slider (2026-09-02, user asked for exact
+    # values, not just dragging). Routes through the slider rather than
+    # calling Write-CameraZoomPct directly, so there is still only one
+    # place that writes the file and only one place that formats the
+    # display text -- this just decides what value to hand it.
+    $text = $zoomValueBox.Text.Trim().TrimEnd('%')
+    $value = 0.0
+    if ([double]::TryParse($text, [ref]$value)) {
+        $zoomSlider.Value = [Math]::Max(-50, [Math]::Min(50, [Math]::Round($value)))
+    } else {
+        # Empty or unparseable -- revert to the last valid value instead of
+        # leaving stale/garbage text on screen or writing it to disk.
+        $zoomValueBox.Text = "{0:+0;-0;0}" -f ([Math]::Round($zoomSlider.Value))
+    }
+}
+$zoomValueBox.Add_LostFocus({ Commit-ZoomValueBox })
+$zoomValueBox.Add_KeyDown({
+    param($eventSender, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+        Commit-ZoomValueBox
+        # Moves focus off the box so the commit visibly "lands" (matches
+        # LostFocus's own behavior) instead of leaving the caret sitting in
+        # a box that already applied -- Enter is the one path that commits
+        # without the user's next action doing that for free.
+        [System.Windows.Input.Keyboard]::ClearFocus()
+    }
+})
+
+$script:lastValidOffsetX = 0
+$script:lastValidOffsetY = 0
+
+function Commit-OffsetBoxes {
+    # X and Y share one file as a single "X,Y" line (see
+    # Write-CameraOffsetPx), so committing EITHER box re-reads BOTH current
+    # values and writes them together -- keeps the file always in sync with
+    # what's on screen, rather than one box's commit silently overwriting
+    # the other's not-yet-committed value with a stale one. Invalid/empty
+    # input in either box reverts JUST that box to its own last valid
+    # value, same discipline as the magnifier's Commit-ZoomValueBox.
+    $x = 0.0
+    if ([double]::TryParse($offsetXBox.Text.Trim(), [ref]$x)) {
+        $script:lastValidOffsetX = [Math]::Round($x)
+    }
+    $offsetXBox.Text = "$($script:lastValidOffsetX)"
+
+    $y = 0.0
+    if ([double]::TryParse($offsetYBox.Text.Trim(), [ref]$y)) {
+        $script:lastValidOffsetY = [Math]::Round($y)
+    }
+    $offsetYBox.Text = "$($script:lastValidOffsetY)"
+
+    Write-CameraOffsetPx -X $script:lastValidOffsetX -Y $script:lastValidOffsetY
+}
+$offsetXBox.Add_LostFocus({ Commit-OffsetBoxes })
+$offsetYBox.Add_LostFocus({ Commit-OffsetBoxes })
+$offsetXBox.Add_KeyDown({
+    param($eventSender, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+        Commit-OffsetBoxes
+        [System.Windows.Input.Keyboard]::ClearFocus()
+    }
+})
+$offsetYBox.Add_KeyDown({
+    param($eventSender, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+        Commit-OffsetBoxes
+        [System.Windows.Input.Keyboard]::ClearFocus()
+    }
+})
+
+# Resolves whichever Time Range mode is currently selected (All / Time
+# Slider / Start-End) into concrete Start/End frame numbers, WITHOUT
+# building a step list. Factored out of Get-CaptureClickResult (2026-09-02)
+# so Preview's own click handler can resolve just the Start frame for
+# "Recenter at start frame" without duplicating this per-mode logic, and so
+# Start Recording's recentering reuses the SAME resolution
+# Get-CaptureClickResult already makes for real, rather than paying for a
+# second Maya round trip.
+function Get-ResolvedTimeRange {
     if ($allFramesRadio.IsChecked) {
         # Explicitly queries the true animation range (not just whatever
         # the Range Slider happens to show) so "All" always means the full
@@ -2335,25 +2573,23 @@ function Get-CaptureClickResult {
         # scrubbed for something unrelated since the scene was opened.
         $range = Get-AnimationRange
         if (-not $range.Success) {
-            return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Could not read Maya's animation range: $($range.ErrorMessage) -- not starting." }
+            return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Could not read Maya's animation range: $($range.ErrorMessage)" }
         }
         if ($range.Start -gt $range.End) {
-            return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Maya's animation range is invalid (Start $($range.Start) > End $($range.End)) -- not starting." }
+            return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Maya's animation range is invalid (Start $($range.Start) > End $($range.End))" }
         }
-        $steps = Get-CaptureSteps -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
-        return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null }
+        return [PSCustomObject]@{ Success = $true; Start = $range.Start; End = $range.End; ErrorMessage = $null }
     }
 
     if ($timeSliderRadio.IsChecked) {
         $range = Get-TimeSliderRange
         if (-not $range.Success) {
-            return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Could not read Maya's Time Slider range: $($range.ErrorMessage) -- not starting." }
+            return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Could not read Maya's Time Slider range: $($range.ErrorMessage)" }
         }
         if ($range.Start -gt $range.End) {
-            return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Maya's Time Slider range is invalid (Start $($range.Start) > End $($range.End)) -- not starting." }
+            return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Maya's Time Slider range is invalid (Start $($range.Start) > End $($range.End))" }
         }
-        $steps = Get-CaptureSteps -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
-        return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null }
+        return [PSCustomObject]@{ Success = $true; Start = $range.Start; End = $range.End; ErrorMessage = $null }
     }
 
     # Start/End (manual entry)
@@ -2362,13 +2598,31 @@ function Get-CaptureClickResult {
     $startOk = [int]::TryParse($startFrameBox.Text, [ref]$parsedStart)
     $endOk = [int]::TryParse($endFrameBox.Text, [ref]$parsedEnd)
     if (-not $startOk -or -not $endOk) {
-        return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Start/End must be whole numbers (got '$($startFrameBox.Text)' / '$($endFrameBox.Text)') -- not starting." }
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Start/End must be whole numbers (got '$($startFrameBox.Text)' / '$($endFrameBox.Text)')" }
     }
     if ($parsedStart -gt $parsedEnd) {
-        return [PSCustomObject]@{ Steps = $null; ErrorMessage = "Start ($parsedStart) must not be greater than End ($parsedEnd) -- not starting." }
+        return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Start ($parsedStart) must not be greater than End ($parsedEnd)" }
     }
-    $steps = Get-CaptureSteps -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $parsedStart -EndFrame $parsedEnd
-    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null }
+    return [PSCustomObject]@{ Success = $true; Start = $parsedStart; End = $parsedEnd; ErrorMessage = $null }
+}
+
+# Reads the real WPF controls' current values (and, for Time Slider/All,
+# makes a real bounded round-trip to Maya) but returns a result object
+# instead of starting anything -- lets tests verify the Time Range
+# validation without ever calling Start-Steps (which would launch real
+# send_to_maya.ps1/maya_obs_capture.ps1 processes against whatever's live
+# in Maya right now).
+function Get-CaptureClickResult {
+    $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $range = Get-ResolvedTimeRange
+    if (-not $range.Success) {
+        return [PSCustomObject]@{ Steps = $null; ErrorMessage = "$($range.ErrorMessage) -- not starting."; ResolvedStart = $null }
+    }
+    $steps = Get-CaptureSteps -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
+    # ResolvedStart: so a caller wanting "Recenter at start frame" can reuse
+    # THIS resolution (a real Maya round trip for Time Slider/All) instead
+    # of paying for a second one just to find the same number again.
+    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start }
 }
 
 $previewButton.Add_Click({
@@ -2378,12 +2632,36 @@ $previewButton.Add_Click({
     # PreviewButton clickable-but-inert-while-disabled the normal way.
     $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
     $steps = Get-CaptureSteps -Axis $axis -Recording $false -ScriptDir $ScriptDir
+    # Recenter at start frame (2026-09-02, now mandatory -- no checkbox):
+    # Preview normally never resolves a Time Range at all (Start/End only
+    # ever applied to Start Recording, unchanged) -- this is the one case
+    # Preview pays for a real Maya round trip, unconditionally now. A
+    # failed resolution is a WARNING, not a hard block (Preview has no
+    # other blocking gate either): log it and preview without recentering
+    # rather than refusing to preview at all. Either message is queued
+    # into $recenterLogMessage and logged AFTER Start-Steps below, not
+    # here -- Start-Steps clears the log box as one of its own first
+    # actions (confirmed live: logging here got silently wiped the instant
+    # Start-Steps ran, so the user would never actually have seen it --
+    # this was a real bug, not just missing feedback: nothing ever
+    # confirmed the resolved Start frame, which read as "not calculated"
+    # even on runs where it was).
+    $recenterLogMessage = $null
+    $range = Get-ResolvedTimeRange
+    if ($range.Success) {
+        Write-RecenterStartFrame -Frame $range.Start
+        $recenterLogMessage = "Recenter at start frame: resolved Start=$($range.Start) -- framing measured there."
+    } else {
+        $recenterLogMessage = "Recenter at start frame: could not resolve the current Time Range ($($range.ErrorMessage)) -- previewing without recentering."
+        Clear-RecenterStartFrame
+    }
     # Preview silently triggers a cache build itself when one doesn't
     # exist yet (see the guide text) -- flagging this so the Cache status
     # dot/label refresh once that finishes, instead of staying stuck on
     # whatever it showed (or never showed) before this click.
     $script:pendingCacheRefresh = $true
     Start-Steps $steps
+    if ($recenterLogMessage) { Write-Log $recenterLogMessage }
 })
 
 $startRecordingButton.Add_Click({
@@ -2415,6 +2693,16 @@ $startRecordingButton.Add_Click({
         Write-Log $result.ErrorMessage
         return
     }
+    # Recenter at start frame (2026-09-02, now mandatory -- no checkbox):
+    # reuses Get-CaptureClickResult's OWN range resolution (ResolvedStart)
+    # rather than a second Maya round trip -- that resolution already
+    # succeeded or this would have returned above, so there is no failure
+    # path to handle here (unlike Preview, which has no other gate).
+    # Logged AFTER Start-Steps below (same reasoning as Preview's own
+    # click handler) since Start-Steps clears the log box as one of its
+    # own first actions.
+    Write-RecenterStartFrame -Frame $result.ResolvedStart
+    $recenterLogMessage = "Recenter at start frame: resolved Start=$($result.ResolvedStart) -- framing measured there."
     # Same reasoning as Preview above -- Start Recording can also trigger
     # a silent first-time cache build.
     $script:pendingCacheRefresh = $true
@@ -2438,6 +2726,7 @@ $startRecordingButton.Add_Click({
     # nonexistent one.
     $steps = @($result.Steps) + (Get-CleanResetStep -ScriptDir $ScriptDir)
     Start-Steps $steps $true $startRecordingButton "Stop Recording"
+    if ($recenterLogMessage) { Write-Log $recenterLogMessage }
 })
 
 $resetButton.Add_Click({
@@ -2673,6 +2962,29 @@ function Write-StartupSummary([bool]$MayaReachable) {
 $script:mayaReachableAtStartup = Update-PortStatusIndicator
 $script:portCheckTimer.Start()
 Update-ObsPasswordStatusIndicator
+# Design (2026-09-02): the magnifier always starts at the safe 0% default,
+# never restoring a value left over from an earlier launch -- a forgotten
+# non-zero magnifier should never silently carry into a future session and
+# risk clipping. Sets the box text and writes the file explicitly rather
+# than assigning $zoomSlider.Value = 0 -- the slider's XAML default is
+# already 0, so that assignment would be a same-value no-op and its own
+# ValueChanged handler (the thing that normally updates the box text and
+# writes the file) would never fire, leaving the box blank and any stale
+# non-zero file from a past session in place.
+$zoomValueBox.Text = "0"
+Write-CameraZoomPct -Value 0
+# Same reasoning as the magnifier just above: pixel offset always starts
+# at 0,0 too, never restoring a forgotten value from an earlier launch.
+$offsetXBox.Text = "0"
+$offsetYBox.Text = "0"
+$script:lastValidOffsetX = 0
+$script:lastValidOffsetY = 0
+Write-CameraOffsetPx -X 0 -Y 0
+# Recenter at start frame is mandatory now (no checkbox) -- Preview/Start
+# Recording always resolve and write a fresh value at click time, but
+# clear it here too so nothing stale from a past session could apply if a
+# scene were somehow opened and captured through some OTHER path first.
+Clear-RecenterStartFrame
 Update-MonitorList
 Write-StartupSummary -MayaReachable $script:mayaReachableAtStartup
 Set-ActiveTab "Capture"

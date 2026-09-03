@@ -129,6 +129,7 @@ else:
     x_widths = []
     z_centers = []
     z_widths = []
+    heights = []
 
     frame = start
     while frame <= end:
@@ -139,6 +140,15 @@ else:
         x_widths.append(bbox[3] - bbox[0])
         z_centers.append((bbox[2] + bbox[5]) / 2.0)
         z_widths.append(bbox[5] - bbox[2])
+        # Design (2026-09-02): mirrors x_width/z_width -- maya_camera_panels.py
+        # used to size vertical framing off a SINGLE live measurement (whatever
+        # frame happened to be current), the same gap x_width/z_width already
+        # closed for horizontal framing. Confirmed real on palM_rom_anim: a
+        # sparse 82-frame integer sweep found height varying ~11% across the
+        # animation (226 baseline vs 253 at a raised-arms pose around frame
+        # 1920) -- undersizing off a short-pose frame risks the same class of
+        # vertical clipping the width fix was built to prevent horizontally.
+        heights.append(bbox[4] - bbox[1])
         frame += 1
         if len(frames) % 100 == 0:
             _write_progress(len(frames), total_frames)
@@ -174,6 +184,7 @@ else:
                 'x_width': x_widths,
                 'z_center': z_centers,
                 'z_width': z_widths,
+                'heights': heights,
             }, f)
 
         _write_progress(len(frames), total_frames, note='done')

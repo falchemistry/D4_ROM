@@ -304,6 +304,19 @@ Check "ConvertFrom-ObsMonitorListOutput surfaces a MONITOR_LIST_ERROR message" {
     $result = ConvertFrom-ObsMonitorListOutput -Output "MONITOR_LIST_ERROR Could not connect to OBS WebSocket."
     if ($result.Success -ne $false) { throw "expected Success false, got '$($result.Success)'" }
     if ($result.ErrorMessage -notmatch "Could not connect") { throw "expected the error message text preserved, got '$($result.ErrorMessage)'" }
+    if ($result.AuthFailed -ne $false) { throw "expected AuthFailed false for a plain (non-auth) error, got '$($result.AuthFailed)'" }
+}
+
+Check "ConvertFrom-ObsMonitorListOutput distinguishes MONITOR_LIST_AUTH_FAILED (wrong password) from a plain MONITOR_LIST_ERROR" {
+    # User report this exists for: the OBS WebSocket status dot used to go
+    # green on ANY configured password, even a wrong one. AuthFailed=$true
+    # is the ONLY thing that should ever make Update-ObsPasswordVerificationIndicator
+    # show red "password appears incorrect" rather than the more
+    # ambiguous "can't verify" amber every other failure gets.
+    $result = ConvertFrom-ObsMonitorListOutput -Output "MONITOR_LIST_AUTH_FAILED the OBS WebSocket password is incorrect."
+    if ($result.Success -ne $false) { throw "expected Success false, got '$($result.Success)'" }
+    if ($result.AuthFailed -ne $true) { throw "expected AuthFailed true for MONITOR_LIST_AUTH_FAILED, got '$($result.AuthFailed)'" }
+    if ($result.ErrorMessage -notmatch "password is incorrect") { throw "expected the message text preserved, got '$($result.ErrorMessage)'" }
 }
 
 Check "ConvertFrom-ObsMonitorListOutput reports failure for empty output, not an exception" {

@@ -62,6 +62,69 @@ def get_target_bbox():
     return cmds.exactWorldBoundingBox(sel)
 
 
+def get_effective_overflow_pct():
+    """Reads the zoom-adjusted drift tolerance maya_camera_panels.py wrote
+    (see its compute_effective_overflow_pct) instead of trusting the
+    EDGE_OVERFLOW_PCT constant below in isolation -- the magnifier changes
+    how much of that constant's built-in headroom is actually left, and
+    this file has no other way to know the current zoom level. Falls back
+    to EDGE_OVERFLOW_PCT if the file doesn't exist yet (e.g. run standalone
+    without ever having opened panels first) or is malformed."""
+    path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        return max(0.0, float(content))
+    except (IOError, OSError, ValueError):
+        return EDGE_OVERFLOW_PCT
+
+
+def get_recenter_start_frame():
+    """Reads the frame number rom_launcher.ps1 wrote for 'Recenter at start
+    frame' (see maya_camera_panels.py's own copy of this function for the
+    full explanation). Returns None (disabled) if the file is empty,
+    missing, or malformed."""
+    path = os.path.join(CACHE_DIR, '_camera_recenter_start_frame.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
+def apply_recenter_override(cam_transform, axis, recenter_frame):
+    """Design (2026-09-02): key_edge_guard's own curve does NOT guarantee
+    exact centering at any particular frame -- its job is "never let the
+    subject go off-screen," which is a much looser constraint than "stay
+    centered," so the curve it naturally produces can leave the subject
+    visibly off-center at an arbitrary frame (confirmed live: subject
+    center off by 1.2% of orthoWidth at a real recenter frame, purely from
+    edge_guard's own sparse-key interpolation, no bug in the tracking
+    itself). maya_camera_panels.py's own "Recenter at start frame" only
+    ever controlled the VERTICAL axis in practice, since this Y translate
+    is the one axis the keyer never touches -- horizontal panning
+    (translateX for front/back, translateZ for left/right) gets
+    OVERWRITTEN by whatever curve key_edge_guard/etc. just built, silently
+    discarding panels.py's own centering there. This inserts one explicit
+    keyframe exactly at recenter_frame, using a fresh live bbox
+    measurement, so the frame Preview/Start Recording actually shows the
+    artist is guaranteed correctly centered on both axes -- the rest of
+    the curve (before/after that one frame) is untouched, still tracking
+    normally via edge_guard."""
+    attr = cam_transform + '.translate' + axis.upper()
+    cmds.currentTime(recenter_frame)
+    cmds.select(clear=True)
+    bbox = get_target_bbox()
+    if axis == 'x':
+        true_center = (bbox[0] + bbox[3]) / 2.0
+    else:
+        true_center = (bbox[2] + bbox[5]) / 2.0
+    cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
+
+
 CACHE_PATH = cache_path_for(find_animation_reference())
 
 # view_name -> (camera transform, which cached axis pair to use)
@@ -77,25 +140,45 @@ MODE = 'edge_guard'   # 'edge_guard', 'dead_zone', or 'threshold'
 THRESHOLD_PCT = 0.0    # used when MODE == 'threshold'
 DEAD_ZONE_PCT = 0.50   # used when MODE == 'dead_zone': subject can roam this
                         # fraction of frame width around the camera before it reacts
-EDGE_OVERFLOW_PCT = 0.08  # used when MODE == 'edge_guard': how far past the
+EDGE_OVERFLOW_PCT = 0.02  # used when MODE == 'edge_guard': how far past the
                            # frame edge the subject may extend before the
-                           # camera reacts, as a fraction of frame width.
+                           # camera nudges back, as a fraction of frame width.
                            #
                            # MUST match EDGE_OVERFLOW_PCT in
-                           # maya_camera_panels.py -- that script derives the
-                           # top/bottom margin from this value so the frame is
-                           # wide enough for the subject's widest pose to fit
-                           # within frame + 2*tolerance. A low tolerance is
-                           # only stable because the margin compensates; if
-                           # you lower this here without the panel script
-                           # picking up the same number, the frame stays
-                           # narrow and the camera thrashes (chasing one edge
-                           # then the other). Measured on barM_rom_anim at a
-                           # fixed 45px margin, for reference:
+                           # maya_camera_panels.py -- that script's
+                           # compute_margin_px derives the frame width from
+                           # this value (needed_ortho = max_w / (1 - 2*this)),
+                           # sized so a max-width pose still fits even at
+                           # full drift tolerance. This is NOT just a
+                           # trigger threshold in isolation: edge_guard is
+                           # reactive by construction (it only corrects once
+                           # this tolerance is exceeded), so the worst-case
+                           # clip depth is ALWAYS exactly this fraction of
+                           # the frame width, regardless of how wide the
+                           # frame is sized -- widening the frame only
+                           # reduces how OFTEN clipping happens, not how bad
+                           # it is when it does. Lowering this value is the
+                           # only way to shrink the worst case itself.
+                           #
+                           # Design (2026-09-02, revised): a brief experiment
+                           # decoupled this from frame-sizing entirely
+                           # (frame sized for max_w alone, 8% tolerance) --
+                           # reverted after user-reported hand-clipping
+                           # persisted. Validated against palM_rom_anim's
+                           # real cache: at 8%, worst-case clip was 22.8
+                           # units (a visibly obvious hand); at 2%, worst
+                           # case drops to ~5.0 units (a fingertip) at the
+                           # cost of more frequent (but still small,
+                           # nudge-sized) corrections -- 88 nudges across
+                           # 3241 frames vs 11 at 8%. 2% chosen over an even
+                           # tighter 1% (130 nudges, ~2.4 unit worst case)
+                           # to keep corrections less frequent. Historical
+                           # reference numbers below predate the
+                           # frame-sizing redesign entirely (fixed 45px
+                           # margin, narrower frame) -- not representative
+                           # of current behavior, kept only for context:
                            #   0.05 -> 1775 keys (55% of frames), max jump 46.3
                            #   0.20 ->  104 keys,   2 reversals, max jump 3.3
-                           # With the auto-margin the frame widens instead, so
-                           # 0.05 becomes stable at the cost of some zoom.
 
 
 def compute_size_scale(cache, axis):
@@ -179,11 +262,23 @@ def key_dead_zone(cam_transform, axis, cache, dead_zone_pct, current_ref, cached
 
 def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08):
     """Camera only moves when the subject's bbox edge would extend past
-    the visible frame by more than overflow_pct of the frame width (e.g.
-    a hand poking past the edge during a wide arm-swing is tolerated),
-    and only enough to bring that edge back to the allowed overflow
-    limit -- not all the way back inside. Keeps repositioning minimal and
-    natural while still catching genuine subject-leaves-the-panel cases."""
+    the visible frame by more than overflow_pct of the frame width (e.g. a
+    hand poking past the edge during a wide arm-swing is tolerated), and
+    only enough to bring that edge back to the allowed overflow limit --
+    not all the way back to center. Keeps repositioning minimal and
+    natural while still catching genuine subject-leaves-the-panel cases.
+
+    Design (2026-09-02, reverted back to nudge from a brief full-recenter
+    experiment): the recenter response made the camera visibly, slowly
+    drift to center whenever it triggered -- distracting in a way the
+    smaller, more frequent nudges aren't. The frame-sizing guarantee (see
+    maya_camera_panels.py's compute_margin_px, sized directly off the
+    widest pose in the whole animation, unchanged by this revert) already
+    does the real work of preventing pose-width clipping; edge_guard here
+    only has to correct SIDEWAYS DRIFT (e.g. walking during the take), and
+    the launcher's Frame Offset tools (magnifier, X/Y pixel nudge, recenter
+    at start frame) now cover the cases a human needs to fix by hand, so
+    the automatic full-recenter safety net is no longer needed."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
@@ -267,6 +362,12 @@ print('Using cache: %d frames (%s to %s), animation=%s, cached from character sc
       % (len(cache['frames']), cache['start'], cache['end'],
          cache.get('animation_reference'), cache.get('source_character_scene')))
 
+effective_overflow_pct = get_effective_overflow_pct()
+if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+    print('Using zoom-adjusted drift tolerance: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+
+recenter_frame = get_recenter_start_frame()
+
 scale_cache = {}
 for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
     if not cmds.objExists(cam_transform):
@@ -278,12 +379,16 @@ for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
     print('%s axis size scale: %.4f (current width / cached width at ref frame)' % (axis, scale))
 
     if MODE == 'edge_guard':
-        keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, EDGE_OVERFLOW_PCT)
+        keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct)
     elif MODE == 'dead_zone':
         keyed = key_dead_zone(cam_transform, axis, cache, DEAD_ZONE_PCT, current_ref, cached_ref, scale)
     else:
         keyed = key_from_cache(cam_transform, axis, cache, THRESHOLD_PCT, current_ref, cached_ref, scale)
     print('%s (%s): %d keyframes from %d cached samples' % (view_name, cam_transform, keyed, len(cache['frames'])))
+
+    if recenter_frame is not None:
+        apply_recenter_override(cam_transform, axis, recenter_frame)
+        print('%s (%s): overrode frame %s with a true live-centered keyframe' % (view_name, cam_transform, recenter_frame))
 
 cmds.currentTime(original_time)
 elapsed = time.time() - _t0

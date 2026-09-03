@@ -14,22 +14,41 @@ import maya.mel as mel
 # --- configuration -----------------------------------------------------
 VIEWS = ['left', 'side']        # side = right
 
-# Tolerance the camera keyer will use. MUST match EDGE_OVERFLOW_PCT in
-# maya_key_from_cache_LR.py -- the margin below is derived from it.
-EDGE_OVERFLOW_PCT = 0.08
-
-# See maya_camera_panels.py for the full explanation. None = auto-derive the
-# margin so the subject's widest pose fits within frame + 2*tolerance.
+# See maya_camera_panels.py for the full explanation and derivation. None =
+# auto-derive the margin so the frame contains the subject's widest pose
+# (max_w in the bbox cache) EVEN AT full edge_guard drift tolerance, plus
+# MARGIN_SAFETY headroom.
 MARGIN_PX = None
 MARGIN_PX_MIN = 30
 MARGIN_PX_MAX = 260
 MARGIN_SAFETY = 1.02
+
+# Edge-guard's own drift-tolerance threshold -- MUST match EDGE_OVERFLOW_PCT
+# in maya_key_from_cache_LR.py, and the frame-sizing formula below is only
+# correct if the two stay in sync. See maya_camera_panels.py's copy of this
+# constant for the full derivation and the 8%->2% rationale.
+EDGE_OVERFLOW_PCT = 0.02
 # 'x' so the side views use the SAME frame width as the front/back pair --
 # the character then appears at identical scale across both videos. Driving
 # it off 'z' (the narrow side profile) would frame each side view tighter,
 # but the character would look noticeably bigger than in the front/back
 # video, which is jarring when reviewing them together.
 AUTO_MARGIN_AXIS = 'x'
+
+# Magnifier: user-adjustable +/-50% zoom on top of the safe default above.
+# See maya_camera_panels.py's get_zoom_pct() for the full explanation.
+ZOOM_PCT = 0.0
+ZOOM_PCT_MIN = -50.0
+ZOOM_PCT_MAX = 50.0
+
+# Manual pixel-space nudge. Shared _camera_offset_px.txt file with
+# maya_camera_panels.py (same convention as the shared zoom file) -- see
+# that file's get_pixel_offset() for the full explanation.
+OFFSET_X_PX = 0.0
+OFFSET_Y_PX = 0.0
+
+# Recenter at start frame. See maya_camera_panels.py's
+# get_recenter_start_frame() for the full explanation.
 
 ALL_KNOWN_VIEWS = ['front', 'back', 'side', 'left']
 TITLE_OVERRIDES = {'side': 'Right'}  # Maya calls the right-side camera 'side'
@@ -103,6 +122,49 @@ def get_secondary_monitor_rect():
     return SECONDARY_MONITOR_RECT
 
 
+def get_zoom_pct():
+    """See maya_camera_panels.py for the full explanation. Same
+    _camera_zoom_pct.txt file, shared with the front/back panel script, so
+    the magnifier setting applies identically to both view pairs."""
+    path = os.path.join(CACHE_DIR, '_camera_zoom_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        value = float(content)
+        return max(ZOOM_PCT_MIN, min(ZOOM_PCT_MAX, value))
+    except (IOError, OSError, ValueError):
+        return ZOOM_PCT
+
+
+def get_pixel_offset():
+    """See maya_camera_panels.py for the full explanation. Same shared
+    _camera_offset_px.txt file as the front/back panel script."""
+    path = os.path.join(CACHE_DIR, '_camera_offset_px.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        parts = content.split(',')
+        if len(parts) == 2:
+            return float(parts[0]), float(parts[1])
+    except (IOError, OSError, ValueError):
+        pass
+    return OFFSET_X_PX, OFFSET_Y_PX
+
+
+def get_recenter_start_frame():
+    """See maya_camera_panels.py for the full explanation. Same shared
+    _camera_recenter_start_frame.txt file."""
+    path = os.path.join(CACHE_DIR, '_camera_recenter_start_frame.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
 # --- automatic margin ------------------------------------------------------
 def find_animation_reference():
     refs = cmds.file(query=True, reference=True) or []
@@ -142,22 +204,53 @@ def load_cache():
         return json.load(f)
 
 
-def compute_margin_px(world_h, panel_w, panel_h):
-    """See maya_camera_panels.py for the derivation."""
-    if MARGIN_PX is not None:
-        return int(MARGIN_PX)
+def compute_effective_world_h(world_h, cache):
+    """See maya_camera_panels.py for the full explanation and the
+    algebra-verified reason this MUST be called with the same value
+    compute_margin_px used, and passed into frame_camera's
+    world_h_override -- using two different heights for the two halves of
+    the same formula silently narrows orthoWidth instead of widening it."""
+    cached_heights = cache.get('heights')
+    if cached_heights:
+        return max(world_h, max(cached_heights) * MARGIN_SAFETY)
+    return world_h
 
+
+def compute_margin_px(world_h, panel_w, panel_h):
+    """See maya_camera_panels.py for the derivation. world_h should
+    already be the WIDENED value from compute_effective_world_h. Returns
+    (margin, max_w, needed_ortho) -- see that file's own copy of this
+    function for why the caller needs max_w/needed_ortho too."""
     cache = load_cache()
     max_w = max(cache[AUTO_MARGIN_AXIS + '_width'])
-    needed_ortho = (max_w / (1.0 + 2.0 * EDGE_OVERFLOW_PCT)) * MARGIN_SAFETY
+    needed_ortho = (max_w / (1.0 - 2.0 * EDGE_OVERFLOW_PCT)) * MARGIN_SAFETY
+
+    if MARGIN_PX is not None:
+        return int(MARGIN_PX), max_w, needed_ortho
+
     margin = (panel_h - (world_h * float(panel_w) / needed_ortho)) / 2.0
     margin = int(round(max(MARGIN_PX_MIN, min(margin, MARGIN_PX_MAX))))
 
-    print('Auto margin: widest %s-span=%.1f, tol=%.0f%% -> orthoWidth=%.1f -> margin=%dpx '
+    print('Auto margin: widest %s-span=%.1f, drift tol=%.0f%% -> orthoWidth=%.1f -> margin=%dpx '
           '(character fills %d of %d px)'
           % (AUTO_MARGIN_AXIS, max_w, EDGE_OVERFLOW_PCT * 100, needed_ortho,
              margin, panel_h - 2 * margin, panel_h))
-    return margin
+    return margin, max_w, needed_ortho
+
+
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct):
+    """See maya_camera_panels.py for the full derivation."""
+    final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
+    if final_ortho <= 0:
+        return 0.0
+    effective = (1.0 - (max_w * MARGIN_SAFETY / final_ortho)) / 2.0
+    return max(0.0, effective)
+
+
+def write_effective_overflow_pct(value):
+    path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
+    with open(path, 'w') as f:
+        f.write('%.6f' % value)
 
 
 def view_title(view_name):
@@ -224,18 +317,26 @@ def get_target_bbox():
     return cmds.exactWorldBoundingBox(sel)
 
 
-def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, margin_px):
+def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, margin_px, zoom_pct=0.0, offset_x_px=0.0, offset_y_px=0.0, world_h_override=None):
     h_axis, v_axis = VIEW_AXES[view_name]
     hmin, hmax = AXIS_BBOX_INDEX[h_axis]
     vmin, vmax = AXIS_BBOX_INDEX[v_axis]
 
-    world_h = bbox[vmax] - bbox[vmin]
+    # See maya_camera_panels.py's own copy of this function for why
+    # world_h_override must match compute_effective_world_h exactly.
+    world_h = world_h_override if world_h_override is not None else (bbox[vmax] - bbox[vmin])
     center_h = (bbox[hmax] + bbox[hmin]) / 2.0
     center_v = (bbox[vmax] + bbox[vmin]) / 2.0
 
     usable_px = max(panel_height - 2 * margin_px, 1)
     view_height_world = world_h * (panel_height / float(usable_px))
     ortho_width = view_height_world * (panel_width / float(panel_height))
+    ortho_width *= (1.0 - zoom_pct / 100.0)
+
+    # See maya_camera_panels.py's own copy of this for the full derivation.
+    world_per_px = ortho_width / float(panel_width)
+    center_h -= offset_x_px * world_per_px
+    center_v -= offset_y_px * world_per_px
 
     shape = cmds.listRelatives(cam_transform, shapes=True)[0]
     cmds.setAttr(shape + '.orthographicWidth', ortho_width)
@@ -371,12 +472,32 @@ def open_view_panels():
     hide_model_editor_bars()
 
     cmds.select(clear=True)  # avoid framing a stray selection (cmds.camera() also auto-selects)
+
+    # Recenter at start frame -- see maya_camera_panels.py's own copy of
+    # this for the full explanation. Deliberately NOT restored afterward
+    # (2026-09-02 revision): the point is for Preview to actually show the
+    # artist their capture's starting pose.
+    recenter_frame = get_recenter_start_frame()
+    if recenter_frame is not None:
+        cmds.currentTime(recenter_frame)
+        print('Recenter at start frame: showing frame %s' % recenter_frame)
     bbox = get_target_bbox()
 
     # Panels are forced to exactly col_width x mon_height below, so the
     # margin can be derived up front from those dimensions.
-    world_h = bbox[4] - bbox[1]
-    margin_px = compute_margin_px(world_h, col_width, mon_height)
+    world_h = compute_effective_world_h(bbox[4] - bbox[1], load_cache())
+    margin_px, max_w, needed_ortho = compute_margin_px(world_h, col_width, mon_height)
+    zoom_pct = get_zoom_pct()
+    if zoom_pct:
+        print('Magnifier: %+.0f%%' % zoom_pct)
+    offset_x_px, offset_y_px = get_pixel_offset()
+    if offset_x_px or offset_y_px:
+        print('Pixel offset: X=%+.0f Y=%+.0f' % (offset_x_px, offset_y_px))
+
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct)
+    write_effective_overflow_pct(effective_overflow_pct)
+    if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+        print('Effective drift tolerance at this zoom: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
 
     close_all_view_panels()
 
@@ -409,7 +530,7 @@ def open_view_panels():
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
-        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px)
+        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
 
     cmds.refresh(force=True)
 

@@ -320,24 +320,34 @@ function ConvertFrom-ObsMonitorListOutput {
     #   MONITOR_ITEM name="Display Name" value="raw_monitor_id" current="true|false"
     #   MONITOR_SOURCE_NOT_FOUND
     #   MONITOR_LIST_ERROR <message>
+    #   MONITOR_LIST_AUTH_FAILED <message> -- OBS reachable, wrong password
     # One line per monitor when successful; empty/unrelated output is
-    # reported as Success=$false rather than guessing.
+    # reported as Success=$false rather than guessing. AuthFailed is
+    # $true ONLY for the AUTH_FAILED case -- callers (the OBS WebSocket
+    # password status dot) use it to distinguish "confirmed wrong
+    # password" from every other kind of failure (OBS not running, no
+    # capture source, etc), which all just mean "can't verify right now."
     param(
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Output
     )
 
     $lines = $Output -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     if (-not $lines -or $lines.Count -eq 0) {
-        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No response." }
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No response."; AuthFailed = $false }
     }
 
+    $authFailedLine = $lines | Where-Object { $_ -match "^MONITOR_LIST_AUTH_FAILED\s+(.*)$" } | Select-Object -First 1
+    if ($authFailedLine) {
+        $authFailedLine -match "^MONITOR_LIST_AUTH_FAILED\s+(.*)$" | Out-Null
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = $Matches[1]; AuthFailed = $true }
+    }
     $errorLine = $lines | Where-Object { $_ -match "^MONITOR_LIST_ERROR\s+(.*)$" } | Select-Object -First 1
     if ($errorLine) {
         $errorLine -match "^MONITOR_LIST_ERROR\s+(.*)$" | Out-Null
-        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = $Matches[1] }
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = $Matches[1]; AuthFailed = $false }
     }
     if ($lines | Where-Object { $_ -match "^MONITOR_SOURCE_NOT_FOUND" }) {
-        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No enabled monitor-capture source found in OBS's active scene." }
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "No enabled monitor-capture source found in OBS's active scene."; AuthFailed = $false }
     }
 
     $monitors = @()
@@ -347,9 +357,9 @@ function ConvertFrom-ObsMonitorListOutput {
         }
     }
     if ($monitors.Count -eq 0) {
-        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "Unrecognized response: $($lines -join ' | ')" }
+        return [PSCustomObject]@{ Success = $false; Monitors = @(); ErrorMessage = "Unrecognized response: $($lines -join ' | ')"; AuthFailed = $false }
     }
-    return [PSCustomObject]@{ Success = $true; Monitors = $monitors; ErrorMessage = $null }
+    return [PSCustomObject]@{ Success = $true; Monitors = $monitors; ErrorMessage = $null; AuthFailed = $false }
 }
 
 function ConvertFrom-ObsMonitorSetOutput {

@@ -45,6 +45,48 @@ def get_target_bbox():
     return cmds.exactWorldBoundingBox(sel)
 
 
+def get_effective_overflow_pct():
+    """See maya_key_from_cache.py for the full explanation. Same shared
+    _camera_effective_overflow_pct.txt file."""
+    path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        return max(0.0, float(content))
+    except (IOError, OSError, ValueError):
+        return EDGE_OVERFLOW_PCT
+
+
+def get_recenter_start_frame():
+    """See maya_key_from_cache.py for the full explanation. Same shared
+    _camera_recenter_start_frame.txt file."""
+    path = os.path.join(CACHE_DIR, '_camera_recenter_start_frame.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
+def apply_recenter_override(cam_transform, axis, recenter_frame):
+    """See maya_key_from_cache.py for the full explanation: guarantees the
+    frame Preview/Start Recording shows is actually correctly centered on
+    BOTH axes, since key_edge_guard's own curve only guarantees "stays
+    on-screen," not "centered"."""
+    attr = cam_transform + '.translate' + axis.upper()
+    cmds.currentTime(recenter_frame)
+    cmds.select(clear=True)
+    bbox = get_target_bbox()
+    if axis == 'x':
+        true_center = (bbox[0] + bbox[3]) / 2.0
+    else:
+        true_center = (bbox[2] + bbox[5]) / 2.0
+    cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
+
+
 CACHE_PATH = cache_path_for(find_animation_reference())
 
 # view_name -> (camera transform, which cached axis pair to use)
@@ -58,13 +100,14 @@ MODE = 'edge_guard'   # 'edge_guard', 'dead_zone', or 'threshold'
 THRESHOLD_PCT = 0.0    # used when MODE == 'threshold'
 DEAD_ZONE_PCT = 0.50   # used when MODE == 'dead_zone': subject can roam this
                         # fraction of frame width around the camera before it reacts
-EDGE_OVERFLOW_PCT = 0.08  # used when MODE == 'edge_guard': how far past the
+EDGE_OVERFLOW_PCT = 0.02  # used when MODE == 'edge_guard': how far past the
                            # frame edge the subject may extend before the
-                           # camera reacts, as a fraction of frame width.
+                           # camera nudges back, as a fraction of frame width.
                            # MUST match EDGE_OVERFLOW_PCT in
                            # maya_camera_panels_LR.py, which derives the
-                           # top/bottom margin from it -- see the note in
-                           # maya_key_from_cache.py.
+                           # frame width from it (2026-09-02 revision, see
+                           # maya_key_from_cache.py for the full derivation
+                           # and rationale for lowering this from 0.08).
 
 
 def compute_size_scale(cache, axis):
@@ -147,12 +190,12 @@ def key_dead_zone(cam_transform, axis, cache, dead_zone_pct, current_ref, cached
 
 
 def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08):
-    """Camera only moves when the subject's bbox edge would extend past
-    the visible frame by more than overflow_pct of the frame width (e.g.
-    a hand poking past the edge during a wide arm-swing is tolerated),
-    and only enough to bring that edge back to the allowed overflow
-    limit -- not all the way back inside. Keeps repositioning minimal and
-    natural while still catching genuine subject-leaves-the-panel cases."""
+    """See maya_key_from_cache.py's copy of this function for the full
+    design note (2026-09-02, reverted back to nudge from a brief
+    full-recenter experiment -- the recenter made the camera visibly drift
+    to center on trigger, which read as distracting rather than helpful).
+    Nudges just enough to bring the offending edge back to the allowed
+    overflow limit, not all the way to center."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
@@ -222,6 +265,12 @@ print('Using cache: %d frames (%s to %s), animation=%s, cached from character sc
       % (len(cache['frames']), cache['start'], cache['end'],
          cache.get('animation_reference'), cache.get('source_character_scene')))
 
+effective_overflow_pct = get_effective_overflow_pct()
+if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+    print('Using zoom-adjusted drift tolerance: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+
+recenter_frame = get_recenter_start_frame()
+
 scale_cache = {}
 for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
     if not cmds.objExists(cam_transform):
@@ -233,12 +282,16 @@ for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
     print('%s axis size scale: %.4f (current width / cached width at ref frame)' % (axis, scale))
 
     if MODE == 'edge_guard':
-        keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, EDGE_OVERFLOW_PCT)
+        keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct)
     elif MODE == 'dead_zone':
         keyed = key_dead_zone(cam_transform, axis, cache, DEAD_ZONE_PCT, current_ref, cached_ref, scale)
     else:
         keyed = key_from_cache(cam_transform, axis, cache, THRESHOLD_PCT, current_ref, cached_ref, scale)
     print('%s (%s): %d keyframes from %d cached samples' % (view_name, cam_transform, keyed, len(cache['frames'])))
+
+    if recenter_frame is not None:
+        apply_recenter_override(cam_transform, axis, recenter_frame)
+        print('%s (%s): overrode frame %s with a true live-centered keyframe' % (view_name, cam_transform, recenter_frame))
 
 cmds.currentTime(original_time)
 elapsed = time.time() - _t0
