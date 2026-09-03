@@ -22,7 +22,14 @@
 # this is only "does the configured id resolve," not proof of a working
 # capture; see -Action set below for that), or:
 #   MONITOR_SOURCE_NOT_FOUND -- no monitor_capture source in the active scene
-#   MONITOR_LIST_ERROR <message>
+#   MONITOR_LIST_ERROR <message> -- OBS unreachable, bad config, etc
+#   MONITOR_LIST_AUTH_FAILED <message> -- OBS WAS reachable, but the
+#     configured obs_config.txt password did not authenticate. Kept
+#     distinct from MONITOR_LIST_ERROR (not folded into the same generic
+#     line) specifically so rom_launcher.ps1's OBS WebSocket password
+#     status dot can tell "can't verify, OBS isn't running" apart from
+#     "verified reachable, but this password is just wrong" instead of
+#     treating both as one vague failure.
 # -Action set applies the change, then verifies it with a real
 # GetSourceScreenshot (not just id matching -- confirmed live 2026-08-22
 # that a matching id can still be solid black) and writes:
@@ -32,7 +39,8 @@
 #   MONITOR_SET_BRIGHTNESS <0-765 average sample>
 #   MONITOR_SET_MESSAGE <human-readable result, actionable if not verified>
 #   MONITOR_SET_PREVIEW <path to a saved PNG thumbnail of the current capture>
-# or MONITOR_SET_ERROR <message> if the whole operation failed outright.
+# or MONITOR_SET_ERROR <message> / MONITOR_SET_AUTH_FAILED <message> (same
+# distinction as -Action list above) if the whole operation failed outright.
 
 param(
     [Parameter(Mandatory=$true)]
@@ -231,7 +239,13 @@ try {
     Send-WsMessage $ws $identify
     $identified = Receive-WsMessage $ws
     if ($identified.op -ne 2) {
-        throw "Failed to identify with OBS WebSocket."
+        # "AUTH_FAILED:" marker, not a plain message -- the outer catch
+        # below uses this prefix to tell "OBS is reachable but the
+        # configured password is wrong" apart from every other failure
+        # (OBS not running, bad config, etc), so callers (rom_launcher.ps1's
+        # password status dot) can report the two very differently
+        # instead of collapsing them into one generic error.
+        throw "AUTH_FAILED: the OBS WebSocket password is incorrect (or authentication is required but no password is configured)."
     }
 
     $sourceName = Find-ActiveMonitorCaptureSource $ws
@@ -338,8 +352,15 @@ try {
         # OBS sometimes closes its end first after the response -- harmless.
     }
 } catch {
-    $prefix = if ($Action -eq "list") { "MONITOR_LIST_ERROR" } else { "MONITOR_SET_ERROR" }
-    $line = "$prefix $($_.Exception.Message)"
+    $isAuthFailure = $_.Exception.Message -like "AUTH_FAILED:*"
+    if ($isAuthFailure) {
+        $prefix = if ($Action -eq "list") { "MONITOR_LIST_AUTH_FAILED" } else { "MONITOR_SET_AUTH_FAILED" }
+        $message = $_.Exception.Message -replace "^AUTH_FAILED:\s*", ""
+    } else {
+        $prefix = if ($Action -eq "list") { "MONITOR_LIST_ERROR" } else { "MONITOR_SET_ERROR" }
+        $message = $_.Exception.Message
+    }
+    $line = "$prefix $message"
     Set-Content -Path $resultPath -Value $line -Encoding UTF8
     Write-Output $line
 }

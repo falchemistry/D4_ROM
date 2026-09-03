@@ -120,6 +120,58 @@ function Set-MayaFrameRange($minTime, $maxTime) {
     Send-MayaCode "import maya.cmds as cmds`ncmds.playbackOptions(minTime=$minTime, maxTime=$maxTime)`n"
 }
 
+function Get-MayaFps() {
+    # currentTimeUnitToFPS() is the same MEL proc Maya itself uses to
+    # convert the scene's time unit ('ntsc', 'film', 'pal', a custom
+    # 'Xfps' string, etc.) into a plain number -- confirmed live rather
+    # than assuming 30 always, since this project's ROM scenes aren't
+    # guaranteed to share one time unit.
+    $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 7001)
+    $stream = $client.GetStream()
+    $code = "import maya.mel as mel`nwith open(r'$ScriptDir\_fps_state.txt','w') as f:`n    f.write(str(mel.eval('currentTimeUnitToFPS()')))`n"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($code)
+    $stream.Write($bytes, 0, $bytes.Length)
+    Start-Sleep -Milliseconds 300
+    $stream.Close()
+    $client.Close()
+    Start-Sleep -Milliseconds 200
+    return [double](Get-Content "$ScriptDir\_fps_state.txt" -Raw).Trim()
+}
+
+function Get-PlaybackPollIntervalSeconds($frameCount) {
+    # Design (2026-09-02): user reported that short sample-range captures
+    # took noticeably long to trigger Stop Recording after playback had
+    # actually already finished -- the fixed 5s poll below meant up to
+    # ~5.5s of dead air (5s sleep + this function's own ~0.5s round trip)
+    # tacked onto the end of even a 2-3 second clip, more than doubling
+    # its length. Scaling the interval to the CAPTURE's own expected
+    # duration fixes this without touching the fixed 5s ceiling that
+    # already works fine for full-length ROM videos (a 100+ second capture
+    # still polls every 5s, unchanged).
+    #
+    # Expected duration assumes Maya plays back at its own scene fps in
+    # real time, which is the whole premise of this recording -- OBS is
+    # capturing the live viewport, not a re-timed render. Falls back to
+    # 30fps if the fps query fails for any reason (Maya briefly
+    # unreachable, unexpected mel.eval output) -- this interval is a UX
+    # nicety, not something the capture's correctness depends on, so a
+    # bad/missing fps should never abort or stall the run.
+    $fps = 30.0
+    try {
+        $queriedFps = Get-MayaFps
+        if ($queriedFps -gt 0) { $fps = $queriedFps }
+    } catch {
+        Write-Host "Could not query Maya's frame rate for poll-interval scaling -- assuming 30fps."
+    }
+    $expectedDurationSec = $frameCount / $fps
+    # Floor of 0.5s: Get-MayaPlaybackState's own round trip already costs
+    # ~0.5s (its two fixed Start-Sleeps), so polling faster than that
+    # cannot actually detect completion any sooner -- it would only add
+    # command-port traffic. Ceiling of 5s: the value this always used
+    # before this change, kept as-is for anything long enough to hit it.
+    return [Math]::Max(0.5, [Math]::Min(5.0, $expectedDurationSec * 0.1))
+}
+
 # --- OBS WebSocket helpers -------------------------------------------------
 function Send-WsMessage($ws, $obj) {
     $json = $obj | ConvertTo-Json -Depth 10 -Compress
@@ -401,16 +453,33 @@ try {
     Send-MayaCode "import maya.cmds as cmds`ncmds.playbackOptions(loop='once')`ncmds.currentTime($resetFrame)`n"
     Start-Sleep -Milliseconds 500
 
+    # Computed here, BEFORE Invoke-ObsRecordAction, not after -- this needs
+    # 1-2 Maya round trips (frame range + fps), and doing that AFTER
+    # StartRecord would push Send-MayaCode "cmds.play(forward=True)"
+    # further away from it, reintroducing exactly the static lead-in this
+    # code already goes out of its way to avoid (see the file header
+    # comment: playback is meant to start "back-to-back with the recording
+    # start").
+    if ($StartFrame -ne $null) {
+        $activeMin = $StartFrame
+        $activeMax = $EndFrame
+    } else {
+        $activeRange = Get-MayaFrameRange
+        $activeMin = $activeRange.MinTime
+        $activeMax = $activeRange.MaxTime
+    }
+    $pollIntervalSec = Get-PlaybackPollIntervalSeconds ($activeMax - $activeMin)
+
     Write-Host "Starting OBS recording..."
     Invoke-ObsRecordAction "start"
 
     Write-Host "Starting Maya playback..."
     Send-MayaCode "import maya.cmds as cmds`ncmds.play(forward=True)`n"
 
-    Write-Host "Waiting for playback to reach the end..."
+    Write-Host "Waiting for playback to reach the end (polling every $([Math]::Round($pollIntervalSec, 2))s)..."
     $state = "True"
     while ($state -eq "True") {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds $pollIntervalSec
         $state = Get-MayaPlaybackState
         Write-Host "  playback state: $state"
     }
