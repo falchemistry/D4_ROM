@@ -238,12 +238,17 @@ def compute_margin_px(world_h, panel_w, panel_h):
     return margin, max_w, needed_ortho
 
 
-def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct):
-    """See maya_camera_panels.py for the full derivation."""
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width):
+    """See maya_camera_panels.py for the full derivation. BUG FIXED
+    2026-09-08: now also accounts for the pixel offset eating into margin
+    asymmetrically -- see that file's copy for the full writeup."""
     final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
     if final_ortho <= 0:
         return 0.0
     effective = (1.0 - (max_w * MARGIN_SAFETY / final_ortho)) / 2.0
+    world_per_px = final_ortho / float(panel_width)
+    offset_world = abs(offset_x_px) * world_per_px
+    effective -= offset_world / final_ortho
     return max(0.0, effective)
 
 
@@ -251,6 +256,24 @@ def write_effective_overflow_pct(value):
     path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
     with open(path, 'w') as f:
         f.write('%.6f' % value)
+
+
+def write_world_per_px(value):
+    # Hand-off to maya_key_from_cache_LR.py's apply_recenter_override --
+    # see maya_camera_panels.py's own copy of this function for the full
+    # explanation (the bug this fixes is identical here, tracked axis 'z'
+    # instead of 'x').
+    path = os.path.join(CACHE_DIR, '_camera_world_per_px.txt')
+    with open(path, 'w') as f:
+        f.write('%.10f' % value)
+
+
+def write_base_ortho_width(value):
+    # See maya_camera_panels.py's own copy for the full explanation. Same
+    # shared _camera_base_ortho_width.txt file.
+    path = os.path.join(CACHE_DIR, '_camera_base_ortho_width.txt')
+    with open(path, 'w') as f:
+        f.write('%.10f' % value)
 
 
 def view_title(view_name):
@@ -330,8 +353,10 @@ def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, marg
 
     usable_px = max(panel_height - 2 * margin_px, 1)
     view_height_world = world_h * (panel_height / float(usable_px))
-    ortho_width = view_height_world * (panel_width / float(panel_height))
-    ortho_width *= (1.0 - zoom_pct / 100.0)
+    # base_ortho_width: see maya_camera_panels.py's own copy for why this
+    # needs to be its own variable (maya_camera_live_zoom.py reuses it).
+    base_ortho_width = view_height_world * (panel_width / float(panel_height))
+    ortho_width = base_ortho_width * (1.0 - zoom_pct / 100.0)
 
     # See maya_camera_panels.py's own copy of this for the full derivation.
     world_per_px = ortho_width / float(panel_width)
@@ -348,6 +373,7 @@ def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, marg
     trans[AXIS_POS[h_axis]] = center_h
     trans[AXIS_POS[v_axis]] = center_v
     cmds.setAttr(cam_transform + '.translate', trans[0], trans[1], trans[2], type='double3')
+    return world_per_px, base_ortho_width
 
 
 def apply_mesh_only_display(panel):
@@ -494,10 +520,12 @@ def open_view_panels():
     if offset_x_px or offset_y_px:
         print('Pixel offset: X=%+.0f Y=%+.0f' % (offset_x_px, offset_y_px))
 
-    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct)
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, col_width)
     write_effective_overflow_pct(effective_overflow_pct)
     if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
-        print('Effective drift tolerance at this zoom: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+        print('Effective drift tolerance at this zoom/offset: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+        if effective_overflow_pct <= 1e-6:
+            print('WARNING: current zoom/offset leaves ZERO drift tolerance -- the widest pose may clip regardless of tracking. Reduce zoom-in or offset magnitude if clipping is visible.')
 
     close_all_view_panels()
 
@@ -530,11 +558,16 @@ def open_view_panels():
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
-        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
+        computed_world_per_px, computed_base_ortho_width = frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
 
+    write_world_per_px(computed_world_per_px)
+    write_base_ortho_width(computed_base_ortho_width)
     cmds.refresh(force=True)
 
 
+# Suspended for the whole setup -- see maya_camera_panels.py's own copy
+# for the full explanation (identical fix here).
+cmds.refresh(suspend=True)
 try:
     open_view_panels()
 except Exception:
@@ -551,4 +584,6 @@ except Exception:
     # got to run.
     mel.eval('toggleModelEditorBarsInAllPanels(0)')
     raise
+finally:
+    cmds.refresh(suspend=False)
 print('VIEW_PANELS_OK')

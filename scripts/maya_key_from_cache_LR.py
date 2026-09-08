@@ -71,11 +71,57 @@ def get_recenter_start_frame():
         return None
 
 
-def apply_recenter_override(cam_transform, axis, recenter_frame):
+# Manual pixel-space nudge -- see maya_camera_panels.py's get_pixel_offset()
+# for the full explanation. Only needed here so apply_recenter_override can
+# apply the SAME offset instead of discarding it (BUG FIXED 2026-09-08, see
+# maya_key_from_cache.py's copy of apply_recenter_override for the full
+# writeup -- identical bug here, tracked axis 'z' instead of 'x').
+OFFSET_X_PX = 0.0
+OFFSET_Y_PX = 0.0
+
+
+def get_pixel_offset():
+    """See maya_camera_panels.py for the full explanation. Same shared
+    _camera_offset_px.txt file."""
+    path = os.path.join(CACHE_DIR, '_camera_offset_px.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        parts = content.split(',')
+        if len(parts) == 2:
+            return float(parts[0]), float(parts[1])
+    except (IOError, OSError, ValueError):
+        pass
+    return OFFSET_X_PX, OFFSET_Y_PX
+
+
+def get_world_per_px():
+    """See maya_key_from_cache.py for the full explanation. Same shared
+    _camera_world_per_px.txt file, written by maya_camera_panels_LR.py's
+    write_world_per_px()."""
+    path = os.path.join(CACHE_DIR, '_camera_world_per_px.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
+def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, world_per_px):
     """See maya_key_from_cache.py for the full explanation: guarantees the
     frame Preview/Start Recording shows is actually correctly centered on
     BOTH axes, since key_edge_guard's own curve only guarantees "stays
-    on-screen," not "centered"."""
+    on-screen," not "centered". BUG FIXED 2026-09-08: also applies the
+    manual pixel offset, which this override used to silently discard --
+    see maya_key_from_cache.py's copy for the full writeup.
+
+    BUG FIXED 2026-09-08 (second fix, same day): also forces linear
+    tangents on the inserted keyframe, since the default 'auto' tangent
+    could swing past either neighboring key's value once the offset+zoom
+    margin hit zero -- see maya_key_from_cache.py's copy for the full
+    writeup and the real-scene evidence (9 overshoot clusters, up to 26
+    units, eliminated by this alone)."""
     attr = cam_transform + '.translate' + axis.upper()
     cmds.currentTime(recenter_frame)
     cmds.select(clear=True)
@@ -84,7 +130,10 @@ def apply_recenter_override(cam_transform, axis, recenter_frame):
         true_center = (bbox[0] + bbox[3]) / 2.0
     else:
         true_center = (bbox[2] + bbox[5]) / 2.0
+    if world_per_px is not None:
+        true_center -= offset_x_px * world_per_px
     cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
+    cmds.keyTangent(attr, time=(recenter_frame, recenter_frame), inTangentType='linear', outTangentType='linear')
 
 
 CACHE_PATH = cache_path_for(find_animation_reference())
@@ -189,13 +238,18 @@ def key_dead_zone(cam_transform, axis, cache, dead_zone_pct, current_ref, cached
     return keyed_count
 
 
-def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08):
+def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08, offset_shift=0.0):
     """See maya_key_from_cache.py's copy of this function for the full
     design note (2026-09-02, reverted back to nudge from a brief
     full-recenter experiment -- the recenter made the camera visibly drift
     to center on trigger, which read as distracting rather than helpful).
     Nudges just enough to bring the offending edge back to the allowed
-    overflow limit, not all the way to center."""
+    overflow limit, not all the way to center.
+
+    BUG FIXED 2026-09-08: offset_shift (see maya_key_from_cache.py's copy
+    for the full writeup) -- this function used to have zero knowledge of
+    the manual pixel offset at all, so the whole curve ignored it outside
+    the one recenter-frame override."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
@@ -211,7 +265,7 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     half_ortho = ortho_width / 2.0
     overflow = overflow_pct * ortho_width
 
-    cam_pos = subject_center[0]
+    cam_pos = subject_center[0] - offset_shift
     cmds.setKeyframe(attr, time=frames[0], value=cam_pos)
     keyed_count = 1
     last_keyed_frame = frames[0]
@@ -265,35 +319,45 @@ print('Using cache: %d frames (%s to %s), animation=%s, cached from character sc
       % (len(cache['frames']), cache['start'], cache['end'],
          cache.get('animation_reference'), cache.get('source_character_scene')))
 
-effective_overflow_pct = get_effective_overflow_pct()
-if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
-    print('Using zoom-adjusted drift tolerance: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+# Suspended for the whole keying pass -- see maya_key_from_cache.py's own
+# copy for the full explanation (identical fix here). Placed AFTER the
+# cache-load above so a first-time cache build's own progress reporting
+# is never hidden by this.
+cmds.refresh(suspend=True)
+try:
+    effective_overflow_pct = get_effective_overflow_pct()
+    if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+        print('Using zoom-adjusted drift tolerance: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
 
-recenter_frame = get_recenter_start_frame()
+    recenter_frame = get_recenter_start_frame()
+    offset_x_px, offset_y_px = get_pixel_offset()
+    world_per_px = get_world_per_px()
+    offset_shift = (offset_x_px * world_per_px) if world_per_px is not None else 0.0
 
-scale_cache = {}
-for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
-    if not cmds.objExists(cam_transform):
-        print('Skipped %s: camera "%s" does not exist' % (view_name, cam_transform))
-        continue
-    if axis not in scale_cache:
-        scale_cache[axis] = compute_size_scale(cache, axis)
-    current_ref, cached_ref, scale = scale_cache[axis]
-    print('%s axis size scale: %.4f (current width / cached width at ref frame)' % (axis, scale))
+    scale_cache = {}
+    for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
+        if not cmds.objExists(cam_transform):
+            print('Skipped %s: camera "%s" does not exist' % (view_name, cam_transform))
+            continue
+        if axis not in scale_cache:
+            scale_cache[axis] = compute_size_scale(cache, axis)
+        current_ref, cached_ref, scale = scale_cache[axis]
+        print('%s axis size scale: %.4f (current width / cached width at ref frame)' % (axis, scale))
 
-    if MODE == 'edge_guard':
-        keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct)
-    elif MODE == 'dead_zone':
-        keyed = key_dead_zone(cam_transform, axis, cache, DEAD_ZONE_PCT, current_ref, cached_ref, scale)
-    else:
-        keyed = key_from_cache(cam_transform, axis, cache, THRESHOLD_PCT, current_ref, cached_ref, scale)
-    print('%s (%s): %d keyframes from %d cached samples' % (view_name, cam_transform, keyed, len(cache['frames'])))
+        if MODE == 'edge_guard':
+            keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct, offset_shift)
+        elif MODE == 'dead_zone':
+            keyed = key_dead_zone(cam_transform, axis, cache, DEAD_ZONE_PCT, current_ref, cached_ref, scale)
+        else:
+            keyed = key_from_cache(cam_transform, axis, cache, THRESHOLD_PCT, current_ref, cached_ref, scale)
+        print('%s (%s): %d keyframes from %d cached samples' % (view_name, cam_transform, keyed, len(cache['frames'])))
 
-    if recenter_frame is not None:
-        apply_recenter_override(cam_transform, axis, recenter_frame)
-        print('%s (%s): overrode frame %s with a true live-centered keyframe' % (view_name, cam_transform, recenter_frame))
-
-cmds.currentTime(original_time)
+        if recenter_frame is not None:
+            apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, world_per_px)
+            print('%s (%s): overrode frame %s with a true live-centered keyframe' % (view_name, cam_transform, recenter_frame))
+finally:
+    cmds.currentTime(original_time)
+    cmds.refresh(suspend=False)
 elapsed = time.time() - _t0
 print('Elapsed: %.2f sec' % elapsed)
 with open(r'D:\__backup\claude\maya_debug.txt', 'w') as f:

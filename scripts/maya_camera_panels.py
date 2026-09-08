@@ -331,7 +331,7 @@ def compute_margin_px(world_h, panel_w, panel_h):
     return margin, max_w, needed_ortho
 
 
-def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct):
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width):
     """The magnifier multiplies the final orthoWidth AFTER compute_margin_px
     has already sized the frame assuming zero zoom -- zooming in narrows
     the frame below what compute_margin_px promised, silently eating into
@@ -348,11 +348,29 @@ def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct):
     zoom-in, even the driftless max-width pose no longer fits in the frame
     at all, which no tolerance value can fix; that residual is an inherent
     consequence of the user's own zoom choice, not something this can
-    compensate away."""
+    compensate away.
+
+    BUG FIXED 2026-09-08: this used to ignore the pixel offset entirely,
+    even though offset shifts the subject's resting position toward ONE
+    edge of the frame (see frame_camera's own offset math) -- eating
+    margin on that near side while adding it on the far side. edge_guard's
+    own tolerance is symmetric (the same threshold applies to both edges),
+    so the tolerance actually safe to use is bounded by the TIGHTER (near)
+    side, not the average symmetric slack the zoom-only formula assumed.
+    Confirmed live on a real scene: a 60px offset left the TRUE near-edge
+    tolerance at -2.87% (already clipping at rest, before any drift)
+    while the offset-blind formula still claimed 2.00% was available --
+    reported as "lost its frame-gate ability" and jumpy framing during an
+    actual recording (Preview only ever shows one static frame, so this
+    never surfaced there -- it only shows up once edge_guard's curve gets
+    exercised across the whole animation during real playback)."""
     final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
     if final_ortho <= 0:
         return 0.0
     effective = (1.0 - (max_w * MARGIN_SAFETY / final_ortho)) / 2.0
+    world_per_px = final_ortho / float(panel_width)
+    offset_world = abs(offset_x_px) * world_per_px
+    effective -= offset_world / final_ortho
     return max(0.0, effective)
 
 
@@ -360,6 +378,31 @@ def write_effective_overflow_pct(value):
     path = os.path.join(CACHE_DIR, '_camera_effective_overflow_pct.txt')
     with open(path, 'w') as f:
         f.write('%.6f' % value)
+
+
+def write_world_per_px(value):
+    # Hand-off to maya_key_from_cache.py's apply_recenter_override, so the
+    # recenter override can apply the SAME pixel offset frame_camera() just
+    # applied below instead of silently discarding it on the one frame
+    # Preview actually shows (see apply_recenter_override's docstring for
+    # the bug this fixes). Same file-hand-off pattern as
+    # write_effective_overflow_pct.
+    path = os.path.join(CACHE_DIR, '_camera_world_per_px.txt')
+    with open(path, 'w') as f:
+        f.write('%.10f' % value)
+
+
+def write_base_ortho_width(value):
+    # Hand-off to maya_camera_live_zoom.py: the PRE-zoom orthoWidth, so a
+    # live zoom-slider push can recompute orthoWidth for a new zoom_pct
+    # without redoing the margin/bbox measurement -- and can then rewrite
+    # world_per_px too, since zoom changes what a pixel is worth (offset
+    # nudging reads that same file -- see maya_key_from_cache.py's
+    # apply_recenter_override fix for why these two must never drift
+    # independently).
+    path = os.path.join(CACHE_DIR, '_camera_base_ortho_width.txt')
+    with open(path, 'w') as f:
+        f.write('%.10f' % value)
 
 
 def view_title(view_name):
@@ -446,11 +489,16 @@ def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, marg
 
     usable_px = max(panel_height - 2 * margin_px, 1)
     view_height_world = world_h * (panel_height / float(usable_px))
-    ortho_width = view_height_world * (panel_width / float(panel_height))
+    # base_ortho_width is the pre-zoom frame width -- kept as its own
+    # variable (not just a local inline expression) because
+    # maya_camera_live_zoom.py needs this exact value to recompute
+    # orthoWidth live from a NEW zoom_pct, without redoing the margin/bbox
+    # math (see write_base_ortho_width below).
+    base_ortho_width = view_height_world * (panel_width / float(panel_height))
     # Magnifier: scales the whole visible frame (Maya derives the vertical
     # extent from orthoWidth + panel aspect), so this is a true zoom, not
     # just a horizontal crop.
-    ortho_width *= (1.0 - zoom_pct / 100.0)
+    ortho_width = base_ortho_width * (1.0 - zoom_pct / 100.0)
 
     # Pixel offset: converted using the FINAL (post-zoom) orthoWidth, so a
     # "pixel" here means an actual pixel on the rendered panel, matching
@@ -476,6 +524,7 @@ def frame_camera(view_name, cam_transform, panel_width, panel_height, bbox, marg
     trans[AXIS_POS[h_axis]] = center_h
     trans[AXIS_POS[v_axis]] = center_v
     cmds.setAttr(cam_transform + '.translate', trans[0], trans[1], trans[2], type='double3')
+    return world_per_px, base_ortho_width
 
 
 def apply_mesh_only_display(panel):
@@ -645,10 +694,12 @@ def open_view_panels():
     # actually left -- write the value that ACTUALLY applies at the current
     # zoom level so maya_key_from_cache.py's edge_guard uses it instead of
     # its own static constant. See compute_effective_overflow_pct.
-    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct)
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, col_width)
     write_effective_overflow_pct(effective_overflow_pct)
     if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
-        print('Effective drift tolerance at this zoom: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+        print('Effective drift tolerance at this zoom/offset: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
+        if effective_overflow_pct <= 1e-6:
+            print('WARNING: current zoom/offset leaves ZERO drift tolerance -- the widest pose may clip regardless of tracking. Reduce zoom-in or offset magnitude if clipping is visible.')
 
     close_all_view_panels()
 
@@ -681,11 +732,22 @@ def open_view_panels():
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
-        frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
+        computed_world_per_px, computed_base_ortho_width = frame_camera(view_name, cam, panel_w, panel_h, bbox, margin_px, zoom_pct, offset_x_px, offset_y_px, world_h)
 
+    write_world_per_px(computed_world_per_px)
+    write_base_ortho_width(computed_base_ortho_width)
     cmds.refresh(force=True)
 
 
+# Suspended for the whole setup (2026-09-08): without this, the user sees
+# the panel windows appear unframed and then visibly snap into place
+# across 3 separate cmds.refresh(force=True) calls inside
+# open_view_panels() -- reported as "the viewport kept updating the
+# progress... quite distracting." Resumed in `finally` so a mid-setup
+# failure can never leave the viewport frozen (the same reasoning as the
+# existing model-editor-bars restore in `except` just below, now covering
+# both).
+cmds.refresh(suspend=True)
 try:
     open_view_panels()
 except Exception:
@@ -702,4 +764,6 @@ except Exception:
     # got to run.
     mel.eval('toggleModelEditorBarsInAllPanels(0)')
     raise
+finally:
+    cmds.refresh(suspend=False)
 print('VIEW_PANELS_OK')

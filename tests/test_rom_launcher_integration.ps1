@@ -22,6 +22,40 @@
 $script:defaultRecordingMonitorNameTestPath = Join-Path $env:TEMP "rom_launcher_test_monitor_name_default.txt"
 function Get-RecordingMonitorNamePath { return $script:defaultRecordingMonitorNameTestPath }
 
+# Safety-net default (2026-09-08): Show-DarkConfirm's REAL implementation
+# always calls a genuine, blocking .ShowDialog() regardless of the main
+# window's -NoShow state -- confirmed the hard way: the frame-gate warning
+# added to Start Recording's click handler hung an entire suite run with
+# two real, unattended "Framing Warning" dialog windows sitting open,
+# because $script:lastCachePath/zoom/offset state left over from an
+# EARLIER, unrelated test happened to land in the zero-tolerance zone by
+# the time a LATER test clicked Start Recording without expecting to hit
+# any confirm dialog at all. Same override convention as
+# Get-RecordingMonitorNamePath just above: any Check below that DOES want
+# to test a real confirm-dialog interaction (several already do, e.g. the
+# Force Rebuild tests) defines its own override, which simply takes
+# priority for that scope -- this is only the fallback for everything
+# else, so a leftover/unexpected reach into ANY confirm dialog (this one
+# or a future one) can never again hang the whole suite unattended.
+#
+# Captured BEFORE the override below replaces it, so the one test that
+# specifically verifies Show-DarkConfirm's OWN real click-handling
+# (searchable: "Show-DarkConfirm's real Yes button") can temporarily
+# restore the genuine implementation for its own scope, then hand the
+# safe default back for everything after it.
+$script:realShowDarkConfirm = ${function:Show-DarkConfirm}
+
+function Show-DarkConfirm {
+    param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+    return $false
+}
+function Set-SafeShowDarkConfirmDefault {
+    ${function:Show-DarkConfirm} = {
+        param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+        return $false
+    }
+}
+
 $failures = @()
 $passed = 0
 
@@ -530,6 +564,10 @@ Check "Start Recording appends a Reset step automatically once the recording fin
     function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
     function Test-RecordingMonitorSelected { return $true }
     function Get-CacheStatus { return [PSCustomObject]@{ Status = "Missing"; AnimationReference = "D:/fake/auto_reset_test.ma"; CachePath = $null; ErrorMessage = $null } }
+    # Not testing the frame-gate warning here -- isolate from whatever
+    # $script:lastCachePath/zoom/offset a PRIOR test left behind, same
+    # reasoning as the Show-DarkConfirm safety-net default above.
+    $script:lastCachePath = $null
     $allFramesRadio.IsChecked = $true
     function Get-AnimationRange { return [PSCustomObject]@{ Success = $true; Start = 0; End = 10; ErrorMessage = $null } }
     function Get-CaptureSteps {
@@ -887,6 +925,14 @@ Check "Show-DarkConfirm's real Yes button actually returns true (regression test
     # .CurrentSources (not Application.Current.Windows, which is $null
     # here since this codebase never constructs a System.Windows.
     # Application object) is what finds the shown-but-untracked window.
+    #
+    # Restores the GENUINE implementation for this scope only -- the suite
+    # otherwise runs under a safe stub (see Set-SafeShowDarkConfirmDefault)
+    # so a leftover state from an unrelated test can never again pop a
+    # real, unattended modal. Handed back in the existing finally below,
+    # which runs regardless of outcome, so a failure here can't leave the
+    # real (blocking) implementation active for every test after this one.
+    ${function:Show-DarkConfirm} = $script:realShowDarkConfirm
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(250)
     $timer.Add_Tick({
@@ -919,6 +965,7 @@ Check "Show-DarkConfirm's real Yes button actually returns true (regression test
         # outcome, is what actually happened and caused exactly that
         # symptom before this try/finally was added.
         $timer.Stop()
+        Set-SafeShowDarkConfirmDefault
     }
     if ($result -ne $true) { throw "expected the real Yes button click to resolve the dialog true, got '$result'" }
 }
@@ -1641,6 +1688,9 @@ Check "Start Recording writes the SAME resolved Start frame Get-CaptureClickResu
         param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
         return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
     }
+    # Not testing the frame-gate warning here -- same isolation as the
+    # other Start Recording tests above.
+    $script:lastCachePath = $null
 
     $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
     if ($script:resolveCallCount -ne 1) { throw "expected exactly 1 range resolution (shared with Get-CaptureClickResult), got $($script:resolveCallCount)" }
@@ -1775,6 +1825,337 @@ Check "Invoke-ResetOnClose fires the Reset step when idle, but not while a run i
         $script:currentProcess = $null
     }
 }
+
+# --- Live-tune controls (2026-09-08 revision) -------------------------
+# Per-box drag (X/Y), hover-gated arrow-key nudge, deferred zoom-slider
+# push, and Reset -- all funnel into $script:pendingNudgeDeltaX/Y /
+# $pendingZoomPush, flushed by Invoke-LiveApplyTick. Isolated to a
+# throwaway offset file, same convention as every other Write-Camera*
+# function above.
+$script:liveTuneOffsetPath = Join-Path $env:TEMP "rom_launcher_test_livetune_offset.txt"
+function Get-CameraOffsetPxPath { return $script:liveTuneOffsetPath }
+function Reset-LiveTuneTestState {
+    $script:lastValidOffsetX = 0
+    $script:lastValidOffsetY = 0
+    $script:dragBoxAxis = $null
+    $script:dragCurrentValue = 0.0
+    $script:arrowNudgeActive = $false
+    $script:zoomSliderDragging = $false
+    $script:pendingNudgeDeltaX = 0.0
+    $script:pendingNudgeDeltaY = 0.0
+    $script:pendingZoomPush = $false
+    $script:liveApplyProcess = $null
+    $offsetXBox.Text = "0"
+    $offsetYBox.Text = "0"
+    $zoomSlider.Value = 0
+    # The assignment above can itself trigger ValueChanged (a real change
+    # from whatever the previous test left it at) and set pendingZoomPush
+    # -- clear it again AFTER, not just before, so this reset is truly clean.
+    $script:pendingZoomPush = $false
+    Remove-Item $script:liveTuneOffsetPath -ErrorAction SilentlyContinue
+}
+
+Check "Commit-OffsetBoxes pushes a live nudge delta matching the change; invalid input pushes nothing" {
+    Reset-LiveTuneTestState
+    $offsetXBox.Text = "42"
+    $offsetYBox.Text = "-15"
+    Commit-OffsetBoxes
+    if ($script:pendingNudgeDeltaX -ne 42) { throw "expected pending X delta 42, got $($script:pendingNudgeDeltaX)" }
+    if ($script:pendingNudgeDeltaY -ne -15) { throw "expected pending Y delta -15, got $($script:pendingNudgeDeltaY)" }
+
+    $script:pendingNudgeDeltaX = 0.0
+    $script:pendingNudgeDeltaY = 0.0
+    $offsetXBox.Text = "not a number"
+    Commit-OffsetBoxes
+    if ($script:pendingNudgeDeltaX -ne 0) { throw "invalid input must push a zero delta (revert, not a change), got $($script:pendingNudgeDeltaX)" }
+}
+
+Check "a single zoom slider VALUE CHANGE (not a drag) applies immediately" {
+    Reset-LiveTuneTestState
+    $zoomSlider.Value = 15
+    if (-not $script:pendingZoomPush) { throw "expected an immediate pendingZoomPush for a non-drag value change" }
+}
+
+Check "zoom slider drag is deferred: no push while dragging, exactly one push on DragCompleted" {
+    Reset-LiveTuneTestState
+    $script:zoomSliderDragging = $true
+    $zoomSlider.Value = 20   # simulates a ValueChanged tick mid-drag
+    if ($script:pendingZoomPush) { throw "expected the push suppressed while a drag is in progress" }
+    $dragCompletedArgs = New-Object System.Windows.Controls.Primitives.DragCompletedEventArgs(0, 0, $false)
+    $dragCompletedArgs.RoutedEvent = [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent
+    $zoomSlider.RaiseEvent($dragCompletedArgs)
+    if ($script:zoomSliderDragging) { throw "expected dragging flag cleared after DragCompleted" }
+    if (-not $script:pendingZoomPush) { throw "expected exactly one push once the drag completes" }
+}
+
+Check "Update/Stop-OffsetWheelNudge on X: no live push mid-scroll, one push with the TOTAL delta once settled" {
+    Reset-LiveTuneTestState
+    # Ten scroll-up notches (positive Delta): no push until Stop (matching
+    # the settle-timer firing after 400ms of no further scrolling).
+    for ($i = 1; $i -le 10; $i++) { Update-OffsetWheelNudge -Axis "X" -Delta 120 -ShiftHeld $false }
+    if ($script:pendingNudgeDeltaX -ne 0) { throw "expected NO live push while still mid-scroll, got $($script:pendingNudgeDeltaX)" }
+    if ($offsetXBox.Text -ne "100") { throw "expected OffsetXBox to display '100' live during the scroll, got '$($offsetXBox.Text)'" }
+    Stop-OffsetWheelNudge
+    if ($script:pendingNudgeDeltaX -ne 100) { throw "expected exactly one pending delta of 100 once settled, got $($script:pendingNudgeDeltaX)" }
+    if ($script:lastValidOffsetX -ne 100) { throw "expected committed offset X = 100, got $($script:lastValidOffsetX)" }
+    $written = (Get-Content $script:liveTuneOffsetPath -Raw).Trim()
+    if ($written -ne "100,0") { throw "expected the offset file to hold '100,0' once settled, got '$written'" }
+}
+
+Check "scrolling down is negative, Shift = 100px per notch, Y-axis scroll never touches X" {
+    Reset-LiveTuneTestState
+    Update-OffsetWheelNudge -Axis "X" -Delta -120 -ShiftHeld $false
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne -10) { throw "expected -10 from a single scroll-down notch, got $($script:lastValidOffsetX)" }
+
+    Reset-LiveTuneTestState
+    Update-OffsetWheelNudge -Axis "Y" -Delta 120 -ShiftHeld $true
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne 100) { throw "expected +100 from a single Shift+scroll-up notch, got $($script:lastValidOffsetY)" }
+    if ($script:lastValidOffsetX -ne 0) { throw "a Y-axis scroll must never touch X, got $($script:lastValidOffsetX)" }
+}
+
+Check "Stop-OffsetWheelNudge is a no-op when no scroll session is active" {
+    Reset-LiveTuneTestState
+    Stop-OffsetWheelNudge
+    if ($script:pendingNudgeDeltaX -ne 0 -or $script:pendingNudgeDeltaY -ne 0) { throw "expected no pending delta without an active scroll session" }
+}
+
+Check "switching axis mid-scroll flushes the prior axis's session first, not mixing them" {
+    Reset-LiveTuneTestState
+    Update-OffsetWheelNudge -Axis "X" -Delta 120 -ShiftHeld $false
+    Update-OffsetWheelNudge -Axis "X" -Delta 120 -ShiftHeld $false
+    Update-OffsetWheelNudge -Axis "Y" -Delta 120 -ShiftHeld $false   # switches axis -- must flush X's 2-notch session
+    if ($script:lastValidOffsetX -ne 20) { throw "expected X's session flushed at 20 before Y started, got $($script:lastValidOffsetX)" }
+    if ($script:pendingNudgeDeltaX -ne 20) { throw "expected X's flushed delta to already be pending, got $($script:pendingNudgeDeltaX)" }
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne 10) { throw "expected Y's own session to commit separately, got $($script:lastValidOffsetY)" }
+}
+
+Check "arrow nudge: plain arrow = 10px, Shift+arrow = 100px, unrelated key is a no-op, deferred until Stop-ArrowNudge" {
+    Reset-LiveTuneTestState
+    Start-ArrowNudge
+    if (-not (Update-ArrowNudge -Key ([System.Windows.Input.Key]::Right) -ShiftHeld $false)) { throw "expected Right arrow to be handled" }
+    if ($script:lastValidOffsetX -ne 10) { throw "expected +10 from a plain Right arrow, got $($script:lastValidOffsetX)" }
+    if ($script:pendingNudgeDeltaX -ne 0) { throw "expected NO live push while the key is still held (before Stop-ArrowNudge), got $($script:pendingNudgeDeltaX)" }
+
+    if (-not (Update-ArrowNudge -Key ([System.Windows.Input.Key]::Up) -ShiftHeld $true)) { throw "expected Shift+Up to be handled" }
+    if ($script:lastValidOffsetY -ne 100) { throw "expected +100 from Shift+Up, got $($script:lastValidOffsetY)" }
+
+    if (Update-ArrowNudge -Key ([System.Windows.Input.Key]::A) -ShiftHeld $false) { throw "expected an unrelated key to be a no-op (return false)" }
+    if ($script:lastValidOffsetX -ne 10 -or $script:lastValidOffsetY -ne 100) { throw "an unrelated key must not change the offset" }
+
+    Stop-ArrowNudge
+    if ($script:pendingNudgeDeltaX -ne 10 -or $script:pendingNudgeDeltaY -ne 100) { throw "expected the whole held-key session's total (10, 100) pushed exactly once on release, got ($($script:pendingNudgeDeltaX), $($script:pendingNudgeDeltaY))" }
+}
+
+Check "Test-ArrowNudgeKey identifies exactly the 4 arrow keys" {
+    foreach ($k in @([System.Windows.Input.Key]::Left, [System.Windows.Input.Key]::Right, [System.Windows.Input.Key]::Up, [System.Windows.Input.Key]::Down)) {
+        if (-not (Test-ArrowNudgeKey $k)) { throw "expected $k to be recognized as an arrow-nudge key" }
+    }
+    if (Test-ArrowNudgeKey ([System.Windows.Input.Key]::Space)) { throw "expected an unrelated key to NOT be recognized" }
+}
+
+Check "Reset button zeroes Zoom/X/Y and applies immediately" {
+    Reset-LiveTuneTestState
+    $zoomSlider.Value = 30
+    $offsetXBox.Text = "25"; $offsetYBox.Text = "-8"
+    Commit-OffsetBoxes
+    $script:pendingNudgeDeltaX = 0.0; $script:pendingNudgeDeltaY = 0.0; $script:pendingZoomPush = $false
+
+    $resetFrameOffsetsButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+
+    if ($zoomSlider.Value -ne 0) { throw "expected zoom reset to 0, got $($zoomSlider.Value)" }
+    if ($offsetXBox.Text -ne "0" -or $offsetYBox.Text -ne "0") { throw "expected X/Y boxes reset to 0, got X='$($offsetXBox.Text)' Y='$($offsetYBox.Text)'" }
+    if (-not $script:pendingZoomPush) { throw "expected the reset to apply live immediately (zoom)" }
+    if ($script:pendingNudgeDeltaX -ne -25 -or $script:pendingNudgeDeltaY -ne 8) { throw "expected the reset to apply live immediately (offset delta back to 0), got ($($script:pendingNudgeDeltaX), $($script:pendingNudgeDeltaY))" }
+}
+
+Check "Invoke-LiveApplyTick coalesces pending state into exactly one send per tick, zoom before nudge" {
+    Reset-LiveTuneTestState
+    $script:liveApplySendCalls = @()
+    function Send-CameraLiveScript { param([string]$ScriptName); $script:liveApplySendCalls += $ScriptName }
+    $nudgeDeltaPath = Join-Path $ScriptDir "..\d4_anim_sample\_camera_nudge_delta.txt"
+    Remove-Item $nudgeDeltaPath -ErrorAction SilentlyContinue
+
+    # Several raw updates land between ticks -- must coalesce to ONE send,
+    # using the LATEST accumulated total, not one send per update.
+    $script:pendingNudgeDeltaX = 3.0
+    $script:pendingNudgeDeltaX += 4.0
+    $script:pendingNudgeDeltaY = 1.0
+    Invoke-LiveApplyTick
+    if ($script:liveApplySendCalls.Count -ne 1) { throw "expected exactly 1 send for coalesced nudge deltas, got $($script:liveApplySendCalls.Count)" }
+    if ($script:liveApplySendCalls[0] -ne "maya_camera_live_nudge.py") { throw "expected the nudge script to be sent" }
+    if ($script:pendingNudgeDeltaX -ne 0 -or $script:pendingNudgeDeltaY -ne 0) { throw "expected pending deltas cleared after the send" }
+    $writtenDelta = (Get-Content $nudgeDeltaPath -Raw).Trim()
+    if ($writtenDelta -ne "7,1") { throw "expected the coalesced delta '7,1' written before the send, got '$writtenDelta'" }
+    Remove-Item $nudgeDeltaPath -ErrorAction SilentlyContinue
+
+    # Zoom beats nudge when both are pending at once.
+    $script:liveApplySendCalls = @()
+    $script:pendingNudgeDeltaX = 5.0
+    $script:pendingZoomPush = $true
+    Invoke-LiveApplyTick
+    if ($script:liveApplySendCalls.Count -ne 1) { throw "expected exactly 1 send even with 2 things pending, got $($script:liveApplySendCalls.Count)" }
+    if ($script:liveApplySendCalls[0] -ne "maya_camera_live_zoom.py") { throw "expected zoom to take priority, got $($script:liveApplySendCalls[0])" }
+    if ($script:pendingNudgeDeltaX -ne 5.0) { throw "nudge delta should still be pending -- only one thing is sent per tick" }
+
+    # A send genuinely still "in flight" (a real, not-yet-exited process)
+    # must block the tick entirely -- nothing sent, nothing cleared. Set a
+    # FRESH pending push here rather than relying on the previous section's
+    # (which Invoke-LiveApplyTick already consumed/cleared on its own send).
+    $script:liveApplySendCalls = @()
+    $script:pendingZoomPush = $true
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "ping"
+    $psi.Arguments = "-n 30 127.0.0.1"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $script:liveApplyProcess = [System.Diagnostics.Process]::Start($psi)
+    try {
+        Invoke-LiveApplyTick
+        if ($script:liveApplySendCalls.Count -ne 0) { throw "expected no send while a previous one is still in flight, got $($script:liveApplySendCalls.Count)" }
+        if (-not $script:pendingZoomPush) { throw "pending zoom push must remain pending while blocked" }
+    } finally {
+        $script:liveApplyProcess.Kill()
+        $script:liveApplyProcess.WaitForExit(2000) | Out-Null
+        $script:liveApplyProcess = $null
+    }
+}
+
+Reset-LiveTuneTestState
+
+# --- Frame-gate warning (2026-09-08) ----------------------------------
+# Get-FrameGateEffectiveOverflowPct mirrors maya_camera_panels.py's
+# compute_effective_overflow_pct entirely locally -- verify it against a
+# synthetic cache file with a KNOWN x_width, not the real project cache,
+# so the expected value can be hand-derived exactly (no MARGIN_PX_MIN-style
+# clamp involved in this particular formula, unlike compute_margin_px's
+# vertical margin -- confirmed by re-reading the Python source before
+# trusting this).
+$script:frameGateTestCachePath = Join-Path $env:TEMP "rom_launcher_test_frame_gate_cache.json"
+$script:frameGateTestRectPath = Join-Path $env:TEMP "rom_launcher_test_frame_gate_rect.txt"
+function Get-RecordingMonitorRectPath { return $script:frameGateTestRectPath }
+
+function Reset-FrameGateTestState {
+    # max_w=200, panel width=1000 (rect 0..1000,0..1080 -> colWidth=500 for
+    # 2 views -- use a rect that yields a round colWidth for easy hand math).
+    Set-Content -Path $script:frameGateTestRectPath -Value "0,0,1000,1080" -Encoding ASCII
+    @{ x_width = @(150, 180, 200, 120) } | ConvertTo-Json | Set-Content -Path $script:frameGateTestCachePath -Encoding UTF8
+    $script:lastCachePath = $script:frameGateTestCachePath
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 0
+    $previewButton.Effect = $null
+}
+
+Check "Get-FrameGateEffectiveOverflowPct returns null when no cache path is known" {
+    $script:lastCachePath = $null
+    if ((Get-FrameGateEffectiveOverflowPct) -ne $null) { throw "expected null with no cache path" }
+    $script:lastCachePath = Join-Path $env:TEMP "rom_launcher_test_frame_gate_nonexistent.json"
+    if ((Get-FrameGateEffectiveOverflowPct) -ne $null) { throw "expected null when the cache path doesn't actually exist" }
+}
+
+Check "Get-FrameGateEffectiveOverflowPct matches a hand-derived value at zero offset/zoom" {
+    Reset-FrameGateTestState
+    # neededOrtho = (200 / (1 - 2*0.02)) * 1.02 = (200/0.96)*1.02 = 212.5
+    # finalOrtho (zoom=0) = 212.5
+    # effective = (1 - (200*1.02/212.5))/2 = (1 - 0.96)/2 = 0.02 (= base, as expected at zero offset)
+    $result = Get-FrameGateEffectiveOverflowPct
+    if ([Math]::Abs($result - 0.02) -gt 1e-6) { throw "expected 0.02 at zero offset/zoom, got $result" }
+}
+
+Check "Get-FrameGateEffectiveOverflowPct reduces correctly with a nonzero offset" {
+    Reset-FrameGateTestState
+    $script:lastValidOffsetX = 40
+    # worldPerPx = finalOrtho / colWidth = 212.5 / 500 = 0.425
+    # offsetWorld = 40 * 0.425 = 17
+    # expected = 0.02 - 17/212.5 = 0.02 - 0.08 = -0.06 -> clamped to 0
+    $result = Get-FrameGateEffectiveOverflowPct
+    if ([Math]::Abs($result - 0.0) -gt 1e-6) { throw "expected 0 (clamped) with a 40px offset on this synthetic frame, got $result" }
+}
+
+Check "Get-FrameGateEffectiveOverflowPct: small offset reduces proportionally, not clamped" {
+    Reset-FrameGateTestState
+    $script:lastValidOffsetX = 5
+    # offsetWorld = 5 * 0.425 = 2.125; expected = 0.02 - 2.125/212.5 = 0.02 - 0.01 = 0.01
+    $result = Get-FrameGateEffectiveOverflowPct
+    if ([Math]::Abs($result - 0.01) -gt 1e-6) { throw "expected 0.01, got $result" }
+}
+
+Check "Update-FrameGateGlow: no effect when healthy, amber when tight, red at zero" {
+    Reset-FrameGateTestState
+    Update-FrameGateGlow
+    if ($previewButton.Effect -ne $null) { throw "expected no glow at the healthy default (0px offset)" }
+
+    # 5px lands exactly on the half-of-base boundary (0.01); use 6px to be
+    # unambiguously inside the amber zone rather than testing an edge case.
+    $script:lastValidOffsetX = 6
+    Update-FrameGateGlow
+    if ($previewButton.Effect -eq $null) { throw "expected an amber glow when tolerance drops below half the base" }
+    if ($previewButton.Effect.Color.R -ne 239) { throw "expected the amber color (R=239), got R=$($previewButton.Effect.Color.R)" }
+
+    $script:lastValidOffsetX = 40   # clamped to 0 per the earlier test
+    Update-FrameGateGlow
+    if ($previewButton.Effect -eq $null) { throw "expected a red glow at the zero floor" }
+    if ($previewButton.Effect.Color.R -ne 224) { throw "expected the red color (R=224), got R=$($previewButton.Effect.Color.R)" }
+}
+
+Check "Start Recording's frame-gate check only prompts at the zero-tolerance floor, and respects Cancel" {
+    Reset-FrameGateTestState
+    function Test-MayaPortReachable { return $true }
+    function Update-PortStatusIndicator { return $true }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    $script:frameGateConfirmCalls = 0
+    function Show-DarkConfirm {
+        param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+        $script:frameGateConfirmCalls++
+        return $false   # Cancel
+    }
+
+    # Healthy state: no prompt at all, run proceeds.
+    $script:lastValidOffsetX = 0
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $reachedDone = Wait-ForStatus "Done" 10
+    if (-not $reachedDone) { throw "expected the healthy-state run to complete without any prompt, log:`n$($logBox.Text)" }
+    if ($script:frameGateConfirmCalls -ne 0) { throw "expected zero confirm calls in the healthy state, got $($script:frameGateConfirmCalls)" }
+
+    # Zero-tolerance state + Cancel: prompted, and the run must NOT start.
+    $script:lastValidOffsetX = 40
+    $script:currentProcess = $null
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($script:frameGateConfirmCalls -ne 1) { throw "expected exactly 1 confirm call at the zero-tolerance floor, got $($script:frameGateConfirmCalls)" }
+    if ($script:currentProcess -ne $null) { throw "Cancel must abort before Start-Steps ever runs" }
+}
+
+Check "Start Recording's frame-gate check proceeds when the user clicks Continue Anyway" {
+    Reset-FrameGateTestState
+    function Test-MayaPortReachable { return $true }
+    function Update-PortStatusIndicator { return $true }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    function Show-DarkConfirm {
+        param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+        return $true   # Continue Anyway
+    }
+    $script:lastValidOffsetX = 40
+
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $reachedDone = Wait-ForStatus "Done" 10
+    if (-not $reachedDone) { throw "expected the run to proceed after Continue Anyway, log:`n$($logBox.Text)" }
+}
+
+Remove-Item $script:frameGateTestCachePath -ErrorAction SilentlyContinue
+Remove-Item $script:frameGateTestRectPath -ErrorAction SilentlyContinue
+$script:lastCachePath = $null
 
 Write-Output "$passed passed, $($failures.Count) failed"
 foreach ($f in $failures) { Write-Output "FAIL: $f" }

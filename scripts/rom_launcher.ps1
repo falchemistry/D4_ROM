@@ -616,11 +616,23 @@ $script:ToolVersion = "1.0.0"
                  rather than being an optional creative choice. -->
             <TextBlock Text="Frame Offsets" FontWeight="Bold" Margin="0,0,0,4"/>
 
-            <!-- Zoom and Offset share one row (2026-09-02): compact,
-                 left-aligned, no full-panel stretch. Zoom order is label,
-                 typed value, slider: the exact value box comes right
-                 after the label since typing is the precise way to set
-                 this, with the slider last for casual dragging. -->
+            <!-- Zoom, Offset, arrow-nudge pad, and Reset all share one row
+                 (2026-09-08 revision): compact, left-aligned, no full-panel
+                 stretch. Zoom order is label, typed value, slider: the
+                 exact value box comes right after the label since typing
+                 is the precise way to set this, with the slider last for
+                 casual dragging.
+
+                 Live updates are DEFERRED to release, not continuous
+                 (2026-09-08, user feedback after trying continuous live
+                 update: "it feels jumpy"). The compromise is that
+                 box/slider text updates instantly, but the actual Maya
+                 push only fires once the drag/key/slider-thumb is
+                 released, via $script:zoomSliderDragging /
+                 Stop-OffsetBoxDrag / the arrow-pad's KeyUp handler below.
+                 A single click (not a drag) or a typed commit is already
+                 a one-shot action and still applies immediately. Only
+                 genuinely CONTINUOUS interactions get deferred. -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
                 <TextBlock Text="Zoom" VerticalAlignment="Center" Margin="0,0,4,0"/>
                 <!-- Editable, not just the slider: typing an exact value and
@@ -633,16 +645,30 @@ $script:ToolVersion = "1.0.0"
                          ToolTip="Type an exact magnifier value from -50 to 50, then press Enter or click away to apply. 0 is the safe default sized to fit the widest pose."/>
                 <TextBlock Text="%" VerticalAlignment="Center" Margin="0,0,8,0"/>
                 <Slider x:Name="ZoomSlider" Width="60" Minimum="-50" Maximum="50" Value="0"
-                        TickFrequency="10" IsSnapToTickEnabled="False" VerticalAlignment="Center" Margin="0,0,16,0"
-                        ToolTip="Adjusts the camera framing +/-50% around the safe default (0%), which is sized to always fit the animation's widest pose. Positive zooms in, negative zooms out for more headroom. Type an exact value in the box instead of dragging if you prefer."/>
+                        TickFrequency="10" IsSnapToTickEnabled="False" VerticalAlignment="Center" Margin="0,0,10,0"
+                        ToolTip="Adjusts the camera framing +/-50% around the safe default (0%), which is sized to always fit the animation's widest pose. Positive zooms in, negative zooms out for more headroom. Applies once you release the drag; type an exact value instead if you prefer instant apply."/>
+                <!-- Repositioned before X/Y (2026-09-08) and repurposed:
+                     no longer a drag surface (drag moved to the X/Y boxes
+                     themselves). Hovering here activates all 4 arrow
+                     keys to nudge offset, X/Y boxes updating live, without
+                     needing to click into anything first. -->
+                <Border x:Name="ArrowNudgePad" Width="28" Height="28" Background="#FF3A3A3A" BorderBrush="#FF707070" BorderThickness="1"
+                        Margin="0,0,10,0"
+                        ToolTip="Hover here, then use the arrow keys to nudge offset 10px at a time (Shift = 100px) -- X/Y update as you go, applied once you release the key. Type an exact value in the box for finer precision.">
+                    <Path Data="M4,14 L24,14 M14,4 L14,24" Stroke="#FFA0A0A0" StrokeThickness="1"/>
+                </Border>
                 <TextBlock Text="X" FontWeight="Bold" Foreground="Red" VerticalAlignment="Center" Margin="0,0,4,0"
                            ToolTip="Horizontal pixel offset, +/- (positive moves the subject right on screen)."/>
                 <TextBox x:Name="OffsetXBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center" Margin="0,0,10,0"
-                         ToolTip="Type a horizontal pixel offset, then press Enter or click away to apply."/>
+                         ToolTip="Type a horizontal pixel offset (Enter or click away to apply), or scroll the mouse wheel here: 10px per notch, Shift = 100px -- applies once you stop scrolling."/>
                 <TextBlock Text="Y" FontWeight="Bold" Foreground="LimeGreen" VerticalAlignment="Center" Margin="0,0,4,0"
                            ToolTip="Vertical pixel offset, +/- (positive moves the subject up on screen)."/>
-                <TextBox x:Name="OffsetYBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center"
-                         ToolTip="Type a vertical pixel offset, then press Enter or click away to apply."/>
+                <TextBox x:Name="OffsetYBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center" Margin="0,0,10,0"
+                         ToolTip="Type a vertical pixel offset (Enter or click away to apply), or scroll the mouse wheel here: 10px per notch, Shift = 100px -- applies once you stop scrolling."/>
+                <Button x:Name="ResetFrameOffsetsButton" Width="24" Height="24" Padding="0"
+                        ToolTip="Reset Zoom, X, and Y to their safe defaults (0). Applies immediately.">
+                    <TextBlock Text="&#x21BA;" FontSize="14"/>
+                </Button>
             </StackPanel>
 
             <!-- Only Start Recording toggles into Stop Recording, matching
@@ -749,6 +775,8 @@ $zoomSlider = $window.FindName("ZoomSlider")
 $zoomValueBox = $window.FindName("ZoomValueBox")
 $offsetXBox = $window.FindName("OffsetXBox")
 $offsetYBox = $window.FindName("OffsetYBox")
+$arrowNudgePad = $window.FindName("ArrowNudgePad")
+$resetFrameOffsetsButton = $window.FindName("ResetFrameOffsetsButton")
 $previewButton = $window.FindName("PreviewButton")
 $startRecordingButton = $window.FindName("StartRecordingButton")
 $resetButton = $window.FindName("ResetButton")
@@ -1641,6 +1669,153 @@ function Write-CameraOffsetPx([double]$X, [double]$Y) {
     Set-Content -Path $offsetPath -Value "$X,$Y" -Encoding ASCII
 }
 
+# --- Live-apply plumbing (2026-09-08) --------------------------------
+# The goal: touching ANY Frame Offsets control (drag, arrow-key, typed
+# box, zoom slider) updates the live Maya camera immediately, with no
+# Preview click and no panel reopen. Raw input events below only ever
+# update the $script:pending* state -- they never call send_to_maya.ps1
+# directly. $script:liveApplyTimer's tick is the ONLY place a bridge send
+# actually fires, coalescing however many raw events happened since the
+# last tick into at most one send -- without this, a fast drag would
+# queue far more sends than a fresh-process-per-send bridge can keep up
+# with, and they'd back up behind each other rather than reflecting the
+# mouse in real time.
+function Get-CameraNudgeDeltaPath {
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_nudge_delta.txt"
+}
+function Write-CameraNudgeDelta([double]$X, [double]$Y) {
+    # Read by maya_camera_live_nudge.py as a single "dx,dy" line -- this is
+    # a DELTA, not the running total (see that script's own docstring for
+    # why: it lets every input method -- drag, arrow-key, typed commit --
+    # share one Maya-side code path without that script needing to track
+    # any state of its own).
+    $path = Get-CameraNudgeDeltaPath
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    Set-Content -Path $path -Value "$X,$Y" -Encoding ASCII
+}
+
+$script:pendingNudgeDeltaX = 0.0
+$script:pendingNudgeDeltaY = 0.0
+$script:pendingZoomPush = $false
+$script:liveApplyProcess = $null
+
+function Send-CameraLiveScript([string]$ScriptName) {
+    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
+    $target = Join-Path $ScriptDir $ScriptName
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$sendToMaya`" -ScriptPath `"$target`""
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $script:liveApplyProcess = [System.Diagnostics.Process]::Start($psi)
+}
+
+# Pulled out into its own named function (not left as an anonymous
+# Add_Tick scriptblock) specifically so this is directly testable, same
+# reasoning as Invoke-ResetOnClose being factored out of Window.Add_Closing.
+function Invoke-LiveApplyTick {
+    if ($script:liveApplyProcess -ne $null -and -not $script:liveApplyProcess.HasExited) {
+        # A send is still in flight -- never overlap sends (Maya's command
+        # port has no queueing of its own); whatever is pending now will
+        # still be pending, and get picked up, on the next tick.
+        return
+    }
+    if ($script:pendingZoomPush) {
+        $script:pendingZoomPush = $false
+        Send-CameraLiveScript "maya_camera_live_zoom.py"
+        return
+    }
+    if ($script:pendingNudgeDeltaX -ne 0 -or $script:pendingNudgeDeltaY -ne 0) {
+        Write-CameraNudgeDelta -X $script:pendingNudgeDeltaX -Y $script:pendingNudgeDeltaY
+        $script:pendingNudgeDeltaX = 0.0
+        $script:pendingNudgeDeltaY = 0.0
+        Send-CameraLiveScript "maya_camera_live_nudge.py"
+    }
+}
+
+# --- Frame-gate glow (2026-09-08) -------------------------------------
+# Mirrors maya_camera_panels.py's compute_effective_overflow_pct entirely
+# LOCALLY -- no Maya round-trip needed, since everything it depends on is
+# already known here: max_w comes straight from the already-built cache
+# JSON (same file $script:lastCachePath already points at), zoom/offset
+# are the launcher's own live state, and panel width comes from the
+# recording monitor rect already written to disk. EDGE_OVERFLOW_PCT/
+# MARGIN_SAFETY are mirrored constants -- if the Python module constants
+# ever change, these drift out of sync (same accepted risk this project
+# already lives with for AUTO_MARGIN_AXIS/EDGE_OVERFLOW_PCT being
+# duplicated across the Python files themselves).
+$script:frameGateEdgeOverflowPct = 0.02
+$script:frameGateMarginSafety = 1.02
+
+function Get-FrameGateEffectiveOverflowPct {
+    # Returns $null when unknown (no cache yet) rather than a guessed
+    # number -- callers must treat $null as "can't tell," not "safe."
+    if (-not $script:lastCachePath -or -not (Test-Path $script:lastCachePath)) {
+        return $null
+    }
+    try {
+        $cacheJson = Get-Content $script:lastCachePath -Raw | ConvertFrom-Json
+        $maxW = ($cacheJson.x_width | Measure-Object -Maximum).Maximum
+    } catch {
+        return $null
+    }
+    if (-not $maxW) { return $null }
+
+    $rectPath = Get-RecordingMonitorRectPath
+    if (-not (Test-Path $rectPath)) { return $null }
+    $parts = (Get-Content $rectPath -Raw).Trim() -split ','
+    if ($parts.Count -ne 4) { return $null }
+    $monWidth = [double]$parts[2] - [double]$parts[0]
+    $colWidth = [Math]::Floor($monWidth / 2.0)
+    if ($colWidth -le 0) { return $null }
+
+    $zoomPct = $zoomSlider.Value
+    $offsetXPx = $script:lastValidOffsetX
+
+    $neededOrtho = ($maxW / (1.0 - 2.0 * $script:frameGateEdgeOverflowPct)) * $script:frameGateMarginSafety
+    $finalOrtho = $neededOrtho * (1.0 - $zoomPct / 100.0)
+    if ($finalOrtho -le 0) { return 0.0 }
+    $effective = (1.0 - ($maxW * $script:frameGateMarginSafety / $finalOrtho)) / 2.0
+    $worldPerPx = $finalOrtho / $colWidth
+    $offsetWorld = [Math]::Abs($offsetXPx) * $worldPerPx
+    $effective -= $offsetWorld / $finalOrtho
+    return [Math]::Max(0.0, $effective)
+}
+
+function New-FrameGateGlow([byte]$R, [byte]$G, [byte]$B) {
+    $glow = New-Object System.Windows.Media.Effects.DropShadowEffect
+    $glow.Color = [System.Windows.Media.Color]::FromRgb($R, $G, $B)
+    $glow.ShadowDepth = 0
+    $glow.BlurRadius = 16
+    $glow.Opacity = 0.9
+    return $glow
+}
+
+function Update-FrameGateGlow {
+    # Cheap enough to call unconditionally every tick (see
+    # Invoke-LiveApplyTick) -- pure local math + two small file reads, no
+    # Maya round-trip, so the glow tracks zoom/offset live as they change.
+    $effective = Get-FrameGateEffectiveOverflowPct
+    if ($effective -eq $null) {
+        $previewButton.Effect = $null
+    } elseif ($effective -le 1e-6) {
+        $previewButton.Effect = New-FrameGateGlow -R 224 -G 120 -B 110   # same red as Stop Recording
+    } elseif ($effective -lt ($script:frameGateEdgeOverflowPct * 0.5)) {
+        $previewButton.Effect = New-FrameGateGlow -R 239 -G 192 -B 84    # same amber as the cache warning dot
+    } else {
+        $previewButton.Effect = $null
+    }
+}
+
+$script:liveApplyTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:liveApplyTimer.Interval = [TimeSpan]::FromMilliseconds(60)
+$script:liveApplyTimer.Add_Tick({
+    Update-FrameGateGlow
+    Invoke-LiveApplyTick
+})
+$script:liveApplyTimer.Start()
+
 function Get-RecenterStartFramePath {
     # Own function, same reasoning as Get-CameraZoomPctPath.
     Join-Path $ScriptDir "..\d4_anim_sample\_camera_recenter_start_frame.txt"
@@ -2471,6 +2646,23 @@ $startEndRadio.Add_Checked({
 $timeSliderRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
 $allFramesRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
 
+# Deferred-to-release (2026-09-08, user feedback: continuous live update
+# "feels jumpy"): the slider's OWN value/text update instantly and always
+# (that's free -- no Maya round trip), but the Maya push is suppressed
+# while $script:zoomSliderDragging is true, and fires exactly once when
+# the thumb drag completes. A single click on the track (not a drag)
+# never sets that flag at all, so it still applies immediately -- only a
+# genuine held-drag gets deferred.
+$script:zoomSliderDragging = $false
+$zoomSlider.AddHandler(
+    [System.Windows.Controls.Primitives.Thumb]::DragStartedEvent,
+    [System.Windows.RoutedEventHandler]{ $script:zoomSliderDragging = $true })
+$zoomSlider.AddHandler(
+    [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent,
+    [System.Windows.RoutedEventHandler]{
+        $script:zoomSliderDragging = $false
+        $script:pendingZoomPush = $true
+    })
 $zoomSlider.Add_ValueChanged({
     # Snap to whole percent -- the underlying framing math has no use for
     # fractional percent, and a whole number is simpler to type back in.
@@ -2481,6 +2673,156 @@ $zoomSlider.Add_ValueChanged({
     $pct = [Math]::Round($zoomSlider.Value)
     $zoomValueBox.Text = "{0:+0;-0;0}" -f $pct
     Write-CameraZoomPct -Value $pct
+    if (-not $script:zoomSliderDragging) {
+        $script:pendingZoomPush = $true
+    }
+})
+
+# --- Offset wheel-nudge on the X/Y boxes (2026-09-08: replaces drag) --
+# Middle-click-drag didn't work reliably in real use -- replaced with
+# mouse-wheel scroll directly on each box: wheel up/down on OffsetXBox
+# nudges X only, same on OffsetYBox for Y. 10px per notch, Shift = 100px, same
+# convention as the arrow-key nudge. Deferred-to-settle, same "avoid
+# jumpy" principle as the drag had: box text updates on every notch, but
+# the Maya push only fires once scrolling actually stops (400ms of no
+# further wheel input), using the whole session's total -- a fast spin
+# doesn't flood Maya with one send per notch.
+#
+# Core logic lives in named functions taking an EXPLICIT direction/shift
+# flag, not hidden behind e.Delta -- same reasoning as the other nudge
+# paths above.
+$script:wheelNudgeAxis = $null   # $null, "X", or "Y"
+$script:wheelNudgeStartValue = 0
+$script:wheelNudgeCurrentValue = 0.0
+
+$script:wheelSettleTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:wheelSettleTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:wheelSettleTimer.Add_Tick({ Stop-OffsetWheelNudge })
+
+function Update-OffsetWheelNudge([string]$Axis, [int]$Delta, [bool]$ShiftHeld) {
+    if ($script:wheelNudgeAxis -ne $null -and $script:wheelNudgeAxis -ne $Axis) {
+        # Switching axis mid-stream (rare, but possible if the mouse moves
+        # to the other box while still settling) -- flush the prior one
+        # first rather than mixing sessions.
+        Stop-OffsetWheelNudge
+    }
+    if ($script:wheelNudgeAxis -eq $null) {
+        $script:wheelNudgeAxis = $Axis
+        $script:wheelNudgeStartValue = if ($Axis -eq "X") { $script:lastValidOffsetX } else { $script:lastValidOffsetY }
+        $script:wheelNudgeCurrentValue = $script:wheelNudgeStartValue
+    }
+    # 10px default / 100px with Shift (2026-09-08): coarse-only via wheel/
+    # arrow-key -- exact values go through the typed box directly (edit
+    # the last digit, e.g. 95/96/103/3), which these nudge controls were
+    # never meant to replace.
+    $step = if ($ShiftHeld) { 100 } else { 10 }
+    $direction = if ($Delta -gt 0) { 1 } else { -1 }
+    $script:wheelNudgeCurrentValue += $direction * $step
+    $box = if ($Axis -eq "X") { $offsetXBox } else { $offsetYBox }
+    $box.Text = "$([Math]::Round($script:wheelNudgeCurrentValue))"
+    $script:wheelSettleTimer.Stop()
+    $script:wheelSettleTimer.Start()
+}
+function Stop-OffsetWheelNudge {
+    $script:wheelSettleTimer.Stop()
+    if ($script:wheelNudgeAxis -eq $null) { return }
+    $axis = $script:wheelNudgeAxis
+    $finalValue = [Math]::Round($script:wheelNudgeCurrentValue)
+    $delta = $finalValue - $script:wheelNudgeStartValue
+    if ($axis -eq "X") { $script:lastValidOffsetX = $finalValue } else { $script:lastValidOffsetY = $finalValue }
+    $box = if ($axis -eq "X") { $offsetXBox } else { $offsetYBox }
+    $box.Text = "$finalValue"
+    if ($delta -ne 0) {
+        if ($axis -eq "X") { $script:pendingNudgeDeltaX += $delta } else { $script:pendingNudgeDeltaY += $delta }
+        Write-CameraOffsetPx -X $script:lastValidOffsetX -Y $script:lastValidOffsetY
+    }
+    $script:wheelNudgeAxis = $null
+}
+
+$offsetXBox.Add_MouseWheel({
+    param($eventSender, $e)
+    $shiftHeld = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    Update-OffsetWheelNudge -Axis "X" -Delta $e.Delta -ShiftHeld $shiftHeld
+    $e.Handled = $true
+})
+$offsetYBox.Add_MouseWheel({
+    param($eventSender, $e)
+    $shiftHeld = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    Update-OffsetWheelNudge -Axis "Y" -Delta $e.Delta -ShiftHeld $shiftHeld
+    $e.Handled = $true
+})
+
+# --- Hover-gated arrow-key nudge on the repositioned pad --------------
+# No click/focus needed -- as long as the mouse is hovering ArrowNudgePad,
+# arrow keys nudge offset, regardless of which control technically has
+# keyboard focus. Bound at the WINDOW level (Preview, tunnels from the
+# window down to whatever has focus) rather than on the pad itself, since
+# the pad never actually receives focus in this design. Deferred-to-
+# release, same as the drag above: held/auto-repeat keys update the boxes
+# live but only push to Maya once the key is released.
+$script:arrowNudgeActive = $false
+$script:arrowNudgeStartX = 0
+$script:arrowNudgeStartY = 0
+
+function Start-ArrowNudge {
+    $script:arrowNudgeActive = $true
+    $script:arrowNudgeStartX = $script:lastValidOffsetX
+    $script:arrowNudgeStartY = $script:lastValidOffsetY
+}
+function Update-ArrowNudge([System.Windows.Input.Key]$Key, [bool]$ShiftHeld) {
+    # Same 10px/100px convention as the wheel nudge above.
+    $step = if ($ShiftHeld) { 100 } else { 10 }
+    $dx = 0; $dy = 0
+    if ($Key -eq [System.Windows.Input.Key]::Left) { $dx = -$step }
+    elseif ($Key -eq [System.Windows.Input.Key]::Right) { $dx = $step }
+    elseif ($Key -eq [System.Windows.Input.Key]::Up) { $dy = $step }
+    elseif ($Key -eq [System.Windows.Input.Key]::Down) { $dy = -$step }
+    else { return $false }
+
+    $script:lastValidOffsetX += $dx
+    $script:lastValidOffsetY += $dy
+    $offsetXBox.Text = "$($script:lastValidOffsetX)"
+    $offsetYBox.Text = "$($script:lastValidOffsetY)"
+    return $true
+}
+function Stop-ArrowNudge {
+    if (-not $script:arrowNudgeActive) { return }
+    $script:arrowNudgeActive = $false
+    $deltaX = $script:lastValidOffsetX - $script:arrowNudgeStartX
+    $deltaY = $script:lastValidOffsetY - $script:arrowNudgeStartY
+    if ($deltaX -ne 0 -or $deltaY -ne 0) {
+        $script:pendingNudgeDeltaX += $deltaX
+        $script:pendingNudgeDeltaY += $deltaY
+        Write-CameraOffsetPx -X $script:lastValidOffsetX -Y $script:lastValidOffsetY
+    }
+}
+function Test-ArrowNudgeKey([System.Windows.Input.Key]$Key) {
+    return $Key -eq [System.Windows.Input.Key]::Left -or $Key -eq [System.Windows.Input.Key]::Right -or
+           $Key -eq [System.Windows.Input.Key]::Up -or $Key -eq [System.Windows.Input.Key]::Down
+}
+
+$window.Add_PreviewKeyDown({
+    param($eventSender, $e)
+    if (-not $arrowNudgePad.IsMouseOver) { return }
+    if (-not (Test-ArrowNudgeKey $e.Key)) { return }
+    if (-not $script:arrowNudgeActive) { Start-ArrowNudge }
+    $shiftHeld = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    Update-ArrowNudge -Key $e.Key -ShiftHeld $shiftHeld | Out-Null
+    $e.Handled = $true
+})
+$window.Add_PreviewKeyUp({
+    param($eventSender, $e)
+    if (Test-ArrowNudgeKey $e.Key) { Stop-ArrowNudge }
+})
+
+# --- Reset button ------------------------------------------------------
+# A discrete, one-shot action (not something "in progress"), so it
+# applies immediately -- same reasoning as a typed box commit.
+$resetFrameOffsetsButton.Add_Click({
+    $zoomSlider.Value = 0
+    $offsetXBox.Text = "0"
+    $offsetYBox.Text = "0"
+    Commit-OffsetBoxes
 })
 
 function Commit-ZoomValueBox {
@@ -2523,6 +2865,9 @@ function Commit-OffsetBoxes {
     # the other's not-yet-committed value with a stale one. Invalid/empty
     # input in either box reverts JUST that box to its own last valid
     # value, same discipline as the magnifier's Commit-ZoomValueBox.
+    $priorX = $script:lastValidOffsetX
+    $priorY = $script:lastValidOffsetY
+
     $x = 0.0
     if ([double]::TryParse($offsetXBox.Text.Trim(), [ref]$x)) {
         $script:lastValidOffsetX = [Math]::Round($x)
@@ -2536,6 +2881,15 @@ function Commit-OffsetBoxes {
     $offsetYBox.Text = "$($script:lastValidOffsetY)"
 
     Write-CameraOffsetPx -X $script:lastValidOffsetX -Y $script:lastValidOffsetY
+
+    # Live-push (2026-09-08): apply the CHANGE immediately -- same
+    # throttled path the drag pad and arrow keys use -- instead of only
+    # taking effect on the next Preview click. Invalid input reverted the
+    # box above without changing lastValidOffset*, so priorX/Y correctly
+    # nets to a zero delta in that case -- no live push happens, matching
+    # "invalid input never pushes garbage to the live camera."
+    $script:pendingNudgeDeltaX += ($script:lastValidOffsetX - $priorX)
+    $script:pendingNudgeDeltaY += ($script:lastValidOffsetY - $priorY)
 }
 $offsetXBox.Add_LostFocus({ Commit-OffsetBoxes })
 $offsetYBox.Add_LostFocus({ Commit-OffsetBoxes })
@@ -2687,6 +3041,18 @@ $startRecordingButton.Add_Click({
         Write-Log "Start Recording blocked: $($requirementFailures.Count) requirement(s) not met."
         Show-DarkNotice -Title "Cannot Start Recording" -Message ("Fix the following before starting a recording:`n`n" + ($requirementFailures -join "`n`n"))
         return
+    }
+    # Frame-gate warning (2026-09-08): a SOFT gate, unlike the hard-block
+    # checks above -- amber alone never blocks (matches Preview's glow-only
+    # treatment), only the zero-tolerance floor does, and only with an
+    # explicit override, not a silent refusal.
+    $frameGateEffective = Get-FrameGateEffectiveOverflowPct
+    if ($frameGateEffective -ne $null -and $frameGateEffective -le 1e-6) {
+        $proceedAnyway = Show-DarkConfirm -Title "Framing Warning" -ConfirmLabel "Continue Anyway" -Message "Your current Zoom/Offset leaves zero safe tracking margin -- the widest pose may clip, or the camera may move erratically to compensate.`n`nContinue anyway?"
+        if (-not $proceedAnyway) {
+            Write-Log "Start Recording cancelled: framing warning not confirmed."
+            return
+        }
     }
     $result = Get-CaptureClickResult
     if ($result.ErrorMessage -ne $null) {
@@ -2979,6 +3345,8 @@ $offsetXBox.Text = "0"
 $offsetYBox.Text = "0"
 $script:lastValidOffsetX = 0
 $script:lastValidOffsetY = 0
+$script:dragOffsetX = 0
+$script:dragOffsetY = 0
 Write-CameraOffsetPx -X 0 -Y 0
 # Recenter at start frame is mandatory now (no checkbox) -- Preview/Start
 # Recording always resolve and write a fresh value at click time, but
