@@ -116,13 +116,23 @@ def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, wo
     manual pixel offset, which this override used to silently discard --
     see maya_key_from_cache.py's copy for the full writeup.
 
-    BUG FIXED 2026-09-08 (second fix, same day): also forces linear
-    tangents on the inserted keyframe, since the default 'auto' tangent
-    could swing past either neighboring key's value once the offset+zoom
-    margin hit zero -- see maya_key_from_cache.py's copy for the full
-    writeup and the real-scene evidence (9 overshoot clusters, up to 26
-    units, eliminated by this alone)."""
+    BUG FIXED 2026-09-08 (second fix, same day): pins the curve back to its
+    own pre-override value exactly 1 frame before and 1 frame after
+    recenter_frame, with linear tangents through all three points, turning
+    the correction into a single-frame notch instead of a wide bulge or a
+    slow "draggy" drift -- see maya_key_from_cache.py's copy for the full
+    writeup and the real-scene evidence (a first attempt using linear
+    tangents on just the inserted keyframe only partially worked -- 26
+    units of overshoot down to 20.6, not 0 -- because it left the curve
+    still gradually blending toward a different value across the whole
+    gap to its real neighbors; the notch anchors fix that completely,
+    confirmed at 0.00000 overshoot across the entire animation)."""
     attr = cam_transform + '.translate' + axis.upper()
+
+    anchor_before, anchor_after = recenter_frame - 1, recenter_frame + 1
+    value_before = cmds.getAttr(attr, time=anchor_before)
+    value_after = cmds.getAttr(attr, time=anchor_after)
+
     cmds.currentTime(recenter_frame)
     cmds.select(clear=True)
     bbox = get_target_bbox()
@@ -132,8 +142,12 @@ def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, wo
         true_center = (bbox[2] + bbox[5]) / 2.0
     if world_per_px is not None:
         true_center -= offset_x_px * world_per_px
+
+    cmds.setKeyframe(attr, time=anchor_before, value=value_before)
     cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
-    cmds.keyTangent(attr, time=(recenter_frame, recenter_frame), inTangentType='linear', outTangentType='linear')
+    cmds.setKeyframe(attr, time=anchor_after, value=value_after)
+    for t in (anchor_before, recenter_frame, anchor_after):
+        cmds.keyTangent(attr, time=(t, t), inTangentType='linear', outTangentType='linear')
 
 
 CACHE_PATH = cache_path_for(find_animation_reference())

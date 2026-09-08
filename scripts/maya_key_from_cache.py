@@ -182,18 +182,38 @@ def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, wo
     2% overflow_pct cushion absorbs it. Reported live as "frame gate still
     not pushing the character" at a specific offset+zoom combo that had
     driven effective_overflow_pct to exactly 0 (no cushion left to hide the
-    swing). Confirmed on a real scene with recenter active at frame 2000:
-    edge_guard alone (no override) held 0.00000 overshoot at every single
-    frame of the whole animation even at 0 cushion, but adding the override
-    back produced up to 26 units of overshoot across 9 separate clusters
-    from frame 1934 to 2688 -- proving the override's own inserted keyframe,
-    not the tracking algorithm, was the cause. Fix: force linear tangents on
-    just this one keyframe. key_edge_guard's own model already assumes the
-    camera holds still between reactive corrections (a step function, not a
-    curve) -- linear is the closest standard tangent type that can't
-    overshoot past either endpoint, without touching the smooth easing on
-    the rest of the curve."""
+    swing), then again as "draggy animation at start of capture frame" once
+    a first attempt (linear tangents on JUST this keyframe, still in this
+    file's history) only partially fixed it. Confirmed on a real scene with
+    recenter active at frame 2000: edge_guard alone (no override) held
+    0.00000 overshoot at every single frame of the whole animation even at
+    0 cushion; adding the override back with 'auto' tangents produced up to
+    26 units of overshoot across 9 clusters from frame 1934 to 2688; the
+    linear-tangent-only attempt only reduced that to 20.6 units across 6
+    clusters, because it straightens the two segments touching this key but
+    the real neighboring keys it connects to (here: 1837 and 3240, both
+    holding the SAME value -- a long calm gap with nothing to correct) are
+    still smoothly, gradually blended toward a DIFFERENT value across that
+    entire gap, which is itself the "draggy" symptom even where it no
+    longer overshoots.
+
+    Actual fix: pin the curve back to its own pre-override value exactly 1
+    frame before and 1 frame after recenter_frame, with linear tangents
+    through all three points. This turns the correction into a single-
+    frame notch instead of a wide bulge or a slow drift -- everywhere
+    else, the curve is untouched, which is what the design paragraph above
+    already promised but 'auto' tangents were quietly breaking. Confirmed:
+    0.00000 overshoot across the ENTIRE animation on the same real scene
+    that showed 26 units of clipping before this fix."""
     attr = cam_transform + '.translate' + axis.upper()
+
+    # Sampled BEFORE inserting anything below, so these anchors pin the
+    # curve to exactly what key_edge_guard's own curve already was at
+    # these two frames -- see the "Actual fix" docstring paragraph above.
+    anchor_before, anchor_after = recenter_frame - 1, recenter_frame + 1
+    value_before = cmds.getAttr(attr, time=anchor_before)
+    value_after = cmds.getAttr(attr, time=anchor_after)
+
     cmds.currentTime(recenter_frame)
     cmds.select(clear=True)
     bbox = get_target_bbox()
@@ -203,8 +223,12 @@ def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, wo
         true_center = (bbox[2] + bbox[5]) / 2.0
     if world_per_px is not None:
         true_center -= offset_x_px * world_per_px
+
+    cmds.setKeyframe(attr, time=anchor_before, value=value_before)
     cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
-    cmds.keyTangent(attr, time=(recenter_frame, recenter_frame), inTangentType='linear', outTangentType='linear')
+    cmds.setKeyframe(attr, time=anchor_after, value=value_after)
+    for t in (anchor_before, recenter_frame, anchor_after):
+        cmds.keyTangent(attr, time=(t, t), inTangentType='linear', outTangentType='linear')
 
 
 CACHE_PATH = cache_path_for(find_animation_reference())
