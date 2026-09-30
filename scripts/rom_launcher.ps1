@@ -583,7 +583,9 @@ $script:ToolVersion = "1.0.0"
             <TextBlock Text="Axis" FontWeight="Bold" Margin="0,0,0,4"/>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
                 <RadioButton x:Name="FrontBackRadio" Content="Front / Back" IsChecked="True" Margin="0,0,16,0" GroupName="Axis"/>
-                <RadioButton x:Name="LeftRightRadio" Content="Left / Right" GroupName="Axis"/>
+                <RadioButton x:Name="LeftRightRadio" Content="Left / Right" Margin="0,0,16,0" GroupName="Axis"/>
+                <RadioButton x:Name="AllAxisRadio" Content="All" GroupName="Axis"
+                             ToolTip="Start Recording runs Front/Back, then Left/Right, back to back -- two separate video outputs from one click. Preview with All shows Front/Back only."/>
             </StackPanel>
 
             <TextBlock Text="Time Range" FontWeight="Bold" Margin="0,0,0,4"/>
@@ -670,6 +672,46 @@ $script:ToolVersion = "1.0.0"
                     <TextBlock Text="&#x21BA;" FontSize="14"/>
                 </Button>
             </StackPanel>
+
+            <!-- Frame gate (2026-09-28): its own row directly under Zoom/
+                 Offset, per the project's own three-piece breakdown:
+                 frame-WIDTH sizing above always stays; this checkbox only
+                 turns off the automatic drift TRACKING/correction, leaving
+                 the camera fixed at whatever framing was already set.
+                 Default checked; reset to checked every launch, same
+                 "never silently restore a forgotten value" rule as
+                 Offset/Recenter (see the startup reset block near the end
+                 of this file). Text ON the checkbox, not a separate
+                 TextBlock, established alignment convention. The Reset
+                 (arrow) button above is deliberately scoped to Zoom/X/Y
+                 only and does not touch this row. -->
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                <CheckBox x:Name="FrameGateCheckBox" Content="Frame gate" IsChecked="True" VerticalAlignment="Center" Margin="0,0,12,0"
+                          ToolTip="Checked: the camera automatically tracks the subject and nudges back small drift. Unchecked: the camera stays fixed for the whole take at the current framing -- watch the Preview glow/tooltip for clipping."/>
+                <!-- Tolerance box (2026-09-29, Part 3): manual override for
+                     the guard's own drift slack. Blank/"Auto" (the default,
+                     reset every launch like every other Frame Offsets
+                     control) keeps today's zoom-derived formula; a typed
+                     0.0-20.0 number fixes the slack at that value regardless
+                     of zoom/offset. With the gate OFF, the SAME number is
+                     reused as the clipping-warning threshold instead of the
+                     hardcoded 2% default (Q4: reuse, recommended). -->
+                <TextBlock Text="Tolerance" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                <TextBox x:Name="ToleranceValueBox" Width="44" Height="24" VerticalContentAlignment="Center" TextAlignment="Right" Margin="0,0,2,0" Text="Auto"
+                         ToolTip="Camera reacts when the character passes the frame edge by more than this. Auto = today's formula (shrinks as you zoom in). Type 0.0-20.0 to fix it regardless of zoom/offset. With Frame gate OFF, this same number is the clipping-warning threshold instead of the default 2%."/>
+                <TextBlock Text="%" VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- Tolerance readout (2026-09-29, Part 3 step 3, Q6: recommended
+                 and included). Read-only: reflects whichever tolerance is
+                 actually in effect (Auto or manual), so a deliberate manual
+                 value is never a silent surprise. Updated on the SAME
+                 60ms live-apply tick as the glow (Update-ToleranceReadout,
+                 called alongside Update-FrameGateGlow): ON-mode only, per
+                 its own function's gating; text is cleared while the gate
+                 is OFF or nothing is known yet. -->
+            <TextBlock x:Name="ToleranceReadoutText" Text="" FontSize="11" Foreground="Gray" Margin="0,0,0,10" TextWrapping="Wrap"
+                       ToolTip="What the automatic guard is predicted to do at the current Zoom/Offset/Tolerance, over the whole cached take -- keys written, percent of frames still over tolerance, and the worst single frame's overflow as a percent of the frame width."/>
 
             <!-- Only Start Recording toggles into Stop Recording, matching
                  that this is the one action that mirrors OBS's own
@@ -765,6 +807,7 @@ $monitorStatusLabel = $window.FindName("MonitorStatusLabel")
 $monitorComboBox = $window.FindName("MonitorComboBox")
 $monitorRefreshButton = $window.FindName("MonitorRefreshButton")
 $frontBackRadio = $window.FindName("FrontBackRadio")
+$allAxisRadio = $window.FindName("AllAxisRadio")
 $timeSliderRadio = $window.FindName("TimeSliderRadio")
 $allFramesRadio = $window.FindName("AllFramesRadio")
 $startEndRadio = $window.FindName("StartEndRadio")
@@ -777,6 +820,9 @@ $offsetXBox = $window.FindName("OffsetXBox")
 $offsetYBox = $window.FindName("OffsetYBox")
 $arrowNudgePad = $window.FindName("ArrowNudgePad")
 $resetFrameOffsetsButton = $window.FindName("ResetFrameOffsetsButton")
+$frameGateCheckBox = $window.FindName("FrameGateCheckBox")
+$toleranceValueBox = $window.FindName("ToleranceValueBox")
+$toleranceReadoutText = $window.FindName("ToleranceReadoutText")
 $previewButton = $window.FindName("PreviewButton")
 $startRecordingButton = $window.FindName("StartRecordingButton")
 $resetButton = $window.FindName("ResetButton")
@@ -1181,7 +1227,7 @@ function Confirm-AndBuildCache {
         $logBox.Clear()
         Write-Log "Building cache for the first time..."
     }
-    $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
     # Cache's step list is the same open-panels-and-key-cameras sequence
     # Preview uses -- appending the clean-reset step here mirrors what
     # Start Recording already does for itself (see its own handler:
@@ -1189,7 +1235,7 @@ function Confirm-AndBuildCache {
     # previously had no equivalent, so a cache build left Maya sitting in
     # "preview" state (floating tracked-camera panels, keyed cameras)
     # afterward, with nothing to clear it.
-    $steps = @(Get-CaptureSteps -Axis $axis -Recording $false -ScriptDir $ScriptDir) + (Get-CleanResetStep -ScriptDir $ScriptDir)
+    $steps = @(Get-CaptureStepsForAxis -Axis $axis -Recording $false -ScriptDir $ScriptDir) + (Get-CleanResetStep -ScriptDir $ScriptDir)
     $script:pendingCacheRefresh = $true
     Start-Steps $steps $false $cacheActionButton "Stop Rebuilding"
 }
@@ -1669,6 +1715,65 @@ function Write-CameraOffsetPx([double]$X, [double]$Y) {
     Set-Content -Path $offsetPath -Value "$X,$Y" -Encoding ASCII
 }
 
+function Get-FrameGatePath {
+    # Own function, same reasoning as Get-CameraZoomPctPath -- lets tests
+    # override just the path without touching real project state.
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_frame_gate.txt"
+}
+
+function Write-FrameGateEnabled([bool]$Enabled) {
+    # Read by get_frame_gate_enabled() in maya_key_from_cache.py/_LR.py --
+    # "1" (checked/ON) or "0" (unchecked/OFF). Same plain-ASCII, no-BOM
+    # reasoning as Write-CameraZoomPct.
+    $gatePath = Get-FrameGatePath
+    $gateDir = Split-Path $gatePath -Parent
+    if (-not (Test-Path $gateDir)) {
+        New-Item -ItemType Directory -Path $gateDir | Out-Null
+    }
+    Set-Content -Path $gatePath -Value $(if ($Enabled) { "1" } else { "0" }) -Encoding ASCII
+}
+
+function Get-CameraTolerancePctPath {
+    # Own function, same reasoning as Get-FrameGatePath -- lets tests
+    # override just the path without touching real project state.
+    Join-Path $ScriptDir "..\d4_anim_sample\_camera_tolerance_pct.txt"
+}
+
+function Write-CameraTolerancePct {
+    # Read by get_manual_tolerance_pct() in maya_camera_panels.py/_LR.py --
+    # a plain number in percent, or an EMPTY file for Auto (today's zoom-
+    # derived formula, unchanged). $null here means Auto; anything else is
+    # written as a plain number, same plain-ASCII, no-BOM reasoning as
+    # every other state file in this project. Not "Auto" as literal text --
+    # empty is simpler for the Python side to treat as falsy with no string
+    # comparison needed, same convention as _camera_recenter_start_frame.txt.
+    param([Nullable[double]]$Value)
+    $tolPath = Get-CameraTolerancePctPath
+    $tolDir = Split-Path $tolPath -Parent
+    if (-not (Test-Path $tolDir)) {
+        New-Item -ItemType Directory -Path $tolDir | Out-Null
+    }
+    Set-Content -Path $tolPath -Value $(if ($null -eq $Value) { "" } else { [string]$Value }) -Encoding ASCII
+}
+
+function Read-CameraTolerancePct {
+    # Mirror of get_manual_tolerance_pct() -- same "unknown/malformed
+    # defaults to Auto ($null), never a guessed number" convention. Used by
+    # Get-FrameGateEffectiveOverflowPct (the launcher's own independent
+    # glow/prompt mirror) and by the Tolerance box's own startup restore.
+    $tolPath = Get-CameraTolerancePctPath
+    if (-not (Test-Path $tolPath)) { return $null }
+    $content = Get-Content $tolPath -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $content) { return $null }
+    $content = $content.Trim()
+    if ($content -eq '') { return $null }
+    $value = 0.0
+    if ([double]::TryParse($content, [ref]$value)) {
+        return $value
+    }
+    return $null
+}
+
 # --- Live-apply plumbing (2026-09-08) --------------------------------
 # The goal: touching ANY Frame Offsets control (drag, arrow-key, typed
 # box, zoom slider) updates the live Maya camera immediately, with no
@@ -1749,6 +1854,18 @@ $script:frameGateEdgeOverflowPct = 0.02
 $script:frameGateMarginSafety = 1.02
 
 function Get-FrameGateEffectiveOverflowPct {
+    # Manual tolerance override (2026-09-29): a typed value in the
+    # Tolerance box bypasses everything below, cache/rect lookups
+    # included -- with a manual value the answer doesn't depend on any of
+    # that. Mirrors compute_effective_overflow_pct's own bypass on the
+    # Python side exactly: the override is an absolute number, so it stops
+    # being offset-aware too once set, not a second, different rule from
+    # the one the keyer itself now uses.
+    $manualPct = Read-CameraTolerancePct
+    if ($null -ne $manualPct) {
+        return $manualPct / 100.0
+    }
+
     # Returns $null when unknown (no cache yet) rather than a guessed
     # number -- callers must treat $null as "can't tell," not "safe."
     if (-not $script:lastCachePath -or -not (Test-Path $script:lastCachePath)) {
@@ -1792,26 +1909,451 @@ function New-FrameGateGlow([byte]$R, [byte]$G, [byte]$B) {
     return $glow
 }
 
+# --- Frame-gate OFF clipping estimate (2026-09-28) --------------------
+# When the checkbox is unchecked, edge_guard never runs at all -- there is
+# no "effective overflow tolerance" to report the way Get-
+# FrameGateEffectiveOverflowPct does for the ON path. Instead this answers
+# a different question entirely: with the camera held perfectly still at
+# its current framing, how much of the ALREADY-CACHED animation would
+# clip? P = percent of (in-range) frames whose bbox exceeds the fixed
+# frame on either edge; W = the worst single overflow, as a percent of
+# the frame width. Deliberately its OWN function, not a branch bolted onto
+# Get-FrameGateEffectiveOverflowPct -- that function's own hermetic tests
+# hand-derive exact ON-path numbers and must stay byte-identical (Q-ON).
+$script:cachedFrameArrays = $null   # memoized by path+mtime, see Get-CachedFrameArrays
+
+function Get-CachedFrameArrays {
+    # Parses the cache JSON's frames/x_center/x_width/z_center/z_width
+    # arrays once and remembers them keyed on (path, LastWriteTimeUtc) --
+    # Get-FrameGateEffectiveOverflowPct re-parses the whole cache on every
+    # 60ms tick already (accepted, existing cost); this avoids ADDING a
+    # second full re-parse of the same file for the new estimator on top
+    # of that, per the tolerance-box proposal's own "cache the parsed
+    # arrays by path + mtime first" guidance (applies equally here).
+    #
+    # IMPORTANT (found via live prototyping against the real barM cache
+    # before writing this): Windows PowerShell 5.1's ConvertFrom-Json
+    # deserializes JSON numbers as [System.Decimal], not [double].
+    # [Array]::IndexOf(a Decimal array, [double]3079) silently returns -1
+    # even when 3079.0 IS present, because boxed Decimal.Equals(boxed
+    # Double) is false across the mismatched types -- confirmed live, this
+    # is not a hypothetical. Casting to [double[]] immediately below is
+    # what makes frame-index lookups (and all downstream arithmetic) work
+    # correctly, matching the Python side's plain floats.
+    if (-not $script:lastCachePath -or -not (Test-Path $script:lastCachePath)) { return $null }
+    $mtime = (Get-Item $script:lastCachePath).LastWriteTimeUtc
+    if ($script:cachedFrameArrays -ne $null -and $script:cachedFrameArrays.Path -eq $script:lastCachePath -and $script:cachedFrameArrays.MTime -eq $mtime) {
+        return $script:cachedFrameArrays
+    }
+    try {
+        $cacheJson = Get-Content $script:lastCachePath -Raw | ConvertFrom-Json
+        [double[]]$frames = @($cacheJson.frames)
+        [double[]]$xCenter = @($cacheJson.x_center)
+        [double[]]$xWidth = @($cacheJson.x_width)
+        [double[]]$zCenter = @($cacheJson.z_center)
+        [double[]]$zWidth = @($cacheJson.z_width)
+    } catch {
+        return $null
+    }
+    if ($frames.Count -eq 0) { return $null }
+    $script:cachedFrameArrays = [PSCustomObject]@{
+        Path = $script:lastCachePath; MTime = $mtime
+        Frames = $frames; XCenter = $xCenter; XWidth = $xWidth; ZCenter = $zCenter; ZWidth = $zWidth
+    }
+    return $script:cachedFrameArrays
+}
+
+function Get-NearestFrameIndex([double[]]$Frames, [double]$TargetFrame) {
+    # Nearest match, not an exact-or-fail lookup -- a typed Start/End (or a
+    # resolved Time-Slider/All range) need not land exactly on a cached
+    # sample. Linear scan: cache arrays are a few thousand elements, called
+    # at most twice per estimate (Start and End), nowhere near the 60ms
+    # budget's actual cost driver (the JSON parse, already memoized above).
+    $bestIdx = 0
+    $bestDiff = [double]::MaxValue
+    for ($i = 0; $i -lt $Frames.Count; $i++) {
+        $diff = [Math]::Abs($Frames[$i] - $TargetFrame)
+        if ($diff -lt $bestDiff) { $bestDiff = $diff; $bestIdx = $i }
+    }
+    return $bestIdx
+}
+
+function Get-ClippingEstimateCore {
+    # Pure math, no file I/O, no WPF -- directly hand-verifiable and unit
+    # testable on synthetic arrays. Mirrors key_edge_guard's own
+    # allowed_left/allowed_right math in maya_key_from_cache.py MINUS any
+    # overflow cushion: gate OFF means the camera never reacts at all, so
+    # the tolerance is exactly zero by construction, not just a small one.
+    # Single-axis only (X slot) -- the caller runs this ONCE PER AXIS PAIR
+    # (Front/Back, then Left/Right) and picks whichever pair is worse; see
+    # Get-ClippingEstimate's own comment for why "All" is resolved that way
+    # rather than folding both axes into one per-frame pass (which would
+    # mix a P from one camera with a W from the other on frames where
+    # neither single camera actually clips that badly).
+    param(
+        [Parameter(Mandatory=$true)][double[]]$CenterX,
+        [Parameter(Mandatory=$true)][double[]]$WidthX,
+        [Parameter(Mandatory=$true)][double]$CamPosX,
+        [Parameter(Mandatory=$true)][double]$HalfOrtho,
+        [Parameter(Mandatory=$true)][int]$StartIndex,
+        [Parameter(Mandatory=$true)][int]$EndIndex
+    )
+    $total = $EndIndex - $StartIndex + 1
+    if ($total -le 0) { return [PSCustomObject]@{ PercentClipped = 0.0; WorstOverflowPct = 0.0 } }
+    $clipped = 0
+    $worst = 0.0
+    for ($i = $StartIndex; $i -le $EndIndex; $i++) {
+        $halfX = $WidthX[$i] / 2.0
+        $ov = [Math]::Max(($CamPosX - $HalfOrtho) - ($CenterX[$i] - $halfX), ($CenterX[$i] + $halfX) - ($CamPosX + $HalfOrtho))
+        if ($ov -gt 0) {
+            $clipped++
+            if ($ov -gt $worst) { $worst = $ov }
+        }
+    }
+    $frameWidth = 2.0 * $HalfOrtho
+    return [PSCustomObject]@{
+        PercentClipped = (100.0 * $clipped / $total)
+        WorstOverflowPct = (100.0 * $worst / $frameWidth)
+    }
+}
+
+function Get-ClippingEstimate {
+    # Returns $null when unknown (no cache yet), same "don't guess"
+    # convention as Get-FrameGateEffectiveOverflowPct. $RangeStart/$RangeEnd
+    # $null (both) means the whole cached take, reference frame = the
+    # cache's own first frame -- used by the live glow tick (Q-rng: no Maya
+    # round trip on every 60ms tick). Non-null means a RESOLVED capture
+    # range (Start Recording's click-time prompt), reference frame = that
+    # range's own Start -- matches where maya_camera_panels.py's
+    # frame_camera() actually parks the camera when Recenter-at-start-frame
+    # is mandatory (it always is now).
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")]
+        [string]$Axis,
+        [Parameter(Mandatory=$true)][double]$ZoomPct,
+        [Parameter(Mandatory=$true)][double]$OffsetXPx,
+        [Nullable[int]]$RangeStart = $null,
+        [Nullable[int]]$RangeEnd = $null
+    )
+    $arrays = Get-CachedFrameArrays
+    if ($arrays -eq $null) { return $null }
+    $maxW = ($arrays.XWidth | Measure-Object -Maximum).Maximum
+    if (-not $maxW) { return $null }
+
+    $rectPath = Get-RecordingMonitorRectPath
+    if (-not (Test-Path $rectPath)) { return $null }
+    $parts = (Get-Content $rectPath -Raw).Trim() -split ','
+    if ($parts.Count -ne 4) { return $null }
+    $monWidth = [double]$parts[2] - [double]$parts[0]
+    $colWidth = [Math]::Floor($monWidth / 2.0)
+    if ($colWidth -le 0) { return $null }
+
+    $neededOrtho = ($maxW / (1.0 - 2.0 * $script:frameGateEdgeOverflowPct)) * $script:frameGateMarginSafety
+    $finalOrtho = $neededOrtho * (1.0 - $ZoomPct / 100.0)
+    if ($finalOrtho -le 0) {
+        # Same "no tolerance value can fix this" floor as Get-FrameGate
+        # EffectiveOverflowPct -- past a large enough zoom-in the frame
+        # itself has collapsed, so every in-range frame clips completely.
+        return [PSCustomObject]@{ PercentClipped = 100.0; WorstOverflowPct = 100.0 }
+    }
+    $halfOrtho = $finalOrtho / 2.0
+    $worldPerPx = $finalOrtho / $colWidth
+    $offsetWorld = $OffsetXPx * $worldPerPx
+
+    $frames = $arrays.Frames
+    $startIdx = 0
+    $endIdx = $frames.Count - 1
+    if ($RangeStart -ne $null) { $startIdx = Get-NearestFrameIndex -Frames $frames -TargetFrame ([double]$RangeStart) }
+    if ($RangeEnd -ne $null) { $endIdx = Get-NearestFrameIndex -Frames $frames -TargetFrame ([double]$RangeEnd) }
+    if ($endIdx -lt $startIdx) { return $null }
+    $refIdx = $startIdx
+
+    $camPosX = $arrays.XCenter[$refIdx] - $offsetWorld
+    $camPosZ = $arrays.ZCenter[$refIdx] - $offsetWorld
+
+    if ($Axis -eq "LeftRight") {
+        # Z-only pass -- reuse the same core with the Z arrays fed into the
+        # X slot (the math is axis-symmetric: center/half-width in,
+        # overflow out) rather than adding a third code path.
+        return Get-ClippingEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
+            -CamPosX $camPosZ -HalfOrtho $halfOrtho -StartIndex $startIdx -EndIndex $endIdx
+    }
+    if ($Axis -eq "FrontBack") {
+        return Get-ClippingEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
+            -CamPosX $camPosX -HalfOrtho $halfOrtho -StartIndex $startIdx -EndIndex $endIdx
+    }
+
+    # "All": run Front/Back and Left/Right independently, then report the
+    # ONE axis pair with the larger worst-overflow (W) together with ITS
+    # OWN P -- NOT a per-frame max/OR across both axes, which would mix a P
+    # from one camera with a W from the other on frames where neither
+    # single camera actually clips that badly (e.g. P=50%/W=20% when no
+    # real camera ever hits both at once). This matches this project's own
+    # rule that worst-overflow alone drives severity (Q-thr: "worst
+    # overflow alone decides") and was verified live to reproduce the
+    # proposal's Front/Back-vs-Left/Right addendum table exactly.
+    $fb = Get-ClippingEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
+        -CamPosX $camPosX -HalfOrtho $halfOrtho -StartIndex $startIdx -EndIndex $endIdx
+    $lr = Get-ClippingEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
+        -CamPosX $camPosZ -HalfOrtho $halfOrtho -StartIndex $startIdx -EndIndex $endIdx
+    if ($lr.WorstOverflowPct -gt $fb.WorstOverflowPct) { return $lr }
+    return $fb
+}
+
+function Get-EdgeGuardCurveEstimateCore {
+    # Pure math, no file I/O, no WPF -- PowerShell port of compute_edge_
+    # guard_curve (maya_key_from_cache.py/_LR.py), the G+B tracking
+    # algorithm, for the ON-mode live readout (2026-09-29, Part 3 step 3).
+    # [G] offset-free curve, offset applied as a uniform post-shift via
+    # OffsetShift (subtracted from every held cam_pos before measuring
+    # overflow -- matches the real keyer's own "value - offset_shift"
+    # write, and the proposal's own evidence table, which IS offset-
+    # dependent for frames-over-tolerance/worst-overflow even though the
+    # tolerance itself is zoom-only). [B] hold instead of correct when a
+    # pose cannot fit within Overflow regardless of camera position.
+    # Single pass: tracks cam_pos exactly like the real loop, storing it at
+    # every frame (piecewise-constant between corrections, same semantics
+    # as key_edge_guard's own loop) so the frames-over-tolerance/worst-
+    # overflow measurement below reads the ACTUAL held position at every
+    # frame, not just at correction points -- equivalent to the persisted
+    # Python tests' separate reconstruction pass, done inline in one pass.
+    param(
+        [Parameter(Mandatory=$true)][double[]]$CenterX,
+        [Parameter(Mandatory=$true)][double[]]$WidthX,
+        [Parameter(Mandatory=$true)][double]$HalfOrtho,
+        [Parameter(Mandatory=$true)][double]$Overflow,
+        [Parameter(Mandatory=$true)][double]$OffsetShift,
+        [Parameter(Mandatory=$true)][int]$StartIndex,
+        [Parameter(Mandatory=$true)][int]$EndIndex
+    )
+    $total = $EndIndex - $StartIndex + 1
+    if ($total -le 0) { return [PSCustomObject]@{ Keys = 0; PercentOverTolerance = 0.0; WorstOverflowPct = 0.0 } }
+
+    $camPos = $CenterX[$StartIndex]
+    $keys = 1
+    $lastKeyedIndex = $StartIndex
+    [double[]]$camPosAt = New-Object 'double[]' $total
+    $camPosAt[0] = $camPos
+
+    for ($i = $StartIndex + 1; $i -le $EndIndex; $i++) {
+        $halfW = $WidthX[$i] / 2.0
+        if ($halfW -le ($HalfOrtho + $Overflow)) {
+            $leftEdge = $CenterX[$i] - $halfW
+            $rightEdge = $CenterX[$i] + $halfW
+            $allowedLeft = $camPos - $HalfOrtho - $Overflow
+            $allowedRight = $camPos + $HalfOrtho + $Overflow
+            if ($leftEdge -lt $allowedLeft) {
+                $camPos = $leftEdge + $HalfOrtho + $Overflow
+                $keys++
+                $lastKeyedIndex = $i
+            } elseif ($rightEdge -gt $allowedRight) {
+                $camPos = $rightEdge - $HalfOrtho - $Overflow
+                $keys++
+                $lastKeyedIndex = $i
+            }
+            # else: within tolerance already, cam_pos unchanged, no new key.
+        }
+        # else: [B] hold -- pose cannot fit even at full tolerance.
+        $camPosAt[$i - $StartIndex] = $camPos
+    }
+    if ($lastKeyedIndex -ne $EndIndex) { $keys++ }
+
+    $overCount = 0
+    $worst = 0.0
+    $frameWidth = 2.0 * $HalfOrtho
+    for ($i = $StartIndex; $i -le $EndIndex; $i++) {
+        $halfW2 = $WidthX[$i] / 2.0
+        $shiftedCamPos = $camPosAt[$i - $StartIndex] - $OffsetShift
+        $ov = [Math]::Max(($shiftedCamPos - $HalfOrtho) - ($CenterX[$i] - $halfW2), ($CenterX[$i] + $halfW2) - ($shiftedCamPos + $HalfOrtho))
+        # "Over tolerance" means the raw overflow (beyond the plain HalfOrtho
+        # edge) EXCEEDS the tolerance cushion itself (Overflow, already in
+        # the SAME raw world units as $ov) -- NOT "any overflow at all".
+        # Bug caught live (2026-09-29): comparing against a hardcoded 0
+        # instead of $Overflow is only correct when Overflow==0 (T=0), which
+        # is exactly why it silently passed there and only surfaced as a
+        # wrong number once a nonzero T (5%) was checked against the real
+        # replica table. "Worst" is still tracked unconditionally (any
+        # positive ov can be the worst, whether or not it individually
+        # exceeds the cushion) -- only the COUNT needed the T-relative check.
+        if ($ov -gt 0 -and $ov -gt $worst) { $worst = $ov }
+        if ($ov -gt $Overflow) {
+            $overCount++
+        }
+    }
+
+    return [PSCustomObject]@{
+        Keys = $keys
+        PercentOverTolerance = (100.0 * $overCount / $total)
+        WorstOverflowPct = (100.0 * $worst / $frameWidth)
+    }
+}
+
+function Get-ToleranceReadoutEstimate {
+    # Live "Estimated: N keys, X% of frames over tolerance, worst Y% of
+    # frame width" readout (2026-09-29, Part 3 step 3, Q6: recommended and
+    # included). ON-mode only -- this simulates the G+B guard itself, which
+    # only runs while Frame gate is ON; callers branch on the checkbox the
+    # same way Update-FrameGateGlow already does. Always the WHOLE cached
+    # take, no resolved-range option -- same convention as the glow's own
+    # continuous display (Q-rng: "whole cached take on the glow tick"),
+    # unlike the click-time OFF-mode prompt which resolves a real range.
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")]
+        [string]$Axis,
+        [Parameter(Mandatory=$true)][double]$ZoomPct,
+        [Parameter(Mandatory=$true)][double]$OffsetXPx,
+        [Nullable[double]]$ManualTolerancePct = $null
+    )
+    $arrays = Get-CachedFrameArrays
+    if ($arrays -eq $null) { return $null }
+    $maxW = ($arrays.XWidth | Measure-Object -Maximum).Maximum
+    if (-not $maxW) { return $null }
+
+    $rectPath = Get-RecordingMonitorRectPath
+    if (-not (Test-Path $rectPath)) { return $null }
+    $parts = (Get-Content $rectPath -Raw).Trim() -split ','
+    if ($parts.Count -ne 4) { return $null }
+    $monWidth = [double]$parts[2] - [double]$parts[0]
+    $colWidth = [Math]::Floor($monWidth / 2.0)
+    if ($colWidth -le 0) { return $null }
+
+    $neededOrtho = ($maxW / (1.0 - 2.0 * $script:frameGateEdgeOverflowPct)) * $script:frameGateMarginSafety
+    $finalOrtho = $neededOrtho * (1.0 - $ZoomPct / 100.0)
+    if ($finalOrtho -le 0) {
+        return [PSCustomObject]@{ Keys = 0; PercentOverTolerance = 100.0; WorstOverflowPct = 100.0 }
+    }
+    $halfOrtho = $finalOrtho / 2.0
+    $worldPerPx = $finalOrtho / $colWidth
+    $offsetShift = $OffsetXPx * $worldPerPx
+
+    if ($null -ne $ManualTolerancePct) {
+        # M1 override: bypasses the zoom-derived formula and its zero floor
+        # entirely -- mirrors compute_effective_overflow_pct's own manual_pct
+        # branch exactly (Python side).
+        $overflowPct = $ManualTolerancePct / 100.0
+    } else {
+        # Auto: zoom-only (no offset term) -- matches the REAL value the
+        # keyer actually reads today (offset_x_px=0.0 always passed at the
+        # real write site, part of G), not the launcher's OWN separately-
+        # offset-aware glow mirror (Get-FrameGateEffectiveOverflowPct,
+        # deliberately different, Q-ON).
+        $overflowPct = (1.0 - ($maxW * $script:frameGateMarginSafety / $finalOrtho)) / 2.0
+        $overflowPct = [Math]::Max(0.0, $overflowPct)
+    }
+    $overflow = $overflowPct * $finalOrtho
+
+    $frames = $arrays.Frames
+    $startIdx = 0
+    $endIdx = $frames.Count - 1
+
+    if ($Axis -eq "LeftRight") {
+        return Get-EdgeGuardCurveEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
+            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+    }
+    if ($Axis -eq "FrontBack") {
+        return Get-EdgeGuardCurveEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
+            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+    }
+    # "All": same "independent per axis, report the worse W with its own P"
+    # rule as Get-ClippingEstimate, for the same reason (never mix a P from
+    # one camera with a W from the other).
+    $fb = Get-EdgeGuardCurveEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
+        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+    $lr = Get-EdgeGuardCurveEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
+        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+    if ($lr.WorstOverflowPct -gt $fb.WorstOverflowPct) { return $lr }
+    return $fb
+}
+
+function Get-ClippingWarningThresholdPct {
+    # Gate-OFF clipping-warning threshold (2026-09-29, Part 3, Q4:
+    # RECOMMENDED answer was "reuse"). With the gate OFF, the Tolerance box
+    # has nothing to override (there is no automatic guard running at all --
+    # see key_edge_guard's own OFF branch), so the SAME number instead
+    # becomes "how much overflow I accept before the warning escalates from
+    # amber to red" -- one number, two meanings depending on the checkbox,
+    # exactly as the approved design describes it. Auto (Tolerance box
+    # empty) keeps the pre-existing hardcoded 2% default, unchanged.
+    $manualPct = Read-CameraTolerancePct
+    if ($null -ne $manualPct) { return $manualPct }
+    return 2.0
+}
+
 function Update-FrameGateGlow {
     # Cheap enough to call unconditionally every tick (see
     # Invoke-LiveApplyTick) -- pure local math + two small file reads, no
     # Maya round-trip, so the glow tracks zoom/offset live as they change.
-    $effective = Get-FrameGateEffectiveOverflowPct
-    if ($effective -eq $null) {
-        $previewButton.Effect = $null
-    } elseif ($effective -le 1e-6) {
-        $previewButton.Effect = New-FrameGateGlow -R 224 -G 120 -B 110   # same red as Stop Recording
-    } elseif ($effective -lt ($script:frameGateEdgeOverflowPct * 0.5)) {
-        $previewButton.Effect = New-FrameGateGlow -R 239 -G 192 -B 84    # same amber as the cache warning dot
-    } else {
-        $previewButton.Effect = $null
+    if ($frameGateCheckBox.IsChecked) {
+        $effective = Get-FrameGateEffectiveOverflowPct
+        if ($effective -eq $null) {
+            $previewButton.Effect = $null
+        } elseif ($effective -le 1e-6) {
+            $previewButton.Effect = New-FrameGateGlow -R 224 -G 120 -B 110   # same red as Stop Recording
+        } elseif ($effective -lt ($script:frameGateEdgeOverflowPct * 0.5)) {
+            $previewButton.Effect = New-FrameGateGlow -R 239 -G 192 -B 84    # same amber as the cache warning dot
+        } else {
+            $previewButton.Effect = $null
+        }
+        $previewButton.ToolTip = "Opens the tracked camera panels and keys them from cache, in the Maya viewport only -- no OBS recording."
+        return
     }
+
+    # Gate OFF: glow/tooltip switch from the zero-margin test to the
+    # clipping estimate (Q-thr, approved as proposed): 0% -> no glow;
+    # 0% < W <= threshold -> amber; W > threshold -> red. Threshold is 2%
+    # by default, or the manual Tolerance value if one is set (Q4: reuse,
+    # see Get-ClippingWarningThresholdPct). P never gates the glow color,
+    # only feeds the wording -- same "worst overflow alone decides" rule
+    # Get-ClippingEstimate's own "All" resolution follows.
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $estimate = Get-ClippingEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX
+    $threshold = Get-ClippingWarningThresholdPct
+    if ($estimate -eq $null) {
+        $previewButton.Effect = $null
+        $previewButton.ToolTip = "Opens the tracked camera panels and keys them from cache, in the Maya viewport only -- no OBS recording."
+    } elseif ($estimate.WorstOverflowPct -le 1e-6) {
+        $previewButton.Effect = $null
+        $previewButton.ToolTip = "Opens the tracked camera panels and keys them from cache, in the Maya viewport only -- no OBS recording."
+    } else {
+        $pRounded = [Math]::Round($estimate.PercentClipped, 1)
+        $wRounded = [Math]::Round($estimate.WorstOverflowPct, 1)
+        if ($estimate.WorstOverflowPct -le $threshold) {
+            $previewButton.Effect = New-FrameGateGlow -R 239 -G 192 -B 84    # amber
+        } else {
+            $previewButton.Effect = New-FrameGateGlow -R 224 -G 120 -B 110  # red
+        }
+        $previewButton.ToolTip = "Frame gate OFF -- estimated clipping: $pRounded% of frames, worst $wRounded% of frame width."
+    }
+}
+
+function Update-ToleranceReadout {
+    # Live "Estimated: N keys, X% of frames over tolerance, worst Y% of
+    # frame width" (2026-09-29, Part 3 step 3, Q6). ON-mode only -- this
+    # simulates the G+B guard itself, which only runs while Frame gate is
+    # ON; cleared (not left stale) while OFF or unknown, same "never leave
+    # a forgotten value visible" discipline as every other Frame Offsets
+    # control's own reset behavior.
+    if (-not $frameGateCheckBox.IsChecked) {
+        $toleranceReadoutText.Text = ""
+        return
+    }
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $manualPct = Read-CameraTolerancePct
+    $estimate = Get-ToleranceReadoutEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct $manualPct
+    if ($estimate -eq $null) {
+        $toleranceReadoutText.Text = ""
+        return
+    }
+    $overRounded = [Math]::Round($estimate.PercentOverTolerance, 1)
+    $worstRounded = [Math]::Round($estimate.WorstOverflowPct, 1)
+    $toleranceReadoutText.Text = "Estimated: $($estimate.Keys) keys, $overRounded% of frames over tolerance, worst $worstRounded% of frame width."
 }
 
 $script:liveApplyTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:liveApplyTimer.Interval = [TimeSpan]::FromMilliseconds(60)
 $script:liveApplyTimer.Add_Tick({
     Update-FrameGateGlow
+    Update-ToleranceReadout
     Invoke-LiveApplyTick
 })
 $script:liveApplyTimer.Start()
@@ -2819,10 +3361,57 @@ $window.Add_PreviewKeyUp({
 # A discrete, one-shot action (not something "in progress"), so it
 # applies immediately -- same reasoning as a typed box commit.
 $resetFrameOffsetsButton.Add_Click({
+    # Scoped to Zoom/X/Y only, deliberately -- does NOT touch Frame gate or
+    # Tolerance (Q-rst: recommended answer, approved as-is).
     $zoomSlider.Value = 0
     $offsetXBox.Text = "0"
     $offsetYBox.Text = "0"
     Commit-OffsetBoxes
+})
+
+# --- Frame gate checkbox ------------------------------------------------
+# Writes immediately on toggle (Checked/Unchecked fire synchronously on the
+# state change itself, not on the 60ms timer) -- Success Criterion 1 asks
+# for "within one tick," this is actually immediate.
+$frameGateCheckBox.Add_Checked({ Write-FrameGateEnabled -Enabled $true })
+$frameGateCheckBox.Add_Unchecked({ Write-FrameGateEnabled -Enabled $false })
+
+$script:lastValidTolerancePct = $null  # $null = Auto, the default
+
+function Commit-ToleranceValueBox {
+    # Auto/blank means "use today's zoom-and-offset-derived formula" -- a
+    # DIFFERENT state from typing "0", which is a real, valid (if
+    # aggressive) manual choice: zero slack, react instantly. Mirrors
+    # Commit-ZoomValueBox/Commit-OffsetBoxes' revert-on-invalid discipline,
+    # but has a third valid state (Auto) neither of those needed. Writes
+    # DIRECTLY (unlike Commit-ZoomValueBox, which routes through a slider
+    # that does the writing) since there is no companion slider here, same
+    # direct-write shape as Commit-OffsetBoxes.
+    $text = $toleranceValueBox.Text.Trim()
+    if ($text -eq '' -or $text -ieq 'auto') {
+        $script:lastValidTolerancePct = $null
+        $toleranceValueBox.Text = 'Auto'
+    } else {
+        $value = 0.0
+        if ([double]::TryParse($text.TrimEnd('%'), [ref]$value)) {
+            $script:lastValidTolerancePct = [Math]::Max(0.0, [Math]::Min(20.0, $value))
+            $toleranceValueBox.Text = "$($script:lastValidTolerancePct)"
+        } else {
+            # Unparseable garbage -- revert instead of leaving stale/invalid
+            # text on screen or writing it to disk, same discipline as every
+            # other box on this row.
+            $toleranceValueBox.Text = if ($null -eq $script:lastValidTolerancePct) { 'Auto' } else { "$($script:lastValidTolerancePct)" }
+        }
+    }
+    Write-CameraTolerancePct -Value $script:lastValidTolerancePct
+}
+$toleranceValueBox.Add_LostFocus({ Commit-ToleranceValueBox })
+$toleranceValueBox.Add_KeyDown({
+    param($eventSender, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+        Commit-ToleranceValueBox
+        [System.Windows.Input.Keyboard]::ClearFocus()
+    }
 })
 
 function Commit-ZoomValueBox {
@@ -2967,16 +3556,20 @@ function Get-ResolvedTimeRange {
 # send_to_maya.ps1/maya_obs_capture.ps1 processes against whatever's live
 # in Maya right now).
 function Get-CaptureClickResult {
-    $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
     $range = Get-ResolvedTimeRange
     if (-not $range.Success) {
-        return [PSCustomObject]@{ Steps = $null; ErrorMessage = "$($range.ErrorMessage) -- not starting."; ResolvedStart = $null }
+        return [PSCustomObject]@{ Steps = $null; ErrorMessage = "$($range.ErrorMessage) -- not starting."; ResolvedStart = $null; ResolvedEnd = $null }
     }
-    $steps = Get-CaptureSteps -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
+    $steps = Get-CaptureStepsForAxis -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
     # ResolvedStart: so a caller wanting "Recenter at start frame" can reuse
     # THIS resolution (a real Maya round trip for Time Slider/All) instead
     # of paying for a second one just to find the same number again.
-    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start }
+    # ResolvedEnd (2026-09-28): same reasoning, added for the Frame gate
+    # OFF clipping estimate -- its click-time prompt needs the exact
+    # resolved range, not just the Start, and must not pay for a second
+    # Get-ResolvedTimeRange round trip to get it.
+    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start; ResolvedEnd = $range.End }
 }
 
 $previewButton.Add_Click({
@@ -2984,8 +3577,16 @@ $previewButton.Add_Click({
     # pre-Stop-feature behavior). It just disables like any other inactive
     # button while something runs; only Start Recording's own run makes
     # PreviewButton clickable-but-inert-while-disabled the normal way.
-    $axis = if ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
-    $steps = Get-CaptureSteps -Axis $axis -Recording $false -ScriptDir $ScriptDir
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    # With All selected Preview shows the FIRST leg (Front/Back) only (user
+    # decision 2026-09-24, option b) -- the two panel sets cannot coexist
+    # (each panel script closes all four claude_view_* windows), so a
+    # two-leg preview would only ever leave Left/Right on screen. Start
+    # Recording and the cache build are untouched (they still run both
+    # legs). The explanatory log line is queued and written AFTER Start-Steps
+    # below, same reason as $recenterLogMessage (Start-Steps clears the log).
+    $steps = Get-CaptureStepsForAxis -Axis (Get-PreviewAxis -Axis $axis) -Recording $false -ScriptDir $ScriptDir
+    $previewAxisNote = if ($axis -eq "All") { "Preview with All shows the first leg (Front/Back) only -- Start Recording captures both legs." } else { $null }
     # Recenter at start frame (2026-09-02, now mandatory -- no checkbox):
     # Preview normally never resolves a Time Range at all (Start/End only
     # ever applied to Start Recording, unchanged) -- this is the one case
@@ -3016,6 +3617,7 @@ $previewButton.Add_Click({
     $script:pendingCacheRefresh = $true
     Start-Steps $steps
     if ($recenterLogMessage) { Write-Log $recenterLogMessage }
+    if ($previewAxisNote) { Write-Log $previewAxisNote }
 })
 
 $startRecordingButton.Add_Click({
@@ -3045,19 +3647,52 @@ $startRecordingButton.Add_Click({
     # Frame-gate warning (2026-09-08): a SOFT gate, unlike the hard-block
     # checks above -- amber alone never blocks (matches Preview's glow-only
     # treatment), only the zero-tolerance floor does, and only with an
-    # explicit override, not a silent refusal.
-    $frameGateEffective = Get-FrameGateEffectiveOverflowPct
-    if ($frameGateEffective -ne $null -and $frameGateEffective -le 1e-6) {
-        $proceedAnyway = Show-DarkConfirm -Title "Framing Warning" -ConfirmLabel "Continue Anyway" -Message "Your current Zoom/Offset leaves zero safe tracking margin -- the widest pose may clip, or the camera may move erratically to compensate.`n`nContinue anyway?"
-        if (-not $proceedAnyway) {
-            Write-Log "Start Recording cancelled: framing warning not confirmed."
-            return
+    # explicit override, not a silent refusal. Gate ON: unchanged (Q-ON) --
+    # this exact check, untouched. Gate OFF: this zero-margin test has no
+    # meaning at all (edge_guard never runs), so it's skipped entirely and
+    # replaced by the clipping-estimate check below, AFTER the resolved
+    # range is known.
+    $frameGateLogMessage = $null
+    if ($frameGateCheckBox.IsChecked) {
+        $frameGateEffective = Get-FrameGateEffectiveOverflowPct
+        if ($frameGateEffective -ne $null -and $frameGateEffective -le 1e-6) {
+            $proceedAnyway = Show-DarkConfirm -Title "Framing Warning" -ConfirmLabel "Continue Anyway" -Message "Your current Zoom/Offset leaves zero safe tracking margin -- the widest pose may clip, or the camera may move erratically to compensate.`n`nContinue anyway?"
+            if (-not $proceedAnyway) {
+                Write-Log "Start Recording cancelled: framing warning not confirmed."
+                return
+            }
         }
     }
     $result = Get-CaptureClickResult
     if ($result.ErrorMessage -ne $null) {
         Write-Log $result.ErrorMessage
         return
+    }
+    # Gate OFF clipping check (2026-09-28): needs the RESOLVED range (Q-rng:
+    # "the click-time prompt uses the resolved range"), so this runs here,
+    # after Get-CaptureClickResult, not alongside the ON-mode check above.
+    # Soft gate too, same as ON: only prompts past the worst-overflow
+    # threshold (Success Criterion 5: "prompt only when W > 2%" by default,
+    # or the manual Tolerance value if set -- Q4: reuse), P never gates it.
+    # Message queued into $frameGateLogMessage and written AFTER
+    # Start-Steps below, same reason as $recenterLogMessage (Start-Steps
+    # clears the log box).
+    if (-not $frameGateCheckBox.IsChecked) {
+        $offAxis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+        $offEstimate = Get-ClippingEstimate -Axis $offAxis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -RangeStart $result.ResolvedStart -RangeEnd $result.ResolvedEnd
+        $offThreshold = Get-ClippingWarningThresholdPct
+        if ($offEstimate -ne $null) {
+            $offP = [Math]::Round($offEstimate.PercentClipped, 1)
+            $offW = [Math]::Round($offEstimate.WorstOverflowPct, 1)
+            if ($offEstimate.WorstOverflowPct -gt $offThreshold) {
+                $proceedAnyway = Show-DarkConfirm -Title "Clipping Warning" -ConfirmLabel "Continue Anyway" -Message "Frame gate is OFF, so the camera stays fixed for the whole take.`n`nAt your current Zoom/Offset the character leaves the frame on about $offP% of frames, by up to $offW% of the frame width -- those parts will be cut off in the recording.`n`nLower the Zoom or turn Frame gate back on to reduce this.`n`nContinue anyway?"
+                if (-not $proceedAnyway) {
+                    Write-Log "Start Recording cancelled: clipping warning not confirmed."
+                    return
+                }
+            }
+            $frameGateLogMessage = "Frame gate OFF: fixed camera, estimated clipping $offP% of frames (worst $offW% of frame width)."
+        }
     }
     # Recenter at start frame (2026-09-02, now mandatory -- no checkbox):
     # reuses Get-CaptureClickResult's OWN range resolution (ResolvedStart)
@@ -3093,6 +3728,7 @@ $startRecordingButton.Add_Click({
     $steps = @($result.Steps) + (Get-CleanResetStep -ScriptDir $ScriptDir)
     Start-Steps $steps $true $startRecordingButton "Stop Recording"
     if ($recenterLogMessage) { Write-Log $recenterLogMessage }
+    if ($frameGateLogMessage) { Write-Log $frameGateLogMessage }
 })
 
 $resetButton.Add_Click({
@@ -3121,7 +3757,7 @@ $guideButton.Add_Click({
             Header = "CAPTURE (what you use every run, its own tab)"
             ImagePath = Join-Path $ScriptDir "guide_images\guide_capture_tab.png"
             Steps = @(
-                @{ Lead = "Pick an Axis:"; Text = "Front/Back or Left/Right." },
+                @{ Lead = "Pick an Axis:"; Text = "Front/Back, Left/Right, or All (Front/Back then Left/Right, recorded as two separate videos -- Preview with All shows Front/Back only)." },
                 @{ Lead = "Pick a Time Range:"; Text = "All (full ROM video), Time Slider (Maya's current Range Slider), or Start/End (type exact frame numbers)." },
                 @{ Lead = "Click Preview"; Text = "to check framing in Maya only, no recording." },
                 @{ Lead = "Click Start Recording"; Text = "to also capture via OBS. While recording, click the same button again (it now reads Stop Recording) to interrupt it early." },
@@ -3353,6 +3989,23 @@ Write-CameraOffsetPx -X 0 -Y 0
 # clear it here too so nothing stale from a past session could apply if a
 # scene were somehow opened and captured through some OTHER path first.
 Clear-RecenterStartFrame
+# Frame gate always starts checked (2026-09-28) -- same "never silently
+# restore a forgotten value" rule as Zoom/Offset/Recenter above. Written
+# explicitly, not just via IsChecked = $true: the XAML default is ALREADY
+# True, so that assignment alone would be a same-value no-op and its own
+# Add_Checked handler (the thing that normally writes the file) would
+# never fire -- identical gotcha to the magnifier's own startup reset just
+# above (see its comment), which is why that one calls Write-CameraZoomPct
+# directly instead of trusting the ValueChanged side effect.
+$frameGateCheckBox.IsChecked = $true
+Write-FrameGateEnabled -Enabled $true
+# Tolerance box always starts at Auto (2026-09-29) -- same rule, same
+# "assignment alone is a same-value no-op" gotcha: Text is already "Auto"
+# in the XAML, so this also writes the file explicitly rather than relying
+# on a LostFocus/KeyDown event that never fires from a same-value assign.
+$toleranceValueBox.Text = 'Auto'
+$script:lastValidTolerancePct = $null
+Write-CameraTolerancePct -Value $null
 Update-MonitorList
 Write-StartupSummary -MayaReachable $script:mayaReachableAtStartup
 Set-ActiveTab "Capture"

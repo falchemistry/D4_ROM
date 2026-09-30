@@ -185,6 +185,26 @@ def get_zoom_pct():
         return ZOOM_PCT
 
 
+def get_manual_tolerance_pct():
+    """Reads the 'Tolerance' box's typed override (see rom_launcher.ps1's
+    Write-CameraTolerancePct) -- a number in percent, or None for Auto
+    (empty file, missing file, or malformed content -- 'unknown' must
+    default to Auto/today's zoom-derived formula, never a guessed number,
+    same convention as get_zoom_pct/get_frame_gate_enabled). Not re-clamped
+    here: Commit-ToleranceValueBox already clamps to 0-20 before writing,
+    so a value that reaches this file is already valid -- re-clamping here
+    would only mask a real bug in the writer, not add real protection."""
+    path = os.path.join(CACHE_DIR, '_camera_tolerance_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
 def get_pixel_offset():
     """Reads the X/Y pixel offset rom_launcher.ps1's Offset boxes last
     wrote (see Write-CameraOffsetPx) as a single 'X,Y' line -- same
@@ -331,7 +351,7 @@ def compute_margin_px(world_h, panel_w, panel_h):
     return margin, max_w, needed_ortho
 
 
-def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width):
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width, manual_pct=None):
     """The magnifier multiplies the final orthoWidth AFTER compute_margin_px
     has already sized the frame assuming zero zoom -- zooming in narrows
     the frame below what compute_margin_px promised, silently eating into
@@ -363,7 +383,18 @@ def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, p
     reported as "lost its frame-gate ability" and jumpy framing during an
     actual recording (Preview only ever shows one static frame, so this
     never surfaced there -- it only shows up once edge_guard's curve gets
-    exercised across the whole animation during real playback)."""
+    exercised across the whole animation during real playback).
+
+    Manual override (2026-09-29, tolerance box): when manual_pct is not
+    None, it IS the effective value (manual_pct / 100.0) -- bypasses the
+    whole zoom/offset-derived formula AND its zero floor entirely, since a
+    typed number is now the tolerance itself, not a suggestion layered on
+    top of the auto one (M1 in the approved design: override, not additive,
+    not a floor). Auto (manual_pct=None, the default) is completely
+    unchanged from before this parameter existed -- every existing caller
+    that never passes it keeps today's exact behavior, byte for byte."""
+    if manual_pct is not None:
+        return manual_pct / 100.0
     final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
     if final_ortho <= 0:
         return 0.0
@@ -542,6 +573,12 @@ def apply_mesh_only_display(panel):
                       # and isn't something the recording can fix after the
                       # fact.
                       headsUpDisplay=False,
+                      # Backface culling on this capture panel only (viewport
+                      # display flag, not a scene/mesh edit) -- requested so
+                      # back-facing geometry never renders into the ROM
+                      # capture video. Reversible, panel-scoped, matches every
+                      # other display flag on this same call.
+                      backfaceCulling=True,
                       rendererName='vp2Renderer')
 
 
@@ -694,12 +731,33 @@ def open_view_panels():
     # actually left -- write the value that ACTUALLY applies at the current
     # zoom level so maya_key_from_cache.py's edge_guard uses it instead of
     # its own static constant. See compute_effective_overflow_pct.
-    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, col_width)
+    #
+    # offset_x_px=0.0 here, NOT the real offset (2026-09-28, part of G):
+    # key_edge_guard's guard tolerance is now zoom-only -- the offset no
+    # longer shrinks it, since G already guarantees the offset survives as
+    # a pure constant shift regardless of how much tolerance is left (see
+    # key_edge_guard/compute_edge_guard_curve's own docstrings for the full
+    # derivation). Coupling this tolerance to the offset was the OLD design
+    # (offset-reduced), rejected in favor of keeping the offset a pure
+    # translation -- see the proposal's REJECTED list. This does NOT affect
+    # the launcher's own glow/prompt (Get-FrameGateEffectiveOverflowPct in
+    # rom_launcher.ps1, which computes its own value independently and
+    # deliberately stays offset-aware, Q-ON) -- only what gets WRITTEN here
+    # for the keyer to read.
+    # Manual tolerance override (2026-09-29): a typed value in the
+    # "Tolerance" box bypasses the zoom-derived formula entirely (M1,
+    # override not additive/floor -- see compute_effective_overflow_pct's
+    # own docstring). None (Auto, the default) is byte-identical to before
+    # this existed.
+    manual_tolerance_pct = get_manual_tolerance_pct()
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, 0.0, col_width, manual_tolerance_pct)
     write_effective_overflow_pct(effective_overflow_pct)
-    if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+    if manual_tolerance_pct is not None:
+        print('Manual tolerance override: %.2f%% (auto would have been %.2f%%)' % (effective_overflow_pct * 100, compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, 0.0, col_width) * 100))
+    elif abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
         print('Effective drift tolerance at this zoom/offset: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
-        if effective_overflow_pct <= 1e-6:
-            print('WARNING: current zoom/offset leaves ZERO drift tolerance -- the widest pose may clip regardless of tracking. Reduce zoom-in or offset magnitude if clipping is visible.')
+    if effective_overflow_pct <= 1e-6:
+        print('WARNING: zero drift tolerance in effect -- a pose wider than the frame will clip regardless of tracking. Reduce zoom-in, or raise the manual Tolerance value, if clipping is visible.')
 
     close_all_view_panels()
 

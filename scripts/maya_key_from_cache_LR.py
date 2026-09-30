@@ -71,6 +71,19 @@ def get_recenter_start_frame():
         return None
 
 
+def get_frame_gate_enabled():
+    """See maya_key_from_cache.py for the full explanation. Same shared
+    _camera_frame_gate.txt file -- '0' means OFF, anything else (including
+    missing/malformed) means ON."""
+    path = os.path.join(CACHE_DIR, '_camera_frame_gate.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        return content != '0'
+    except (IOError, OSError):
+        return True
+
+
 # Manual pixel-space nudge -- see maya_camera_panels.py's get_pixel_offset()
 # for the full explanation. Only needed here so apply_recenter_override can
 # apply the SAME offset instead of discarding it (BUG FIXED 2026-09-08, see
@@ -263,7 +276,19 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     BUG FIXED 2026-09-08: offset_shift (see maya_key_from_cache.py's copy
     for the full writeup) -- this function used to have zero knowledge of
     the manual pixel offset at all, so the whole curve ignored it outside
-    the one recenter-frame override."""
+    the one recenter-frame override.
+
+    G + B (2026-09-28, see maya_key_from_cache.py's copy of this function
+    and of compute_edge_guard_curve below for the full derivation and
+    real-scene/replica evidence -- identical fix here, z axis instead of
+    x): the 2026-09-08 fix above turned out not to actually hold under
+    correction (algebraically, cam_pos_new = edge +/- half_ortho +/-
+    overflow has no surviving cam_pos term, so any correction erases
+    whatever offset was baked into frame 0). [G] fixes this for real by
+    building the curve completely offset-free and subtracting offset_shift
+    from EVERY keyed value uniformly. [B] holds (skips correcting) any
+    frame whose pose cannot fit within the tolerance regardless of camera
+    position, instead of chasing it for zero actual benefit."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
@@ -279,14 +304,31 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     half_ortho = ortho_width / 2.0
     overflow = overflow_pct * ortho_width
 
-    cam_pos = subject_center[0] - offset_shift
-    cmds.setKeyframe(attr, time=frames[0], value=cam_pos)
-    keyed_count = 1
-    last_keyed_frame = frames[0]
+    curve = compute_edge_guard_curve(subject_center, subject_half_width, half_ortho, overflow)
+    for i, value in curve:
+        cmds.setKeyframe(attr, time=frames[i], value=value - offset_shift)
 
-    for i in range(1, len(frames)):
-        left_edge = subject_center[i] - subject_half_width[i]
-        right_edge = subject_center[i] + subject_half_width[i]
+    return len(curve)
+
+
+def compute_edge_guard_curve(centers, half_widths, half_ortho, overflow):
+    """See maya_key_from_cache.py's copy of this function for the full
+    docstring, derivation, and evidence (identical here) -- pure, cmds-free
+    replica of key_edge_guard's own tracking loop, offset-free by design
+    [G], with a hold when a pose cannot fit within the tolerance regardless
+    of camera position [B]."""
+    n = len(centers)
+    if n == 0:
+        return []
+    curve = [(0, centers[0])]
+    cam_pos = centers[0]
+    last_keyed_index = 0
+    for i in range(1, n):
+        if half_widths[i] > half_ortho + overflow:
+            # [B] pose cannot fit even with the full tolerance -- hold.
+            continue
+        left_edge = centers[i] - half_widths[i]
+        right_edge = centers[i] + half_widths[i]
         allowed_left = cam_pos - half_ortho - overflow
         allowed_right = cam_pos + half_ortho + overflow
 
@@ -297,15 +339,13 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
         else:
             continue
 
-        cmds.setKeyframe(attr, time=frames[i], value=cam_pos)
-        keyed_count += 1
-        last_keyed_frame = frames[i]
+        curve.append((i, cam_pos))
+        last_keyed_index = i
 
-    if last_keyed_frame != frames[-1]:
-        cmds.setKeyframe(attr, time=frames[-1], value=cam_pos)
-        keyed_count += 1
+    if last_keyed_index != n - 1:
+        curve.append((n - 1, cam_pos))
 
-    return keyed_count
+    return curve
 
 
 _t0 = time.time()
@@ -348,11 +388,25 @@ try:
     world_per_px = get_world_per_px()
     offset_shift = (offset_x_px * world_per_px) if world_per_px is not None else 0.0
 
+    frame_gate_enabled = get_frame_gate_enabled()
+    if not frame_gate_enabled:
+        print('Frame gate OFF: camera held static (no tracking, no drift correction)')
+
     scale_cache = {}
     for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
         if not cmds.objExists(cam_transform):
             print('Skipped %s: camera "%s" does not exist' % (view_name, cam_transform))
             continue
+
+        if not frame_gate_enabled:
+            # See maya_key_from_cache.py's copy of this branch for the full
+            # explanation (identical here, tracked axis 'z' instead of 'x').
+            attr = cam_transform + '.translate' + axis.upper()
+            if cmds.keyframe(attr, query=True, keyframeCount=True):
+                cmds.cutKey(attr, clear=True)
+            print('%s (%s): Frame gate OFF -- camera held static' % (view_name, cam_transform))
+            continue
+
         if axis not in scale_cache:
             scale_cache[axis] = compute_size_scale(cache, axis)
         current_ref, cached_ref, scale = scale_cache[axis]

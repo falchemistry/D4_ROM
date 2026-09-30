@@ -95,6 +95,26 @@ def get_recenter_start_frame():
         return None
 
 
+def get_frame_gate_enabled():
+    """Reads the 'Frame gate' checkbox state rom_launcher.ps1's
+    Write-FrameGateEnabled last wrote -- '1' (checked/ON, the default) or
+    '0' (unchecked/OFF). Missing or malformed = ON = today's behavior
+    (automatic tracking), the same "unknown defaults to the existing
+    behavior" convention as get_effective_overflow_pct's own fallback --
+    an OFF state must be an explicit, deliberate '0', never inferred from
+    the file simply not existing yet (e.g. a launcher build that predates
+    this checkbox). Only the literal '0' means OFF; any other content
+    (including garbage) is treated as ON rather than silently disabling
+    tracking on a parse hiccup."""
+    path = os.path.join(CACHE_DIR, '_camera_frame_gate.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        return content != '0'
+    except (IOError, OSError):
+        return True
+
+
 # Manual pixel-space nudge -- see maya_camera_panels.py's own copy of
 # get_pixel_offset() for the full explanation. Only needed here so
 # apply_recenter_override can apply the SAME offset instead of discarding
@@ -400,16 +420,36 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     plays/records the full animation, since Preview only ever shows the one
     static (correct-by-luck) recenter frame.
 
-    Fix: shift cam_pos by offset_shift ONCE at initialization, in the SAME
-    world-unit direction frame_camera()/apply_recenter_override() already
-    use. Every subsequent keyframe is computed incrementally FROM that same
-    cam_pos (both the value itself and the allowed_left/allowed_right
-    boundaries derive from it), so the shift propagates consistently through
-    the ENTIRE curve for free -- no other change to the tracking logic
-    itself. apply_recenter_override still runs afterward and is still
-    needed: it corrects for sparse-key INTERPOLATION drift at one specific
-    frame, a different problem than "does the offset apply at all," and the
-    two fixes are complementary, not redundant."""
+    Fix (superseded by G below, 2026-09-28): shift cam_pos by offset_shift
+    ONCE at initialization, in the SAME world-unit direction frame_camera()/
+    apply_recenter_override() already use. The intent -- every subsequent
+    keyframe computed incrementally FROM that same cam_pos, so the shift
+    propagates through the ENTIRE curve for free -- turned out not to hold:
+    algebraically, cam_pos_new = left_edge + half_ortho + overflow (or the
+    symmetric right-edge form) on every CORRECTION, which has NO surviving
+    cam_pos term at all -- the offset baked into frame 0's cam_pos is
+    erased the instant any correction fires, exactly as if it had never
+    been applied. Confirmed live (2026-09-28, zoom 20/offset 20 on barM):
+    tolerance file 0.000000, first correction at frame 12 (offset 0) vs
+    frame 10 (offset 20), curves IDENTICAL from frame 12 onward -- the
+    20px offset survived on only 0.1% of frames. apply_recenter_override
+    still runs afterward and is still needed for the same reason as
+    before: it corrects sparse-key INTERPOLATION drift at one specific
+    frame, unrelated to whether the offset applies elsewhere.
+
+    G + B (2026-09-28, both live-proven -- see compute_edge_guard_curve's
+    own docstring for the derivation and real-scene evidence):
+    [G] The curve itself is now built completely OFFSET-FREE by compute_
+    edge_guard_curve (which never sees offset_shift at all), and offset_shift
+    is subtracted from EVERY returned value here, uniformly, as a pure
+    constant screen shift -- not just the first. This is what actually
+    fixes the erasure bug above: a per-value subtraction can never cancel
+    out algebraically the way baking it into a chained cam_pos did.
+    [B] compute_edge_guard_curve also holds (skips correcting) any frame
+    whose pose cannot fit within the tolerance regardless of camera
+    position, instead of chasing it with an oversized, cosmetically bad
+    correction for zero actual benefit (the residual clip is the same
+    either way -- see that function's own docstring)."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
@@ -425,14 +465,76 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     half_ortho = ortho_width / 2.0
     overflow = overflow_pct * ortho_width
 
-    cam_pos = subject_center[0] - offset_shift
-    cmds.setKeyframe(attr, time=frames[0], value=cam_pos)
-    keyed_count = 1
-    last_keyed_frame = frames[0]
+    curve = compute_edge_guard_curve(subject_center, subject_half_width, half_ortho, overflow)
+    for i, value in curve:
+        cmds.setKeyframe(attr, time=frames[i], value=value - offset_shift)
 
-    for i in range(1, len(frames)):
-        left_edge = subject_center[i] - subject_half_width[i]
-        right_edge = subject_center[i] + subject_half_width[i]
+    return len(curve)
+
+
+def compute_edge_guard_curve(centers, half_widths, half_ortho, overflow):
+    """Pure, cmds-free replica of key_edge_guard's own tracking loop --
+    OFFSET-FREE by design [G]: the caller (key_edge_guard) subtracts
+    offset_shift from EVERY returned value uniformly, as a pure constant
+    screen shift, rather than this function ever seeing or propagating an
+    offset internally. This is the actual fix for the erasure bug key_edge_
+    guard's own docstring documents: a per-value subtraction after the fact
+    can never algebraically cancel out the way baking an offset into a
+    chained cam_pos did.
+
+    Returns a list of (index, value) pairs -- index into the SAME centers/
+    half_widths arrays (equivalently, cache['frames']) -- marking every
+    entry that needs an explicit keyframe: index 0 (the anchor), every
+    corrective nudge, and the last index (if it wasn't already a
+    correction), mirroring the original loop's keyed_count/last_keyed_frame
+    bookkeeping exactly, minus the cmds calls.
+
+    [B] Hold when the pose cannot fit: if a pose's own half-width alone
+    already exceeds half_ortho + overflow, NO camera position can bring
+    both edges inside the allowed range simultaneously -- moving toward
+    one edge only worsens the other by the same amount, so "correcting"
+    would just chase an unfixable pose: large, frequent motion for a
+    residual clip that happens regardless (the SAME clip whether the
+    camera moves or not). Holding is a deliberate no-op for that frame,
+    not a missed correction -- confirmed live this does not create visible
+    snaps when the pose later fits again: on barM at zoom+20%/offset20,
+    the first correction after a hold was at most 18px (mean 5px), not a
+    jarring jump back.
+
+    Design history for the overall G+B rework (2026-09-28, live-proven
+    against barM's real cache, full take, zoom+20%/offset20px):
+    - A (current code, offset baked into cam_pos only): 1240 keys, offset
+      held on only 0.3% of frames (0.1% live), mean/max single correction
+      34px/169px, 366 corrections > 50px, max camera travel 336px.
+    - G+B (this function): 480 keys, offset held 100% of frames BY
+      CONSTRUCTION (every value gets the same subtraction), mean/max
+      correction 3px/25px, zero corrections > 50px, max travel 146px.
+    - The trade-off: G+B's offset-side overflow is larger (frames over 0
+      tolerance 44.6% vs A's 23.1%, worst overflow 20.7% vs 17.6%) -- the
+      price of "offset always wins" is that the guard's own tolerance is
+      now zoom-only (see maya_camera_panels.py's compute_effective_
+      overflow_pct call), no longer shrunk by the offset the way A's was.
+      Accepted trade-off (tolerance box, built separately, makes it a
+      visible per-take choice instead of a hidden cost).
+
+    Validated (2026-09-28, plain Python, no Maya, against the real barM
+    cache -- see scratchpad proto_keyer_gb.py/validate_gb_prototype.py):
+    keys 480/480 exact, frames-over-tolerance 44.6%/44.6% exact, worst
+    overflow 20.7%/20.7% exact, differential property (offset0 vs
+    offset20 curves) exact to floating-point precision, B never holds at
+    zoom0/offset0 (the regression case) confirmed True."""
+    n = len(centers)
+    if n == 0:
+        return []
+    curve = [(0, centers[0])]
+    cam_pos = centers[0]
+    last_keyed_index = 0
+    for i in range(1, n):
+        if half_widths[i] > half_ortho + overflow:
+            # [B] pose cannot fit even with the full tolerance -- hold.
+            continue
+        left_edge = centers[i] - half_widths[i]
+        right_edge = centers[i] + half_widths[i]
         allowed_left = cam_pos - half_ortho - overflow
         allowed_right = cam_pos + half_ortho + overflow
 
@@ -443,15 +545,13 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
         else:
             continue
 
-        cmds.setKeyframe(attr, time=frames[i], value=cam_pos)
-        keyed_count += 1
-        last_keyed_frame = frames[i]
+        curve.append((i, cam_pos))
+        last_keyed_index = i
 
-    if last_keyed_frame != frames[-1]:
-        cmds.setKeyframe(attr, time=frames[-1], value=cam_pos)
-        keyed_count += 1
+    if last_keyed_index != n - 1:
+        curve.append((n - 1, cam_pos))
 
-    return keyed_count
+    return curve
 
 
 _t0 = time.time()
@@ -517,11 +617,37 @@ try:
     # never synthesize a fallback ratio.
     offset_shift = (offset_x_px * world_per_px) if world_per_px is not None else 0.0
 
+    frame_gate_enabled = get_frame_gate_enabled()
+    if not frame_gate_enabled:
+        print('Frame gate OFF: camera held static (no tracking, no drift correction)')
+
     scale_cache = {}
     for view_name, (cam_transform, axis) in ACTIVE_VIEWS.items():
         if not cmds.objExists(cam_transform):
             print('Skipped %s: camera "%s" does not exist' % (view_name, cam_transform))
             continue
+
+        if not frame_gate_enabled:
+            # Gate OFF: the camera stays exactly where maya_camera_panels.py's
+            # frame_camera() already parked it (start-frame bbox centre,
+            # Offset and Zoom applied, run just before this script) -- no
+            # per-frame tracking, no key_edge_guard, no apply_recenter_override.
+            # cutKey still runs UNCONDITIONALLY here (guarded only on
+            # keyframeCount, matching the existing key_edge_guard/key_from_
+            # cache/key_dead_zone convention) so a stale ON-mode curve left
+            # over from an EARLIER run on this same scene (gate flipped OFF
+            # without a Reset in between) is removed even though this run's
+            # own OFF pass never adds any keys of its own -- otherwise the
+            # camera would keep tracking on old keys despite the checkbox
+            # being off, a silent stale-key bug of exactly the kind this
+            # project has hit before (see apply_recenter_override's own
+            # BUG FIXED writeups).
+            attr = cam_transform + '.translate' + axis.upper()
+            if cmds.keyframe(attr, query=True, keyframeCount=True):
+                cmds.cutKey(attr, clear=True)
+            print('%s (%s): Frame gate OFF -- camera held static' % (view_name, cam_transform))
+            continue
+
         if axis not in scale_cache:
             scale_cache[axis] = compute_size_scale(cache, axis)
         current_ref, cached_ref, scale = scale_cache[axis]

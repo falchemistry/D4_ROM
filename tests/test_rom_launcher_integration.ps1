@@ -659,6 +659,125 @@ Check "Start/End selected with valid numbers passes them through to the OBS step
     if ($joined -notmatch "-EndFrame 50") { throw "expected -EndFrame 50 in: $joined" }
 }
 
+Check "Axis: All shares the Axis radio group, is off by default, and checking it unchecks Front/Back and Left/Right" {
+    # Item 4 (All radiobutton). rom_launcher.ps1 never bound LeftRightRadio
+    # to a variable (Front/Back vs Left/Right was a binary ternary), so the
+    # test looks it up by name.
+    if ($window -eq $null) { throw "test setup: expected the dot-sourced launcher's `$window in scope" }
+    $leftRightRadio = $window.FindName("LeftRightRadio")
+    if ($allAxisRadio -eq $null) { throw "AllAxisRadio was not found in the XAML (FindName returned null)" }
+    if ($leftRightRadio -eq $null) { throw "LeftRightRadio was not found in the XAML" }
+    if ($allAxisRadio.GroupName -ne "Axis") { throw "expected GroupName 'Axis', got '$($allAxisRadio.GroupName)'" }
+    if ($allAxisRadio.Content -ne "All") { throw "expected the label 'All', got '$($allAxisRadio.Content)'" }
+    if (-not $frontBackRadio.IsChecked) { throw "Front/Back must stay the default axis" }
+    if ($allAxisRadio.IsChecked) { throw "All must not be checked by default" }
+    try {
+        $allAxisRadio.IsChecked = $true
+        if ($frontBackRadio.IsChecked -or $leftRightRadio.IsChecked) { throw "checking All must uncheck the other axis radios (same GroupName)" }
+    } finally {
+        $frontBackRadio.IsChecked = $true
+    }
+    if ($allAxisRadio.IsChecked) { throw "re-checking Front/Back must uncheck All" }
+}
+
+Check "Axis: All queues both legs (Front/Back then Left/Right) with the same Start/End range on each OBS step; single axes still queue one leg" {
+    # Item 4 success criterion: with All checked the click queue equals
+    # Front/Back steps + Left/Right steps concatenated -- two independent
+    # OBS capture steps = two videos. Uses Start/End (typed numbers, no
+    # Maya round trip), same technique as the Start/End test above.
+    $leftRightRadio = $window.FindName("LeftRightRadio")
+    $startEndRadio.IsChecked = $true
+    $startFrameBox.Text = "10"
+    $endFrameBox.Text = "50"
+    try {
+        $allAxisRadio.IsChecked = $true
+        $result = Get-CaptureClickResult
+        if ($result.ErrorMessage -ne $null) { throw "expected no error, got: $($result.ErrorMessage)" }
+        if (@($result.Steps).Count -ne 12) { throw "expected 12 steps (6 Front/Back + 6 Left/Right), got $(@($result.Steps).Count)" }
+        $joinedSteps = @($result.Steps | ForEach-Object { $_.Arguments -join " " })
+        if (($joinedSteps[1] -notlike "*maya_camera_panels.py*") -or ($joinedSteps[1] -like "*maya_camera_panels_LR.py*")) { throw "step 1 should be the Front/Back panels script, got: $($joinedSteps[1])" }
+        if ($joinedSteps[7] -notlike "*maya_camera_panels_LR.py*") { throw "step 7 should be the Left/Right panels script, got: $($joinedSteps[7])" }
+        $obsSteps = @($joinedSteps | Where-Object { $_ -like "*maya_obs_capture.ps1*" })
+        if ($obsSteps.Count -ne 2) { throw "expected exactly 2 OBS capture steps (one per leg = two videos), got $($obsSteps.Count)" }
+        foreach ($o in $obsSteps) {
+            if ($o -notmatch "-StartFrame 10 -EndFrame 50") { throw "each leg's OBS step must carry the same range, got: $o" }
+        }
+
+        $frontBackRadio.IsChecked = $true
+        $result = Get-CaptureClickResult
+        if (@($result.Steps).Count -ne 6) { throw "Front/Back alone must still queue exactly one leg (6 steps), got $(@($result.Steps).Count)" }
+
+        $leftRightRadio.IsChecked = $true
+        $result = Get-CaptureClickResult
+        if (@($result.Steps).Count -ne 6) { throw "Left/Right alone must still queue exactly one leg (6 steps), got $(@($result.Steps).Count)" }
+        if ((@($result.Steps)[1].Arguments -join " ") -notlike "*maya_camera_panels_LR.py*") { throw "Left/Right alone must use the LR panels script" }
+    } finally {
+        $frontBackRadio.IsChecked = $true
+        $allFramesRadio.IsChecked = $true
+    }
+}
+
+Check "Axis: Preview with All runs ONLY the first leg (Front/Back); single axes unchanged; the cache build still runs both legs" {
+    # Item 4 follow-up (user decision 2026-09-24, option b). Each panel
+    # script closes all four claude_view_* windows on startup, so an All
+    # preview could only ever leave the LAST leg on screen; Preview now runs
+    # the first leg only. Hermetic on purpose: Get-CaptureSteps is a
+    # recorder returning one harmless ping step, Get-CleanResetStep is a
+    # ping too (the real one sends maya_clean_reset.py to whatever Maya is
+    # live), Test-MayaPortReachable is $false so the post-run cache refresh
+    # takes its early return, and the recenter file/range resolution are
+    # redirected -- nothing here touches Maya, OBS or the real state files.
+    $leftRightRadio = $window.FindName("LeftRightRadio")
+    $script:previewAxesSeen = @()
+    $script:recenterFrameTestPath = Join-Path $env:TEMP "rom_launcher_test_preview_axis.txt"
+    function Get-RecenterStartFramePath { return $script:recenterFrameTestPath }
+    function Get-ResolvedTimeRange { return [PSCustomObject]@{ Success = $true; Start = 0; End = 100; ErrorMessage = $null } }
+    function Test-MayaPortReachable { return $false }
+    function Show-DarkConfirm { return $true }
+    function Get-CleanResetStep { param([string]$ScriptDir) return ,@([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") }) }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        $script:previewAxesSeen += $Axis
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+    try {
+        # All -> Preview asks for the FrontBack leg only, and says so in the log.
+        $allAxisRadio.IsChecked = $true
+        $script:previewAxesSeen = @()
+        $previewButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        if (-not (Wait-ForStatus "Done" 15)) { throw "Preview (All) never reached Done, log:`n$($logBox.Text)" }
+        if ((@($script:previewAxesSeen) -join ",") -ne "FrontBack") { throw "Preview with All must request ONLY the FrontBack leg, got: '$(@($script:previewAxesSeen) -join ',')'" }
+        if ($logBox.Text -notmatch "first leg \(Front/Back\) only") { throw "expected the log to say Preview shows the first leg only, got:`n$($logBox.Text)" }
+
+        # Front/Back alone -> FrontBack, no note.
+        $frontBackRadio.IsChecked = $true
+        $script:previewAxesSeen = @()
+        $previewButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        if (-not (Wait-ForStatus "Done" 15)) { throw "Preview (Front/Back) never reached Done" }
+        if ((@($script:previewAxesSeen) -join ",") -ne "FrontBack") { throw "Preview with Front/Back must request FrontBack, got: '$(@($script:previewAxesSeen) -join ',')'" }
+        if ($logBox.Text -match "first leg") { throw "the first-leg note must only appear for All, got:`n$($logBox.Text)" }
+
+        # Left/Right alone -> LeftRight, unchanged.
+        $leftRightRadio.IsChecked = $true
+        $script:previewAxesSeen = @()
+        $previewButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        if (-not (Wait-ForStatus "Done" 15)) { throw "Preview (Left/Right) never reached Done" }
+        if ((@($script:previewAxesSeen) -join ",") -ne "LeftRight") { throw "Preview with Left/Right must request LeftRight, got: '$(@($script:previewAxesSeen) -join ',')'" }
+
+        # Regression: the cache build with All is UNCHANGED (still both legs).
+        $allAxisRadio.IsChecked = $true
+        $script:previewAxesSeen = @()
+        Confirm-AndBuildCache -DeleteExisting $false
+        if (-not (Wait-ForStatus "Done" 15)) { throw "cache build (All) never reached Done, log:`n$($logBox.Text)" }
+        if ((@($script:previewAxesSeen) -join ",") -ne "FrontBack,LeftRight") { throw "the cache build with All must still request both legs in order, got: '$(@($script:previewAxesSeen) -join ',')'" }
+    } finally {
+        $frontBackRadio.IsChecked = $true
+        $allFramesRadio.IsChecked = $true
+        Remove-Item $script:recenterFrameTestPath -ErrorAction SilentlyContinue
+    }
+}
+
 Check "Start/End selected with non-numeric input produces an error, no steps" {
     $startEndRadio.IsChecked = $true
     $startFrameBox.Text = "abc"
@@ -2040,12 +2159,34 @@ function Get-RecordingMonitorRectPath { return $script:frameGateTestRectPath }
 function Reset-FrameGateTestState {
     # max_w=200, panel width=1000 (rect 0..1000,0..1080 -> colWidth=500 for
     # 2 views -- use a rect that yields a round colWidth for easy hand math).
+    # frames/x_center/z_center/z_width added (2026-09-28) for the Frame gate
+    # OFF clipping-estimate tests below -- x_width kept EXACTLY as before so
+    # the pre-existing ON-mode (Get-FrameGateEffectiveOverflowPct) tests
+    # above stay byte-identical (Q-ON). x_center=[0,0,0,100] with
+    # x_width=[150,180,200,120]: at zoom0/offset0 (neededOrtho=212.5,
+    # halfOrtho=106.25) frames 0-2 all fit (widest pose, by design, always
+    # fits at zero drift/zero offset); frame 3's pose has drifted to
+    # center=100 with half-width=60, edges [40,160] vs allowed [-106.25,
+    # 106.25] -> overflow=53.75 -> P=25% (1 of 4 frames), W=53.75/212.5*100
+    # = 25.294...% ~ 25.3%. z_width kept tiny (10 throughout) so Left/Right
+    # never clips in this shared fixture -- isolates the Front/Back-only
+    # math cleanly; a dedicated small-array test below exercises Get-
+    # ClippingEstimateCore directly (no files at all) for the "All picks
+    # the worse axis" case, since mixing that into this shared per-file
+    # fixture would need a second cache entirely.
     Set-Content -Path $script:frameGateTestRectPath -Value "0,0,1000,1080" -Encoding ASCII
-    @{ x_width = @(150, 180, 200, 120) } | ConvertTo-Json | Set-Content -Path $script:frameGateTestCachePath -Encoding UTF8
+    @{ frames = @(0,1,2,3); x_width = @(150, 180, 200, 120); x_center = @(0,0,0,100); z_width = @(10,10,10,10); z_center = @(0,0,0,0) } | ConvertTo-Json | Set-Content -Path $script:frameGateTestCachePath -Encoding UTF8
     $script:lastCachePath = $script:frameGateTestCachePath
+    $script:cachedFrameArrays = $null   # invalidate the memoized parse -- a PRIOR test may have cached a DIFFERENT path/array under the same variable
     $zoomSlider.Value = 0
     $script:lastValidOffsetX = 0
     $previewButton.Effect = $null
+    # Isolation (2026-09-28): a PRIOR test could leave this unchecked --
+    # every existing Check in this section assumes gate ON (it tests the
+    # ON-mode path exclusively), and the new OFF-mode Checks below always
+    # set it explicitly themselves, so this default matters only as a
+    # defensive reset, same philosophy as zeroing zoom/offset above.
+    $frameGateCheckBox.IsChecked = $true
 }
 
 Check "Get-FrameGateEffectiveOverflowPct returns null when no cache path is known" {
@@ -2106,6 +2247,26 @@ Check "Start Recording's frame-gate check only prompts at the zero-tolerance flo
     function Update-PortStatusIndicator { return $true }
     function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
     function Test-RecordingMonitorSelected { return $true }
+    # Get-CacheStatus mocked too, not just Test-MayaPortReachable -- SAME
+    # underlying bug as the auto-reset test far above this one (search "Get-
+    # CacheStatus mocked too"): Start Recording sets $script:pendingCache
+    # Refresh, whose completion hook calls a REAL Update-CacheStatusIndicator
+    # once the healthy-state run below finishes. THAT function unconditionally
+    # resets $script:lastCachePath to $null before even looking at the
+    # result (see its own source, ~line 1108), then only its "Exists" branch
+    # repopulates it from $result.CachePath -- so unlike the auto-reset
+    # test's own "Missing" mock (which doesn't care about lastCachePath),
+    # THIS test needs "Exists" with CachePath pointed at the SAME synthetic
+    # cache Reset-FrameGateTestState already wrote, so the reset-then-
+    # repopulate round-trips back to the same value instead of leaving it
+    # null. Confirmed live (2026-09-28, with a real Maya reachable on port
+    # 7001): without any override here, the unmocked REAL Get-CacheStatus
+    # returns the REAL project cache, silently replacing $script:lastCachePath
+    # mid-test -- the zero-tolerance assertion below then flaked to "got 0
+    # confirm calls" because Get-FrameGateEffectiveOverflowPct read the wrong
+    # cache's max_w. This was the pre-existing non-hermetic test the task
+    # called out by name.
+    function Get-CacheStatus { return [PSCustomObject]@{ Status = "Exists"; AnimationReference = "D:/fake/frame_gate_test.ma"; CachePath = $script:frameGateTestCachePath; ErrorMessage = $null } }
     function Get-CaptureSteps {
         param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
         return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
@@ -2138,6 +2299,9 @@ Check "Start Recording's frame-gate check proceeds when the user clicks Continue
     function Update-PortStatusIndicator { return $true }
     function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
     function Test-RecordingMonitorSelected { return $true }
+    # See the previous Check's own comment ("Get-CacheStatus mocked too")
+    # for the full explanation -- same hermetic fix needed here.
+    function Get-CacheStatus { return [PSCustomObject]@{ Status = "Exists"; AnimationReference = "D:/fake/frame_gate_test.ma"; CachePath = $script:frameGateTestCachePath; ErrorMessage = $null } }
     function Get-CaptureSteps {
         param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
         return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
@@ -2153,9 +2317,380 @@ Check "Start Recording's frame-gate check proceeds when the user clicks Continue
     if (-not $reachedDone) { throw "expected the run to proceed after Continue Anyway, log:`n$($logBox.Text)" }
 }
 
+# --- Frame gate OFF: clipping estimator (2026-09-28) -------------------
+# Get-ClippingEstimateCore is pure math (no files, no WPF) -- tested
+# directly on hand-derived arrays first; Get-ClippingEstimate (the file-
+# reading wrapper) is then tested through the SAME Reset-FrameGateTestState
+# fixture the ON-mode tests above already use, hand-derived independently
+# below rather than trusting the source's own formula (see that function's
+# comment for the numbers: neededOrtho=(200/0.96)*1.02=212.5, halfOrtho=
+# 106.25 at zoom0).
+
+Check "Get-ClippingEstimateCore: no overflow anywhere -> 0%/0%" {
+    $result = Get-ClippingEstimateCore -CenterX @(0.0, 0.0, 0.0) -WidthX @(10.0, 10.0, 10.0) -CamPosX 0.0 -HalfOrtho 100.0 -StartIndex 0 -EndIndex 2
+    if ([Math]::Abs($result.PercentClipped - 0.0) -gt 1e-6) { throw "expected 0% clipped, got $($result.PercentClipped)" }
+    if ([Math]::Abs($result.WorstOverflowPct - 0.0) -gt 1e-6) { throw "expected 0% worst overflow, got $($result.WorstOverflowPct)" }
+}
+
+Check "Get-ClippingEstimateCore: one frame drifts past the fixed frame edge -> hand-derived P/W" {
+    # frame width = 2*50 = 100. Frames 0-2 sit at center=0 (half-width 5,
+    # inside +/-50 -- never clips). Frame 3 drifts to center=100, half=5 ->
+    # edges [95,105] vs allowed [-50,50] -> right overflow = 105-50 = 55.
+    # P = 1/4 = 25%. W = 55/100*100 = 55% exactly -- clean round numbers,
+    # deliberately chosen so there is no rounding ambiguity to hide a bug.
+    $result = Get-ClippingEstimateCore -CenterX @(0.0, 0.0, 0.0, 100.0) -WidthX @(10.0, 10.0, 10.0, 10.0) -CamPosX 0.0 -HalfOrtho 50.0 -StartIndex 0 -EndIndex 3
+    if ([Math]::Abs($result.PercentClipped - 25.0) -gt 1e-6) { throw "expected 25% clipped, got $($result.PercentClipped)" }
+    if ([Math]::Abs($result.WorstOverflowPct - 55.0) -gt 1e-6) { throw "expected 55% worst overflow, got $($result.WorstOverflowPct)" }
+}
+
+Check "Get-ClippingEstimate: FrontBack/LeftRight/All wired to the right cache arrays (hand-derived)" {
+    Reset-FrameGateTestState
+    # Front/Back (x): frame 3 (center=100, half-width=60) vs allowed
+    # [-106.25, 106.25] -> overflow 53.75 -> P=25%, W=53.75/212.5*100 =
+    # 25.294...%. Left/Right (z): all centers 0, half-width 5, never
+    # clips -> P=0%, W=0%. All picks the pair with the larger W, i.e.
+    # Front/Back here (25.3 > 0).
+    $fb = Get-ClippingEstimate -Axis FrontBack -ZoomPct 0 -OffsetXPx 0
+    if ([Math]::Abs($fb.PercentClipped - 25.0) -gt 0.1) { throw "FrontBack: expected P=25, got $($fb.PercentClipped)" }
+    if ([Math]::Abs($fb.WorstOverflowPct - 25.2941) -gt 0.1) { throw "FrontBack: expected W~25.29, got $($fb.WorstOverflowPct)" }
+
+    $lr = Get-ClippingEstimate -Axis LeftRight -ZoomPct 0 -OffsetXPx 0
+    if ([Math]::Abs($lr.PercentClipped - 0.0) -gt 1e-6) { throw "LeftRight: expected P=0, got $($lr.PercentClipped)" }
+    if ([Math]::Abs($lr.WorstOverflowPct - 0.0) -gt 1e-6) { throw "LeftRight: expected W=0, got $($lr.WorstOverflowPct)" }
+
+    $all = Get-ClippingEstimate -Axis All -ZoomPct 0 -OffsetXPx 0
+    if ([Math]::Abs($all.PercentClipped - $fb.PercentClipped) -gt 1e-6 -or [Math]::Abs($all.WorstOverflowPct - $fb.WorstOverflowPct) -gt 1e-6) {
+        throw "All: expected to match FrontBack (the worse axis pair) exactly, got P=$($all.PercentClipped) W=$($all.WorstOverflowPct)"
+    }
+}
+
+Check "Get-ClippingEstimate: a resolved range narrows the window AND moves the reference frame" {
+    Reset-FrameGateTestState
+    # Range [1,2]: excludes frame 3 (the only clipping frame) entirely, and
+    # re-anchors camPosX on frame 1's own center (still 0 here) -- expect a
+    # clean healthy 0%/0% result even though the UNBOUNDED whole-take call
+    # above found 25% clipped.
+    $ranged = Get-ClippingEstimate -Axis FrontBack -ZoomPct 0 -OffsetXPx 0 -RangeStart 1 -RangeEnd 2
+    if ([Math]::Abs($ranged.PercentClipped - 0.0) -gt 1e-6) { throw "expected 0% clipped when the clipping frame is outside the range, got $($ranged.PercentClipped)" }
+}
+
+# --- Frame gate OFF: glow (none/amber/red) ------------------------------
+$script:frameGateGlowTestCachePath = Join-Path $env:TEMP "rom_launcher_test_frame_gate_glow_cache.json"
+function Set-FrameGateGlowTestCache([double]$Frame1CenterX) {
+    # max_w=10 -> neededOrtho=(10/0.96)*1.02=10.625, halfOrtho=5.3125,
+    # frameWidth=10.625. Frame 0 always sits at center=0 (half=5, inside
+    # +/-5.3125 -- never clips, a safety margin so shifting frame 1 alone
+    # cleanly isolates each case). z arrays kept flat/tiny (never clips) --
+    # this test only exercises the Front/Back axis.
+    @{ frames = @(0,1); x_width = @(10.0, 10.0); x_center = @(0.0, $Frame1CenterX); z_width = @(10.0, 10.0); z_center = @(0.0, 0.0) } |
+        ConvertTo-Json | Set-Content -Path $script:frameGateGlowTestCachePath -Encoding UTF8
+    $script:lastCachePath = $script:frameGateGlowTestCachePath
+    $script:cachedFrameArrays = $null   # invalidate the memo -- see Get-CachedFrameArrays
+}
+
+Check "Update-FrameGateGlow (gate OFF): no glow when healthy, amber when tight, red past 2% worst overflow" {
+    Reset-FrameGateTestState
+    $frameGateCheckBox.IsChecked = $false
+    $frontBackRadio.IsChecked = $true
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 0
+
+    # Healthy: frame 1 at center=0, same as frame 0 -- never clips.
+    Set-FrameGateGlowTestCache -Frame1CenterX 0.0
+    Update-FrameGateGlow
+    if ($previewButton.Effect -ne $null) { throw "expected no glow when healthy (gate OFF, no clipping), got a glow" }
+    if ($previewButton.ToolTip -match "Frame gate OFF") { throw "expected the normal Preview tooltip when there is nothing to warn about, got '$($previewButton.ToolTip)'" }
+
+    # Amber: frame 1 at center=0.5 -> overflow 0.1875 -> W=1.7647...% (0-2%).
+    Set-FrameGateGlowTestCache -Frame1CenterX 0.5
+    Update-FrameGateGlow
+    if ($previewButton.Effect -eq $null) { throw "expected an amber glow at ~1.76% worst overflow" }
+    if ($previewButton.Effect.Color.R -ne 239) { throw "expected the amber color (R=239), got R=$($previewButton.Effect.Color.R)" }
+    if ($previewButton.ToolTip -notmatch "Frame gate OFF -- estimated clipping: 50% of frames, worst 1\.8% of frame width\.") { throw "unexpected tooltip wording: '$($previewButton.ToolTip)'" }
+
+    # Red: frame 1 at center=2 -> overflow 1.6875 -> W=15.88...% (>2%).
+    Set-FrameGateGlowTestCache -Frame1CenterX 2.0
+    Update-FrameGateGlow
+    if ($previewButton.Effect -eq $null) { throw "expected a red glow past 2% worst overflow" }
+    if ($previewButton.Effect.Color.R -ne 224) { throw "expected the red color (R=224), got R=$($previewButton.Effect.Color.R)" }
+    if ($previewButton.ToolTip -notmatch "Frame gate OFF -- estimated clipping: 50% of frames, worst 15\.9% of frame width\.") { throw "unexpected tooltip wording: '$($previewButton.ToolTip)'" }
+
+    Remove-Item $script:frameGateGlowTestCachePath -ErrorAction SilentlyContinue
+}
+
+Check "Frame gate checkbox writes _camera_frame_gate.txt on toggle (Success Criterion 1)" {
+    $testGatePath = Join-Path $env:TEMP "rom_launcher_test_frame_gate_state.txt"
+    function Get-FrameGatePath { return $testGatePath }
+    Remove-Item $testGatePath -ErrorAction SilentlyContinue
+
+    $frameGateCheckBox.IsChecked = $true
+    if ((Get-Content $testGatePath -Raw).Trim() -ne "1") { throw "expected '1' after checking, got '$((Get-Content $testGatePath -Raw))'" }
+    $frameGateCheckBox.IsChecked = $false
+    if ((Get-Content $testGatePath -Raw).Trim() -ne "0") { throw "expected '0' after unchecking, got '$((Get-Content $testGatePath -Raw))'" }
+    $frameGateCheckBox.IsChecked = $true
+    if ((Get-Content $testGatePath -Raw).Trim() -ne "1") { throw "expected '1' after re-checking, got '$((Get-Content $testGatePath -Raw))'" }
+    Remove-Item $testGatePath -ErrorAction SilentlyContinue
+}
+
+Check "Update-FrameGateGlow: ON path is untouched by the OFF branch (Q-ON regression)" {
+    # Guards against a future edit accidentally routing the ON path through
+    # the new OFF estimator -- re-runs the ORIGINAL ON-mode assertions
+    # (same numbers as the pre-existing "Update-FrameGateGlow: no effect
+    # when healthy..." Check above) with the gate explicitly ON.
+    Reset-FrameGateTestState
+    $frameGateCheckBox.IsChecked = $true
+    Update-FrameGateGlow
+    if ($previewButton.Effect -ne $null) { throw "ON path: expected no glow at the healthy default" }
+    $script:lastValidOffsetX = 40
+    Update-FrameGateGlow
+    if ($previewButton.Effect -eq $null -or $previewButton.Effect.Color.R -ne 224) { throw "ON path: expected the red zero-floor glow, got $($previewButton.Effect)" }
+    if ($previewButton.ToolTip -match "Frame gate OFF") { throw "ON path: tooltip must not show the OFF wording, got '$($previewButton.ToolTip)'" }
+}
+
+# --- Frame gate OFF: Start Recording's clipping prompt ------------------
+Check "Start Recording (gate OFF): only prompts past 2% worst overflow, and respects Cancel" {
+    Reset-FrameGateTestState
+    $frameGateCheckBox.IsChecked = $false
+    $frontBackRadio.IsChecked = $true
+    $allFramesRadio.IsChecked = $true
+    function Get-AnimationRange { return [PSCustomObject]@{ Success = $true; Start = 0; End = 3; ErrorMessage = $null } }
+    function Test-MayaPortReachable { return $true }
+    function Update-PortStatusIndicator { return $true }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    function Get-CacheStatus { return [PSCustomObject]@{ Status = "Exists"; AnimationReference = "D:/fake/frame_gate_test.ma"; CachePath = $script:frameGateTestCachePath; ErrorMessage = $null } }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    $script:offClipConfirmCalls = 0
+    function Show-DarkConfirm {
+        param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+        $script:offClipConfirmCalls++
+        return $false   # Cancel
+    }
+
+    # Healthy axis (Left/Right on this fixture never clips): no prompt.
+    (Get-Variable -Name window -Scope Script -ValueOnly).FindName("LeftRightRadio").IsChecked = $true
+    $script:currentProcess = $null
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $reachedDone = Wait-ForStatus "Done" 10
+    if (-not $reachedDone) { throw "expected the healthy-axis (Left/Right) run to complete without any prompt, log:`n$($logBox.Text)" }
+    if ($script:offClipConfirmCalls -ne 0) { throw "expected zero confirm calls on the non-clipping axis, got $($script:offClipConfirmCalls)" }
+
+    # Clipping axis (Front/Back, W~25.3% > 2%): prompted, run must NOT start.
+    $frontBackRadio.IsChecked = $true
+    $script:currentProcess = $null
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($script:offClipConfirmCalls -ne 1) { throw "expected exactly 1 confirm call on the clipping axis, got $($script:offClipConfirmCalls)" }
+    if ($script:currentProcess -ne $null) { throw "Cancel must abort before Start-Steps ever runs" }
+}
+
+Check "Start Recording (gate OFF): proceeds and logs the estimate when the user clicks Continue Anyway" {
+    Reset-FrameGateTestState
+    $frameGateCheckBox.IsChecked = $false
+    $frontBackRadio.IsChecked = $true
+    $allFramesRadio.IsChecked = $true
+    function Get-AnimationRange { return [PSCustomObject]@{ Success = $true; Start = 0; End = 3; ErrorMessage = $null } }
+    function Test-MayaPortReachable { return $true }
+    function Update-PortStatusIndicator { return $true }
+    function Get-ObsPasswordStatus { return [PSCustomObject]@{ Configured = $true } }
+    function Test-RecordingMonitorSelected { return $true }
+    function Get-CacheStatus { return [PSCustomObject]@{ Status = "Exists"; AnimationReference = "D:/fake/frame_gate_test.ma"; CachePath = $script:frameGateTestCachePath; ErrorMessage = $null } }
+    function Get-CaptureSteps {
+        param([string]$Axis, [bool]$Recording, [string]$ScriptDir, $StartFrame, $EndFrame)
+        return @([PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "1", "127.0.0.1") })
+    }
+    function Show-DarkConfirm {
+        param([string]$Message, [string]$Title, [string]$ConfirmLabel = "Confirm")
+        return $true   # Continue Anyway
+    }
+
+    $startRecordingButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    $reachedDone = Wait-ForStatus "Done" 10
+    if (-not $reachedDone) { throw "expected the run to proceed after Continue Anyway, log:`n$($logBox.Text)" }
+    if ($logBox.Text -notmatch "Frame gate OFF: fixed camera, estimated clipping 25% of frames \(worst 25\.3% of frame width\)\.") { throw "expected the estimate log line, got:`n$($logBox.Text)" }
+}
+
+# --- Tolerance box (2026-09-29, Part 3 -- override plumbing step) -------
+
+Check "Tolerance box starts at Auto; Commit-ToleranceValueBox writes/clamps/reverts/clears correctly" {
+    $testTolPath = Join-Path $env:TEMP "rom_launcher_test_tolerance_state.txt"
+    function Get-CameraTolerancePctPath { return $testTolPath }
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+
+    # Default state (matches the startup-reset block): Auto, no file written yet.
+    $toleranceValueBox.Text = "Auto"
+    $script:lastValidTolerancePct = $null
+
+    # Typing a valid in-range number writes it and normalizes the display text.
+    $toleranceValueBox.Text = "5.5"
+    Commit-ToleranceValueBox
+    if ((Get-Content $testTolPath -Raw).Trim() -ne "5.5") { throw "expected '5.5' written, got '$((Get-Content $testTolPath -Raw))'" }
+    if ($toleranceValueBox.Text -ne "5.5") { throw "expected display text '5.5', got '$($toleranceValueBox.Text)'" }
+
+    # Out-of-range clamps (both directions).
+    $toleranceValueBox.Text = "27"
+    Commit-ToleranceValueBox
+    if ((Get-Content $testTolPath -Raw).Trim() -ne "20") { throw "expected clamp to 20, got '$((Get-Content $testTolPath -Raw))'" }
+    $toleranceValueBox.Text = "-4"
+    Commit-ToleranceValueBox
+    if ((Get-Content $testTolPath -Raw).Trim() -ne "0") { throw "expected clamp to 0, got '$((Get-Content $testTolPath -Raw))'" }
+
+    # Unparseable garbage reverts to the last valid value, does not touch the file.
+    $beforeGarbage = (Get-Content $testTolPath -Raw).Trim()
+    $toleranceValueBox.Text = "not a number"
+    Commit-ToleranceValueBox
+    if ($toleranceValueBox.Text -ne $beforeGarbage) { throw "expected revert to '$beforeGarbage', got '$($toleranceValueBox.Text)'" }
+    if ((Get-Content $testTolPath -Raw).Trim() -ne $beforeGarbage) { throw "garbage input must not touch the file" }
+
+    # "Auto"/blank clears -- writes an EMPTY file, not the text "Auto".
+    $toleranceValueBox.Text = "Auto"
+    Commit-ToleranceValueBox
+    if ((Get-Content $testTolPath -Raw).Trim() -ne "") { throw "expected an empty file for Auto, got '$((Get-Content $testTolPath -Raw))'" }
+    $toleranceValueBox.Text = "3"
+    Commit-ToleranceValueBox
+    $toleranceValueBox.Text = ""
+    Commit-ToleranceValueBox
+    if ((Get-Content $testTolPath -Raw).Trim() -ne "") { throw "expected blank input to also clear to an empty file, got '$((Get-Content $testTolPath -Raw))'" }
+    if ($toleranceValueBox.Text -ne "Auto") { throw "expected display text to normalize blank back to 'Auto', got '$($toleranceValueBox.Text)'" }
+
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+    $toleranceValueBox.Text = "Auto"
+    $script:lastValidTolerancePct = $null
+}
+
+Check "Get-ClippingWarningThresholdPct: Auto is 2.0, a manual Tolerance value overrides it (Q4: reuse)" {
+    $testTolPath = Join-Path $env:TEMP "rom_launcher_test_tolerance_threshold.txt"
+    function Get-CameraTolerancePctPath { return $testTolPath }
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+
+    if ((Get-ClippingWarningThresholdPct) -ne 2.0) { throw "expected Auto (no file) to give the default 2.0 threshold" }
+    Set-Content -Path $testTolPath -Value "8" -Encoding ASCII
+    if ((Get-ClippingWarningThresholdPct) -ne 8.0) { throw "expected a manual value to override the default threshold" }
+
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+}
+
+Check "Get-FrameGateEffectiveOverflowPct: a manual Tolerance value bypasses the zoom/offset formula entirely" {
+    Reset-FrameGateTestState
+    $testTolPath = Join-Path $env:TEMP "rom_launcher_test_tolerance_bypass.txt"
+    function Get-CameraTolerancePctPath { return $testTolPath }
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+
+    # Auto first -- confirms this test's Reset-FrameGateTestState fixture still
+    # gives the SAME pre-existing ON-mode number as the ORIGINAL (Q-ON) test
+    # above, i.e. this new function's Auto path is unaffected by its own edit.
+    $zoomSlider.Value = 0
+    $autoResult = Get-FrameGateEffectiveOverflowPct
+
+    # A manual value must return EXACTLY manual/100, regardless of zoom --
+    # tries a zoom level far enough to change the Auto answer, to prove this
+    # is a real bypass and not a coincidence.
+    Set-Content -Path $testTolPath -Value "6.5" -Encoding ASCII
+    $zoomSlider.Value = 30
+    $manualResult = Get-FrameGateEffectiveOverflowPct
+    if ([Math]::Abs($manualResult - 0.065) -gt 1e-9) { throw "expected exactly 0.065 with manual=6.5, got $manualResult" }
+    if ($manualResult -eq $autoResult) { throw "test setup should have made Auto and manual disagree -- got the same value" }
+
+    Remove-Item $testTolPath -ErrorAction SilentlyContinue
+    $zoomSlider.Value = 0
+}
+
+# --- Tolerance readout (2026-09-29, Part 3 step 3) -----------------------
+# Validated against the REAL barM cache and the approved proposal's own
+# replica tables (d4_rom_final_proposals.md sec.3 evidence table + sec.4
+# trade-off table) -- these numbers were independently derived BEFORE this
+# readout was ever built (the proposal predates it), and the G+B algorithm
+# itself is already live-Maya-verified (gap 2, this same session). The
+# readout's own design deliberately never touches Maya (same "no round
+# trip needed" principle as the pre-existing glow) -- so matching these
+# real-cache, previously-live-verified numbers through Get-Tolerance
+# ReadoutEstimate's pure-PowerShell path is the correct-scoped verification
+# for THIS specific new code, not a live Maya run that has nothing to
+# exercise.
+$script:realBarmCachePath = Join-Path $ScriptDir "..\d4_anim_sample\barM_rom_anim__c1af6ac5752e.json"
+
+function Set-RealBarmCacheState {
+    Set-Content -Path $script:frameGateTestRectPath -Value "1920,0,3840,1080" -Encoding ASCII
+    $script:lastCachePath = $script:realBarmCachePath
+    $script:cachedFrameArrays = $null
+}
+
+Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom20/offset20 replica table (T=0/2/5/10/15) on the real barM cache" {
+    Set-RealBarmCacheState
+    $zoomSlider.Value = 20
+    $script:lastValidOffsetX = 20
+    # replica: keys / frames-over-T / worst-overflow, from d4_rom_final_proposals.md sec.4
+    $expected = @{
+        0  = @{ Keys = 480; OverT = 44.6; Worst = 20.7 }
+        2  = @{ Keys = 395; OverT = 35.7; Worst = 17.9 }
+        5  = @{ Keys = 298; OverT = 16.5; Worst = 15.7 }
+        10 = @{ Keys = 111; OverT = 11.4; Worst = 12.1 }
+        15 = @{ Keys = 70;  OverT = 10.4; Worst = 17.1 }
+    }
+    foreach ($t in $expected.Keys) {
+        $result = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct ([double]$t)
+        $exp = $expected[$t]
+        if ($result.Keys -ne $exp.Keys) { throw "T=$t%: expected $($exp.Keys) keys, got $($result.Keys)" }
+        if ([Math]::Abs($result.PercentOverTolerance - $exp.OverT) -gt 0.1) { throw "T=$t%: expected $($exp.OverT)% over tolerance, got $($result.PercentOverTolerance)" }
+        if ([Math]::Abs($result.WorstOverflowPct - $exp.Worst) -gt 0.1) { throw "T=$t%: expected $($exp.Worst)% worst overflow, got $($result.WorstOverflowPct)" }
+    }
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 0
+}
+
+Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom0/offset20 replica row (T=0/2/5/10/15) on the real barM cache" {
+    Set-RealBarmCacheState
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 20
+    # replica: d4_rom_final_proposals.md sec.4 trade-off table, second row
+    $expected = @{
+        0  = @{ Keys = 97; OverT = 11.8; Worst = 2.1 }
+        2  = @{ Keys = 70; OverT = 11.1; Worst = 4.1 }
+        5  = @{ Keys = 30; OverT = 7.0;  Worst = 7.1 }
+        10 = @{ Keys = 14; OverT = 2.5;  Worst = 12.1 }
+        15 = @{ Keys = 8;  OverT = 2.3;  Worst = 17.1 }
+    }
+    foreach ($t in $expected.Keys) {
+        $result = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct ([double]$t)
+        $exp = $expected[$t]
+        if ($result.Keys -ne $exp.Keys) { throw "zoom0 T=$t%: expected $($exp.Keys) keys, got $($result.Keys)" }
+        if ([Math]::Abs($result.PercentOverTolerance - $exp.OverT) -gt 0.1) { throw "zoom0 T=$t%: expected $($exp.OverT)% over tolerance, got $($result.PercentOverTolerance)" }
+        if ([Math]::Abs($result.WorstOverflowPct - $exp.Worst) -gt 0.1) { throw "zoom0 T=$t%: expected $($exp.Worst)% worst overflow, got $($result.WorstOverflowPct)" }
+    }
+    $script:lastValidOffsetX = 0
+}
+
+Check "Get-ToleranceReadoutEstimate Auto matches Get-FrameGateEffectiveOverflowPct's own zoom-only formula (regression: readout's Auto path is not a second, diverging formula)" {
+    Set-RealBarmCacheState
+    $zoomSlider.Value = 20
+    $script:lastValidOffsetX = 0
+    $autoResult = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct $null
+    if ($autoResult.Keys -ne 480) { throw "Auto at zoom20/offset0 should match the T=0 replica exactly (Auto's own formula clamps to 0 here), got $($autoResult.Keys) keys" }
+    $zoomSlider.Value = 0
+}
+
+Check "Get-ToleranceReadoutEstimate: All axis picks the worse-worst-overflow pair with its OWN P (not a per-frame mix), on a small hand-derived fixture" {
+    Reset-FrameGateTestState
+    # Reuses the shared fixture: x half-widths up to 100 vs halfOrtho 106.25
+    # (frame 3 clips per Reset-FrameGateTestState's own comment); z_width is
+    # tiny (10) throughout, so Left/Right never clips here -- "All" must
+    # therefore report exactly the FrontBack numbers, not some blend.
+    $fb = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct 0 -OffsetXPx 0 -ManualTolerancePct 0.0
+    $all = Get-ToleranceReadoutEstimate -Axis "All" -ZoomPct 0 -OffsetXPx 0 -ManualTolerancePct 0.0
+    if ($all.Keys -ne $fb.Keys -or [Math]::Abs($all.WorstOverflowPct - $fb.WorstOverflowPct) -gt 1e-9) {
+        throw "expected All to exactly match FrontBack when LeftRight never clips, got Keys=$($all.Keys)/W=$($all.WorstOverflowPct) vs FB Keys=$($fb.Keys)/W=$($fb.WorstOverflowPct)"
+    }
+}
+
 Remove-Item $script:frameGateTestCachePath -ErrorAction SilentlyContinue
 Remove-Item $script:frameGateTestRectPath -ErrorAction SilentlyContinue
+Remove-Item $script:frameGateGlowTestCachePath -ErrorAction SilentlyContinue
 $script:lastCachePath = $null
+$script:cachedFrameArrays = $null
+$frameGateCheckBox.IsChecked = $true
+Write-FrameGateEnabled -Enabled $true
 
 Write-Output "$passed passed, $($failures.Count) failed"
 foreach ($f in $failures) { Write-Output "FAIL: $f" }

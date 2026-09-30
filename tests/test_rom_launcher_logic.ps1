@@ -451,6 +451,102 @@ Check "Get-StartRecordingRequirementFailures reports all three at once, in order
     if ($result[2] -notmatch "^Recording Monitor") { throw "expected Recording Monitor third, got '$($result[2])'" }
 }
 
+Check "Get-CaptureStepsForAxis with FrontBack/LeftRight is byte-identical to calling Get-CaptureSteps directly" {
+    foreach ($axis in @("FrontBack", "LeftRight")) {
+        foreach ($recording in @($true, $false)) {
+            $direct = Get-CaptureSteps -Axis $axis -Recording $recording -ScriptDir $ScriptDir
+            $viaWrapper = Get-CaptureStepsForAxis -Axis $axis -Recording $recording -ScriptDir $ScriptDir
+            # ${name} braces on purpose: "$recording:" inside a double-quoted
+            # string parses as a drive-qualified variable (like $env:PATH)
+            # and is a hard parse error, not a runtime one.
+            if ($direct.Count -ne $viaWrapper.Count) { throw "${axis}/Recording=${recording}: step count differs ($($direct.Count) vs $($viaWrapper.Count))" }
+            for ($i = 0; $i -lt $direct.Count; $i++) {
+                if (($direct[$i].Arguments -join " ") -ne ($viaWrapper[$i].Arguments -join " ")) {
+                    throw "${axis}/Recording=${recording} step $i differs between Get-CaptureSteps and Get-CaptureStepsForAxis"
+                }
+            }
+        }
+    }
+}
+
+Check "Get-CaptureStepsForAxis with All concatenates FrontBack then LeftRight as two independent record cycles" {
+    $steps = Get-CaptureStepsForAxis -Axis "All" -Recording $true -ScriptDir $ScriptDir
+    if ($steps.Count -ne 12) { throw "expected 12 steps (6 FrontBack + 6 LeftRight), got $($steps.Count)" }
+    # First leg: identical to a standalone FrontBack capture (steps 0-5).
+    if (-not (ArgsHave $steps[1].Arguments "maya_camera_panels.py")) { throw "step 1 should open front/back panels" }
+    if (ArgsHave $steps[1].Arguments "maya_camera_panels_LR.py") { throw "step 1 must be the FrontBack panels script, not LR" }
+    if (-not (ArgsHave $steps[4].Arguments "maya_obs_capture.ps1")) { throw "step 4 should be the first leg's own OBS capture" }
+    if (-not (ArgsHave $steps[5].Arguments "show")) { throw "step 5 should restore the taskbar after the first leg" }
+    # Second leg: a full, independent LeftRight capture (steps 6-11) -- its
+    # own hide/OBS-start/OBS-stop/show, not sharing the first leg's.
+    if (-not (ArgsHave $steps[6].Arguments "hide")) { throw "step 6 should hide the taskbar again for the second leg" }
+    if (-not (ArgsHave $steps[7].Arguments "maya_camera_panels_LR.py")) { throw "step 7 should open left/right panels" }
+    if (-not (ArgsHave $steps[8].Arguments "maya_key_from_cache_LR.py")) { throw "step 8 should key from cache (left/right)" }
+    if (-not (ArgsHave $steps[10].Arguments "maya_obs_capture.ps1")) { throw "step 10 should be the second leg's own OBS capture" }
+    if (-not (ArgsHave $steps[11].Arguments "show")) { throw "step 11 should restore the taskbar after the second leg" }
+}
+
+Check "Get-CaptureStepsForAxis with All and Recording false (Preview/Run Only) has no OBS/taskbar in either leg" {
+    $steps = Get-CaptureStepsForAxis -Axis "All" -Recording $false -ScriptDir $ScriptDir
+    if ($steps.Count -ne 4) { throw "expected 4 steps (2 FrontBack + 2 LeftRight), got $($steps.Count)" }
+    if (-not (ArgsHave $steps[0].Arguments "maya_camera_panels.py")) { throw "step 0 should open front/back panels" }
+    if (-not (ArgsHave $steps[2].Arguments "maya_camera_panels_LR.py")) { throw "step 2 should open left/right panels" }
+    foreach ($s in $steps) {
+        if ((ArgsHave $s.Arguments "taskbar_control") -or (ArgsHave $s.Arguments "maya_obs_capture")) {
+            throw "All in run-only mode must not touch taskbar or OBS in either leg"
+        }
+    }
+}
+
+Check "Get-CaptureStepsForAxis with All passes the same StartFrame/EndFrame to both legs' OBS step" {
+    $steps = Get-CaptureStepsForAxis -Axis "All" -Recording $true -ScriptDir $ScriptDir -StartFrame 10 -EndFrame 50
+    $firstLegObs = $steps[4]
+    $secondLegObs = $steps[10]
+    if (-not (ArgsHave $firstLegObs.Arguments "-StartFrame 10")) { throw "first leg OBS step missing -StartFrame 10: $($firstLegObs.Arguments -join ' ')" }
+    if (-not (ArgsHave $firstLegObs.Arguments "-EndFrame 50")) { throw "first leg OBS step missing -EndFrame 50: $($firstLegObs.Arguments -join ' ')" }
+    if (-not (ArgsHave $secondLegObs.Arguments "-StartFrame 10")) { throw "second leg OBS step missing -StartFrame 10: $($secondLegObs.Arguments -join ' ')" }
+    if (-not (ArgsHave $secondLegObs.Arguments "-EndFrame 50")) { throw "second leg OBS step missing -EndFrame 50: $($secondLegObs.Arguments -join ' ')" }
+}
+
+Check "Get-PreviewAxis maps All to FrontBack (first leg only) and leaves the single axes alone" {
+    # User decision 2026-09-24 (option b): Preview with All shows only the
+    # first leg, because the two panel sets cannot coexist.
+    if ((Get-PreviewAxis -Axis "All") -ne "FrontBack") { throw "All must preview as FrontBack, got '$(Get-PreviewAxis -Axis 'All')'" }
+    if ((Get-PreviewAxis -Axis "FrontBack") -ne "FrontBack") { throw "FrontBack must stay FrontBack" }
+    if ((Get-PreviewAxis -Axis "LeftRight") -ne "LeftRight") { throw "LeftRight must stay LeftRight" }
+}
+
+Check "Get-PreviewAxis rejects an unknown axis" {
+    $threw = $false
+    try { Get-PreviewAxis -Axis "Diagonal" } catch { $threw = $true }
+    if (-not $threw) { throw "expected ValidateSet to reject an axis other than FrontBack/LeftRight/All" }
+}
+
+Check "Preview steps for All (through Get-PreviewAxis) are the Front/Back leg only; Start Recording steps for All still have both legs" {
+    $preview = Get-CaptureStepsForAxis -Axis (Get-PreviewAxis -Axis "All") -Recording $false -ScriptDir $ScriptDir
+    if ($preview.Count -ne 2) { throw "expected 2 preview steps (Front/Back panels + keyer), got $($preview.Count)" }
+    if (-not (ArgsHave $preview[0].Arguments "maya_camera_panels.py")) { throw "preview step 0 should open the Front/Back panels" }
+    foreach ($s in $preview) {
+        if (ArgsHave $s.Arguments "_LR.py") { throw "an All preview must not include any Left/Right (_LR) script, got: $($s.Arguments -join ' ')" }
+    }
+    $recording = Get-CaptureStepsForAxis -Axis "All" -Recording $true -ScriptDir $ScriptDir
+    if ($recording.Count -ne 12) { throw "Start Recording with All must still queue both legs (12 steps), got $($recording.Count)" }
+    # Cache build goes through Get-CaptureStepsForAxis directly (no
+    # Get-PreviewAxis), so All there stays both legs too.
+    $cacheBuild = Get-CaptureStepsForAxis -Axis "All" -Recording $false -ScriptDir $ScriptDir
+    if ($cacheBuild.Count -ne 4) { throw "cache build with All must still queue both legs (4 steps), got $($cacheBuild.Count)" }
+}
+
+Check "Get-CaptureStepsForAxis rejects an unknown axis the same way Get-CaptureSteps does" {
+    $threw = $false
+    try {
+        Get-CaptureStepsForAxis -Axis "Diagonal" -Recording $true -ScriptDir $ScriptDir
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) { throw "expected ValidateSet to reject an axis other than FrontBack/LeftRight/All" }
+}
+
 Write-Output "$passed passed, $($failures.Count) failed"
 foreach ($f in $failures) { Write-Output "FAIL: $f" }
 if ($failures.Count -gt 0) { exit 1 } else { exit 0 }

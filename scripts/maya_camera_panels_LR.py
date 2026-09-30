@@ -136,6 +136,20 @@ def get_zoom_pct():
         return ZOOM_PCT
 
 
+def get_manual_tolerance_pct():
+    """See maya_camera_panels.py for the full explanation. Same shared
+    _camera_tolerance_pct.txt file as the front/back panel script."""
+    path = os.path.join(CACHE_DIR, '_camera_tolerance_pct.txt')
+    try:
+        with open(path) as f:
+            content = f.read().lstrip(chr(0xFEFF)).strip()
+        if not content:
+            return None
+        return float(content)
+    except (IOError, OSError, ValueError):
+        return None
+
+
 def get_pixel_offset():
     """See maya_camera_panels.py for the full explanation. Same shared
     _camera_offset_px.txt file as the front/back panel script."""
@@ -238,10 +252,15 @@ def compute_margin_px(world_h, panel_w, panel_h):
     return margin, max_w, needed_ortho
 
 
-def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width):
+def compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, panel_width, manual_pct=None):
     """See maya_camera_panels.py for the full derivation. BUG FIXED
     2026-09-08: now also accounts for the pixel offset eating into margin
-    asymmetrically -- see that file's copy for the full writeup."""
+    asymmetrically -- see that file's copy for the full writeup. Manual
+    override (2026-09-29): see that file's copy for the full explanation --
+    identical here, manual_pct bypasses the formula and its zero floor
+    entirely when not None."""
+    if manual_pct is not None:
+        return manual_pct / 100.0
     final_ortho = needed_ortho * (1.0 - zoom_pct / 100.0)
     if final_ortho <= 0:
         return 0.0
@@ -391,6 +410,12 @@ def apply_mesh_only_display(panel):
                       # and isn't something the recording can fix after the
                       # fact.
                       headsUpDisplay=False,
+                      # Backface culling on this capture panel only (viewport
+                      # display flag, not a scene/mesh edit) -- requested so
+                      # back-facing geometry never renders into the ROM
+                      # capture video. Reversible, panel-scoped, matches every
+                      # other display flag on this same call.
+                      backfaceCulling=True,
                       rendererName='vp2Renderer')
 
 
@@ -520,12 +545,20 @@ def open_view_panels():
     if offset_x_px or offset_y_px:
         print('Pixel offset: X=%+.0f Y=%+.0f' % (offset_x_px, offset_y_px))
 
-    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, offset_x_px, col_width)
+    # offset_x_px=0.0 here, NOT the real offset -- see maya_camera_panels.py's
+    # own copy of this call for the full explanation (G, 2026-09-28): the
+    # guard tolerance handed to the keyer is zoom-only now.
+    # Manual tolerance override (2026-09-29) -- see maya_camera_panels.py's
+    # own copy of this call for the full explanation.
+    manual_tolerance_pct = get_manual_tolerance_pct()
+    effective_overflow_pct = compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, 0.0, col_width, manual_tolerance_pct)
     write_effective_overflow_pct(effective_overflow_pct)
-    if abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
+    if manual_tolerance_pct is not None:
+        print('Manual tolerance override: %.2f%% (auto would have been %.2f%%)' % (effective_overflow_pct * 100, compute_effective_overflow_pct(max_w, needed_ortho, zoom_pct, 0.0, col_width) * 100))
+    elif abs(effective_overflow_pct - EDGE_OVERFLOW_PCT) > 1e-6:
         print('Effective drift tolerance at this zoom/offset: %.2f%% (base %.2f%%)' % (effective_overflow_pct * 100, EDGE_OVERFLOW_PCT * 100))
-        if effective_overflow_pct <= 1e-6:
-            print('WARNING: current zoom/offset leaves ZERO drift tolerance -- the widest pose may clip regardless of tracking. Reduce zoom-in or offset magnitude if clipping is visible.')
+    if effective_overflow_pct <= 1e-6:
+        print('WARNING: zero drift tolerance in effect -- a pose wider than the frame will clip regardless of tracking. Reduce zoom-in, or raise the manual Tolerance value, if clipping is visible.')
 
     close_all_view_panels()
 

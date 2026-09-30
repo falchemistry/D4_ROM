@@ -59,6 +59,57 @@ function Get-CaptureSteps {
     return $steps
 }
 
+function Get-CaptureStepsForAxis {
+    # Thin wrapper around Get-CaptureSteps that adds the "All" axis choice:
+    # Front/Back immediately followed by Left/Right, as two independent
+    # step sequences concatenated back to back. Each Get-CaptureSteps call
+    # is already fully self-contained when $Recording is true (its own
+    # taskbar hide/show and its own maya_obs_capture.ps1 start/stop), so
+    # concatenating two of them is exactly two independent OBS record
+    # cycles -- i.e. two video files -- with zero new orchestration code.
+    # This mirrors the concatenation pattern already proven in
+    # tests\test_rom_launcher_logic.ps1 ("every step uses -ExecutionPolicy
+    # Bypass" builds $allSteps the same way). Get-CaptureSteps itself is
+    # deliberately left untouched (still only "FrontBack"/"LeftRight") so
+    # none of its existing callers or tests change behavior.
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")]
+        [string]$Axis,
+        [Parameter(Mandatory=$true)][bool]$Recording,
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [Nullable[int]]$StartFrame = $null,
+        [Nullable[int]]$EndFrame = $null
+    )
+
+    if ($Axis -ne "All") {
+        return Get-CaptureSteps -Axis $Axis -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
+    }
+
+    $steps = @()
+    $steps += Get-CaptureSteps -Axis "FrontBack" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
+    $steps += Get-CaptureSteps -Axis "LeftRight" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
+    return $steps
+}
+
+function Get-PreviewAxis {
+    # Which axis Preview actually runs for the selected Axis radio.
+    # User decision (2026-09-24, option b): with "All" selected, Preview
+    # shows ONLY the first leg (Front/Back). Reason: every panel script
+    # closes ALL four known claude_view_* windows on startup
+    # (ALL_KNOWN_VIEWS is shared by maya_camera_panels.py and _LR.py), so
+    # the two panel sets can never coexist -- an "All" preview would just
+    # open Front/Back and then immediately replace it with Left/Right,
+    # leaving the artist looking at the LAST leg only. Start Recording and
+    # the cache build keep using the real axis (All = both legs); only
+    # Preview goes through this.
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")]
+        [string]$Axis
+    )
+    if ($Axis -eq "All") { return "FrontBack" }
+    return $Axis
+}
+
 function Get-CleanResetStep {
     param(
         [Parameter(Mandatory=$true)][string]$ScriptDir
