@@ -129,15 +129,27 @@ Check "Get-PortSnippetContent reads the real open_maya_port.py file" {
     if ($content -notmatch ":7001") { throw "expected the snippet to mention port 7001: $content" }
 }
 
-Check "Get-StopCleanupSteps stops Maya playback, restores taskbar, stops OBS -- in that order" {
+Check "Get-StopCleanupSteps stops Maya playback, restores HUD, restores taskbar, stops OBS -- in that order" {
     $steps = Get-StopCleanupSteps -ScriptDir $ScriptDir
-    if ($steps.Count -ne 3) { throw "expected 3 cleanup steps, got $($steps.Count)" }
+    if ($steps.Count -ne 4) { throw "expected 4 cleanup steps, got $($steps.Count)" }
     if (-not (ArgsHave $steps[0].Arguments "maya_stop_playback.py")) { throw "step 0 should stop Maya playback" }
     if (-not (ArgsHave $steps[0].Arguments "send_to_maya.ps1")) { throw "step 0 should route through send_to_maya.ps1, same as every other Maya-touching step" }
-    if (-not (ArgsHave $steps[1].Arguments "taskbar_control.ps1")) { throw "step 1 should touch the taskbar" }
-    if (-not (ArgsHave $steps[1].Arguments "show")) { throw "step 1 should SHOW the taskbar, not hide it" }
-    if (-not (ArgsHave $steps[2].Arguments "obs_control.ps1")) { throw "step 2 should touch OBS" }
-    if (-not (ArgsHave $steps[2].Arguments "stop")) { throw "step 2 should STOP OBS recording, not start it" }
+    if (-not (ArgsHave $steps[1].Arguments "maya_restore_hud.py")) { throw "step 1 should restore the Maya HUD" }
+    if (-not (ArgsHave $steps[1].Arguments "send_to_maya.ps1")) { throw "step 1 should also route through send_to_maya.ps1" }
+    if (-not (ArgsHave $steps[2].Arguments "taskbar_control.ps1")) { throw "step 2 should touch the taskbar" }
+    if (-not (ArgsHave $steps[2].Arguments "show")) { throw "step 2 should SHOW the taskbar, not hide it" }
+    if (-not (ArgsHave $steps[3].Arguments "obs_control.ps1")) { throw "step 3 should touch OBS" }
+    if (-not (ArgsHave $steps[3].Arguments "stop")) { throw "step 3 should STOP OBS recording, not start it" }
+}
+
+Check "Get-StopCleanupSteps's HUD restore step runs before the taskbar/OBS restore, mirroring the stop-playback step" {
+    # Regression guard specifically for the new step (task17, 2026-09-30):
+    # both Maya-command-port steps (stop playback, restore HUD) should be
+    # grouped first, ahead of the taskbar/OBS steps that don't touch Maya
+    # at all.
+    $steps = Get-StopCleanupSteps -ScriptDir $ScriptDir
+    $mayaStepIndices = @(0..($steps.Count - 1)) | Where-Object { ArgsHave $steps[$_].Arguments "send_to_maya.ps1" }
+    if (($mayaStepIndices | Sort-Object) -join "," -ne "0,1") { throw "expected the two Maya-touching steps at indices 0,1, got: $($mayaStepIndices -join ',')" }
 }
 
 Check "Get-StopCleanupSteps also uses -ExecutionPolicy Bypass, same as every other step" {
@@ -545,6 +557,256 @@ Check "Get-CaptureStepsForAxis rejects an unknown axis the same way Get-CaptureS
         $threw = $true
     }
     if (-not $threw) { throw "expected ValidateSet to reject an axis other than FrontBack/LeftRight/All" }
+}
+
+# --- Arrow / wheel stepping (task48, 2026-10-07) --------------------------
+# Get-SteppedNumber / Get-NumericFieldSpec / Get-SteppedTolerance /
+# Get-SteppedFrameText are the pure core of the Up/Down + wheel stepping on
+# every numeric box; the launcher's handlers only add the key/modifier read.
+
+function StepEq($actual, $expected, [string]$what) {
+    # Exact comparison on purpose: a drifted 0.30000000000000004 must FAIL.
+    if ($null -eq $actual -or $actual -isnot [double] -or $actual -ne $expected) { throw "$what`: expected $expected, got '$actual' ($(if ($null -ne $actual) { $actual.GetType().Name }))" }
+}
+
+Check "Get-NumericFieldSpec holds exactly the user-approved step table and ranges" {
+    $rows = @(
+        @("Zoom", 10, 100, 1, -50, 50, 0),
+        @("OffsetX", 10, 100, 1, $null, $null, 0),
+        @("OffsetY", 10, 100, 1, $null, $null, 0),
+        @("Tolerance", 1, 10, 0.1, 0, 20, 1),
+        @("StartFrame", 1, 10, 1, [int]::MinValue, [int]::MaxValue, 0),
+        @("EndFrame", 1, 10, 1, [int]::MinValue, [int]::MaxValue, 0)
+    )
+    foreach ($r in $rows) {
+        $s = Get-NumericFieldSpec -Field $r[0]
+        if ($s.Plain -ne $r[1] -or $s.Shift -ne $r[2] -or $s.Ctrl -ne $r[3]) { throw "$($r[0]): steps $($s.Plain)/$($s.Shift)/$($s.Ctrl) != $($r[1])/$($r[2])/$($r[3])" }
+        if ($s.Min -ne $r[4] -or $s.Max -ne $r[5]) { throw "$($r[0]): range $($s.Min)..$($s.Max) != $($r[4])..$($r[5])" }
+        if ($s.Decimals -ne $r[6]) { throw "$($r[0]): decimals $($s.Decimals) != $($r[6])" }
+    }
+}
+
+Check "Get-SteppedNumber Zoom: plain 10, Shift 100 clamps to the limit, Ctrl 1, both modifiers -> Ctrl wins, both range ends" {
+    StepEq (Get-SteppedNumber -Current 0 -Direction 1 -Field Zoom) 10.0 "zoom up plain"
+    StepEq (Get-SteppedNumber -Current 0 -Direction -1 -Field Zoom) -10.0 "zoom down plain"
+    StepEq (Get-SteppedNumber -Current 0 -Direction 1 -Field Zoom -Shift $true) 50.0 "zoom up shift clamps to 50"
+    StepEq (Get-SteppedNumber -Current 0 -Direction -1 -Field Zoom -Shift $true) -50.0 "zoom down shift clamps to -50"
+    StepEq (Get-SteppedNumber -Current 7 -Direction 1 -Field Zoom -Ctrl $true) 8.0 "zoom up ctrl"
+    StepEq (Get-SteppedNumber -Current 7 -Direction -1 -Field Zoom -Ctrl $true) 6.0 "zoom down ctrl"
+    StepEq (Get-SteppedNumber -Current 7 -Direction 1 -Field Zoom -Shift $true -Ctrl $true) 8.0 "zoom shift+ctrl: Ctrl wins"
+    StepEq (Get-SteppedNumber -Current 50 -Direction 1 -Field Zoom) 50.0 "zoom stays at +50"
+    StepEq (Get-SteppedNumber -Current -50 -Direction -1 -Field Zoom) -50.0 "zoom stays at -50"
+    StepEq (Get-SteppedNumber -Current 45 -Direction 1 -Field Zoom) 50.0 "zoom 45 + 10 clamps to 50"
+    StepEq (Get-SteppedNumber -Current -45 -Direction -1 -Field Zoom) -50.0 "zoom -45 - 10 clamps to -50"
+    StepEq (Get-SteppedNumber -Current 3 -Direction -1 -Field Zoom) -7.0 "zoom crosses zero (non-step-aligned start)"
+}
+
+Check "Get-SteppedNumber OffsetX/OffsetY: plain 10, Shift 100, Ctrl 1, unbounded, non-step-aligned start" {
+    foreach ($f in @("OffsetX", "OffsetY")) {
+        StepEq (Get-SteppedNumber -Current 7 -Direction 1 -Field $f) 17.0 "$f 7 -> 17"
+        StepEq (Get-SteppedNumber -Current 0 -Direction -1 -Field $f) -10.0 "$f 0 -> -10"
+        StepEq (Get-SteppedNumber -Current 0 -Direction 1 -Field $f -Shift $true) 100.0 "$f shift up"
+        StepEq (Get-SteppedNumber -Current 0 -Direction -1 -Field $f -Shift $true) -100.0 "$f shift down"
+        StepEq (Get-SteppedNumber -Current 5 -Direction 1 -Field $f -Ctrl $true) 6.0 "$f ctrl up"
+        StepEq (Get-SteppedNumber -Current 5 -Direction -1 -Field $f -Shift $true -Ctrl $true) 4.0 "$f shift+ctrl: Ctrl wins"
+        StepEq (Get-SteppedNumber -Current 100000 -Direction 1 -Field $f -Shift $true) 100100.0 "$f has no upper limit"
+        StepEq (Get-SteppedNumber -Current -100000 -Direction -1 -Field $f -Shift $true) -100100.0 "$f has no lower limit"
+    }
+}
+
+Check "Get-SteppedNumber Tolerance: plain 1, Shift 10, Ctrl 0.1, clamped 0..20, no float drift" {
+    StepEq (Get-SteppedNumber -Current 5 -Direction 1 -Field Tolerance) 6.0 "tol up plain"
+    StepEq (Get-SteppedNumber -Current 5 -Direction -1 -Field Tolerance) 4.0 "tol down plain"
+    StepEq (Get-SteppedNumber -Current 5 -Direction 1 -Field Tolerance -Shift $true) 15.0 "tol up shift"
+    StepEq (Get-SteppedNumber -Current 15 -Direction 1 -Field Tolerance -Shift $true) 20.0 "tol up shift clamps to 20"
+    StepEq (Get-SteppedNumber -Current 5 -Direction -1 -Field Tolerance -Shift $true) 0.0 "tol down shift clamps to 0"
+    StepEq (Get-SteppedNumber -Current 0 -Direction -1 -Field Tolerance) 0.0 "tol Down at 0 stays 0"
+    StepEq (Get-SteppedNumber -Current 20 -Direction 1 -Field Tolerance) 20.0 "tol Up at 20 stays 20"
+    StepEq (Get-SteppedNumber -Current 0.2 -Direction 1 -Field Tolerance -Ctrl $true) 0.3 "tol 0.2 + 0.1 must be exactly 0.3"
+    StepEq (Get-SteppedNumber -Current 5 -Direction 1 -Field Tolerance -Shift $true -Ctrl $true) 5.1 "tol shift+ctrl: Ctrl wins"
+    $v = 0.0
+    for ($i = 0; $i -lt 10; $i++) { $v = Get-SteppedNumber -Current $v -Direction 1 -Field Tolerance -Ctrl $true }
+    StepEq $v 1.0 "ten 0.1 steps from 0 must land exactly on 1.0 (drift)"
+    for ($i = 0; $i -lt 3; $i++) { $v = Get-SteppedNumber -Current $v -Direction -1 -Field Tolerance -Ctrl $true }
+    StepEq $v 0.7 "three 0.1 steps down from 1.0 must land exactly on 0.7"
+    StepEq (Get-SteppedNumber -Current 19.95 -Direction 1 -Field Tolerance -Ctrl $true) 20.0 "tol 19.95 + 0.1 clamps to 20"
+}
+
+Check "Get-SteppedNumber rejects direction 0 and an unknown field" {
+    # Positive control first: a missing function would also "throw" below.
+    StepEq (Get-SteppedNumber -Current 0 -Direction 1 -Field Zoom) 10.0 "control call works"
+    $threw = $false
+    try { Get-SteppedNumber -Current 0 -Direction 0 -Field Zoom } catch { $threw = $true }
+    if (-not $threw) { throw "expected Direction 0 to be rejected" }
+    $threw = $false
+    try { Get-SteppedNumber -Current 0 -Direction 1 -Field Bogus } catch { $threw = $true }
+    if (-not $threw) { throw "expected an unknown field to be rejected" }
+}
+
+Check "Get-SteppedTolerance Auto rule: start from Auto's effective value (1.0 if none) THEN step; Down at 0 stays 0" {
+    # No Auto value known: start at 1.0, then step.
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct $null -Direction 1) 2.0 "auto/none Up"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct $null -Direction -1) 0.0 "auto/none Down"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct $null -Direction 1 -Shift $true) 11.0 "auto/none Shift+Up"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct $null -Direction 1 -Ctrl $true) 1.1 "auto/none Ctrl+Up"
+    # Auto has a known effective value (percent): seed from it (1 decimal), then step.
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 3.14159 -Direction 1) 4.1 "auto/3.14159 Up"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 3.14159 -Direction -1) 2.1 "auto/3.14159 Down"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 0.0 -Direction -1) 0.0 "auto/0 Down stays 0"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 0.0 -Direction 1) 1.0 "auto/0 Up"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 35.0 -Direction 1) 20.0 "auto/35 (out of range) clamps"
+    StepEq (Get-SteppedTolerance -CurrentPct $null -AutoEffectivePct 35.0 -Direction -1) 19.0 "auto/35 Down starts from the clamped 20"
+    # A real current value always wins over the Auto value.
+    StepEq (Get-SteppedTolerance -CurrentPct 5.0 -AutoEffectivePct 3.14159 -Direction 1) 6.0 "manual 5 ignores Auto's value"
+    StepEq (Get-SteppedTolerance -CurrentPct 0.0 -AutoEffectivePct 3.14159 -Direction -1) 0.0 "manual 0 Down stays 0 (a typed 0 is not Auto)"
+    StepEq (Get-SteppedTolerance -CurrentPct 0.0 -AutoEffectivePct 3.14159 -Direction 1) 1.0 "manual 0 Up (a typed 0 is not Auto)"
+}
+
+Check "Get-SteppedFrameText: whole-number text steps (1 / Shift 10 / Ctrl 1), no lower limit; non-numeric text -> `$null (do nothing)" {
+    if ((Get-SteppedFrameText -Text "5" -Direction 1 -Field StartFrame) -ne "6") { throw "5 up" }
+    if ((Get-SteppedFrameText -Text "5" -Direction -1 -Field EndFrame) -ne "4") { throw "5 down" }
+    if ((Get-SteppedFrameText -Text "5" -Direction 1 -Field StartFrame -Shift $true) -ne "15") { throw "5 shift up" }
+    if ((Get-SteppedFrameText -Text "5" -Direction 1 -Field StartFrame -Ctrl $true) -ne "6") { throw "5 ctrl up" }
+    if ((Get-SteppedFrameText -Text "5" -Direction 1 -Field StartFrame -Shift $true -Ctrl $true) -ne "6") { throw "5 shift+ctrl up: Ctrl wins" }
+    if ((Get-SteppedFrameText -Text "0" -Direction -1 -Field StartFrame) -ne "-1") { throw "0 down must go negative (no lower limit), got '$(Get-SteppedFrameText -Text '0' -Direction -1 -Field StartFrame)'" }
+    if ((Get-SteppedFrameText -Text "-995" -Direction -1 -Field EndFrame -Shift $true) -ne "-1005") { throw "-995 shift down" }
+    if ((Get-SteppedFrameText -Text " 7 " -Direction 1 -Field StartFrame) -ne "8") { throw "padded ' 7 ' parses like Start Recording's own int parse" }
+    foreach ($bad in @("", "abc", "5.5", "1e3", "--3", "  ", "12x")) {
+        if ($null -ne (Get-SteppedFrameText -Text $bad -Direction 1 -Field StartFrame)) { throw "non-numeric text '$bad' must give `$null (do nothing)" }
+    }
+    if ((Get-SteppedFrameText -Text "2147483647" -Direction 1 -Field EndFrame) -ne "2147483647") { throw "int32 max must not overflow into text Start Recording cannot parse" }
+    if ((Get-SteppedFrameText -Text "-2147483648" -Direction -1 -Field EndFrame) -ne "-2147483648") { throw "int32 min must not overflow into text Start Recording cannot parse" }
+}
+
+# --- Tolerance visual + estimate range (task48 rebuild, 2026-10-12) ---------
+function Near($actual, [double]$expected, [string]$what, [double]$tol = 1e-6) {
+    if ($null -eq $actual -or [Math]::Abs([double]$actual - $expected) -gt $tol) { throw "$what`: expected $expected, got '$actual'" }
+}
+
+Check "ConvertFrom-FiniteNumberText: numbers parse like TryParse; NaN / Infinity / garbage -> `$null (F4)" {
+    Near (ConvertFrom-FiniteNumberText -Text "5") 5 "5"
+    Near (ConvertFrom-FiniteNumberText -Text " -7.5 ") -7.5 "padded -7.5"
+    foreach ($bad in @("NaN", "Infinity", "-Infinity", "abc", "", $null, "1e999")) {
+        if ($null -ne (ConvertFrom-FiniteNumberText -Text $bad)) { throw "'$bad' must give `$null" }
+    }
+}
+
+Check "Get-AutoTolFromZoom: (1 - 0.96/(1 - zoom))/2 floored at 0 (gate ON); fixed 2.0 with the gate OFF; NaN zoom -> `$null (F1)" {
+    Near (Get-AutoTolFromZoom -ZoomPct 0) 2.0 "zoom 0"
+    Near (Get-AutoTolFromZoom -ZoomPct -50) 18.0 "zoom -50"
+    Near (Get-AutoTolFromZoom -ZoomPct -20) 10.0 "zoom -20"
+    Near (Get-AutoTolFromZoom -ZoomPct -10) (100 * (1 - 0.96 / 1.1) / 2) "zoom -10"
+    Near (Get-AutoTolFromZoom -ZoomPct 2) (100 * (1 - 0.96 / 0.98) / 2) "zoom +2"
+    Near (Get-AutoTolFromZoom -ZoomPct 4) 0.0 "zoom +4"
+    Near (Get-AutoTolFromZoom -ZoomPct 10) 0.0 "zoom +10 floors at 0"
+    Near (Get-AutoTolFromZoom -ZoomPct 100) 0.0 "zoom 100 (no frame left)"
+    foreach ($z in @(-50, 0, 20, 50)) { Near (Get-AutoTolFromZoom -ZoomPct $z -GateOn $false) 2.0 "gate OFF zoom $z" }
+    if ($null -ne (Get-AutoTolFromZoom -ZoomPct ([double]::NaN))) { throw "NaN zoom must give `$null" }
+    # Same number as the cache-based form the launcher's readout uses (max_w cancels out).
+    foreach ($z in @(-35, -5, 1, 3)) {
+        $maxW = 173.0
+        $finalOrtho = ($maxW / (1.0 - 2.0 * 0.02)) * 1.02 * (1.0 - $z / 100.0)
+        $cacheForm = 100.0 * [Math]::Max(0.0, (1.0 - ($maxW * 1.02 / $finalOrtho)) / 2.0)
+        Near (Get-AutoTolFromZoom -ZoomPct $z) $cacheForm "zoom $z vs the cache-based formula" 1e-9
+    }
+}
+
+Check "Get-ToleranceVisualGeometry / Get-ToleranceMarginPx: frame = a fifth, centred; LINEAR 10x scale (4.48 px per % at 224 px), clamped 0..20" {
+    $g = Get-ToleranceVisualGeometry -CanvasWidth 224
+    Near $g.FrameWidth 44.8 "frame width"
+    Near $g.CenterX 112 "centre"
+    Near $g.PxPerPct 4.48 "px per %"
+    Near $g.Magnification 10 "magnification"
+    $cases = @(@(0.5, 2.24), @(2, 8.96), @(5, 22.4), @(10, 44.8), @(20, 89.6), @(25, 89.6), @(0, 0), @(-3, 0))
+    foreach ($c in $cases) { Near (Get-ToleranceMarginPx -Pct $c[0] -PxPerPct $g.PxPerPct) $c[1] "margin $($c[0])%" }
+    Near (Get-ToleranceMarginPx -Pct ([double]::NaN) -PxPerPct 4.48) 0 "NaN margin"
+    # 20 % on one side reaches the canvas edge exactly.
+    Near ($g.CenterX + $g.FrameWidth / 2 + (Get-ToleranceMarginPx -Pct 20 -PxPerPct $g.PxPerPct)) 224 "20% reaches the right edge"
+}
+
+Check "Get-ToleranceBandSplit (W5): used = min(worst, T), slack = T - used, over = min(worst,20) - T; compared at 1 decimal; no worst -> all solid" {
+    $s = Get-ToleranceBandSplit -TolerancePct 10 -WorstPct 6.3
+    Near $s.UsedPct 6.3 "lt used"; Near $s.SlackPct 3.7 "lt slack" 1e-9; Near $s.OverPct 0 "lt over"
+    if ($s.IsOver -or -not $s.HasWorst) { throw "lt must not be over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 2 -WorstPct 2.0
+    Near $s.UsedPct 2 "eq used"; Near $s.SlackPct 0 "eq slack"; if ($s.IsOver) { throw "eq must not be over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 2 -WorstPct 2.04
+    if ($s.IsOver) { throw "2.04 shows as 2.0 in the Estimated line: must not be a red over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 2 -WorstPct 2.06
+    if (-not $s.IsOver) { throw "2.06 shows as 2.1: must be over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 2 -WorstPct 12
+    Near $s.UsedPct 2 "gt used"; Near $s.SlackPct 0 "gt slack"; Near $s.OverPct 10 "gt over"; if (-not $s.IsOver) { throw "gt must be over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 2 -WorstPct 25
+    Near $s.OverPct 18 "over is drawn only up to the 20 % edge"; if (-not $s.IsOver) { throw "25 > 2 must be over" }
+    $s = Get-ToleranceBandSplit -TolerancePct 5 -WorstPct $null
+    if ($s.HasWorst -or $s.IsOver) { throw "no worst: no marker, no over" }
+    Near $s.UsedPct 5 "no worst: whole margin solid"; Near $s.SlackPct 0 "no worst: no slack"
+    $s = Get-ToleranceBandSplit -TolerancePct 0 -WorstPct 0
+    Near $s.UsedPct 0 "T0 used"; if ($s.IsOver) { throw "0 vs 0 is not over" }
+}
+
+Check "Get-EstimateRange: All = whole cache; Start/End parsed like Start Recording; Time Slider = last resolved or unknown; outside / reversed / garbage -> unknown with a reason" {
+    [double[]]$fr = 10..19
+    $r = Get-EstimateRange -Mode All -Frames $fr
+    if (-not $r.Known -or $r.StartIndex -ne 0 -or $r.EndIndex -ne 9) { throw "All must be indices 0..9, got $($r.StartIndex)..$($r.EndIndex)" }
+    $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText "12" -EndText "15"
+    if (-not $r.Known -or $r.StartIndex -ne 2 -or $r.EndIndex -ne 5 -or $r.StartFrame -ne 12 -or $r.EndFrame -ne 15) { throw "12-15 must be indices 2..5, got $($r.StartIndex)..$($r.EndIndex)" }
+    $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText " 5 " -EndText "12"
+    if (-not $r.Known -or $r.StartIndex -ne 0 -or $r.EndIndex -ne 2) { throw "5-12 (partly before the cache) must clip to indices 0..2, got $($r.StartIndex)..$($r.EndIndex)" }
+    $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText "15" -EndText "12"
+    if ($r.Known -or $r.Reason -ne "Start is after End") { throw "reversed range must be unknown ('Start is after End'), got '$($r.Reason)'" }
+    foreach ($bad in @(@("a", "12"), @("12", ""), @("1.5", "12"))) {
+        $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText $bad[0] -EndText $bad[1]
+        if ($r.Known -or $r.Reason -ne "Start/End must be whole numbers") { throw "'$($bad[0])'/'$($bad[1])' must be unknown (whole numbers), got '$($r.Reason)'" }
+    }
+    $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText "30" -EndText "40"
+    if ($r.Known -or $r.Reason -notmatch "outside the cached take") { throw "30-40 must be unknown (outside), got '$($r.Reason)'" }
+    $r = Get-EstimateRange -Mode TimeSlider -Frames $fr
+    if ($r.Known -or $r.Reason -notmatch "Time Slider range unknown") { throw "Time Slider with nothing resolved yet must be unknown, got '$($r.Reason)'" }
+    $r = Get-EstimateRange -Mode TimeSlider -Frames $fr -LastTimeSliderStart 11 -LastTimeSliderEnd 13 -StartText "junk"
+    if (-not $r.Known -or $r.StartIndex -ne 1 -or $r.EndIndex -ne 3) { throw "Time Slider 11-13 must be indices 1..3 (boxes ignored), got $($r.StartIndex)..$($r.EndIndex)" }
+    $r = Get-EstimateRange -Mode All -Frames @()
+    if ($r.Known -or $r.Reason -ne "no cache yet") { throw "no frames must be unknown ('no cache yet'), got '$($r.Reason)'" }
+    $r = Get-EstimateRange -Mode StartEnd -Frames $fr -StartText "13" -EndText "13"
+    if (-not $r.Known -or $r.StartIndex -ne 3 -or $r.EndIndex -ne 3) { throw "a single frame must be a valid range" }
+}
+
+Check "Format-EstimateReadoutText: the bar's rounding rule (half away from zero) at a midpoint; the existing text format is kept" {
+    $t = Format-EstimateReadoutText -Keys 70 -OverPct 0.25 -WorstPct 2.25
+    if ($t -ne "Estimated: 70 keys, 0.3% of frames over tolerance, worst 2.3% of frame width.") { throw "midpoints round away from zero: got '$t'" }
+    if (-not (Get-ToleranceBandSplit -TolerancePct 2.2 -WorstPct 2.25).IsOver) { throw "the bar draws 2.25 vs 2.2 as over, so the text must say 2.3" }
+    $t = Format-EstimateReadoutText -Keys 3 -OverPct 0 -WorstPct 2.0
+    if ($t -ne "Estimated: 3 keys, 0% of frames over tolerance, worst 2% of frame width.") { throw "format unchanged ('2%', not '2.0%'): got '$t'" }
+    $old = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+        if ((Format-EstimateReadoutText -Keys 1 -OverPct 1.25 -WorstPct 15.75) -ne "Estimated: 1 keys, 1.3% of frames over tolerance, worst 15.8% of frame width.") { throw "invariant numbers under de-DE" }
+    } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $old }
+}
+
+Check "Get-EstimatePendingText: the user-approved 'no estimate' wording; other reasons shown as-is" {
+    $want = "Estimated: -- (open Preview once to see keys and worst overshoot)"
+    if ((Get-EstimatePendingText) -ne $want) { throw "no reason" }
+    if ((Get-EstimatePendingText -Reason "no cache yet") -ne $want) { throw "no cache" }
+    if ((Get-EstimatePendingText -Reason "Start is after End") -ne "Estimated: -- (Start is after End)") { throw "reason passthrough" }
+}
+
+Check "Get-ToleranceTooltipText: truthful parts per state; tight-value sentence only with the gate ON; numbers invariant (de-DE safe)" {
+    $on = Get-ToleranceTooltipText -GateOn $true -Auto $true -TolPct 2.0 -WorstPct 6.25 -RangeText "frames 0-120"
+    foreach ($part in @("blue = the allowed margin", "camera reacts LESS", "Margin shown magnified 10x", "Frame gate ON", "Auto (dashed outline, A) = 2.0%", "worst 6.3% of the frame width over frames 0-120", "Very small values (0-2%)", "Mouse wheel here steps")) {
+        if ($on.IndexOf($part) -lt 0) { throw "gate-ON Auto tooltip lacks '$part'" }
+    }
+    $off = Get-ToleranceTooltipText -GateOn $false -Auto $true -TolPct 2.0 -WorstPct $null -PendingReason "no cache yet"
+    if ($off.IndexOf("Frame gate OFF") -lt 0 -or $off.IndexOf("fixed 2.0% warning threshold") -lt 0 -or $off.IndexOf("No estimate yet (open Preview once)") -lt 0) { throw "gate-OFF tooltip parts missing: $off" }
+    if ($off.IndexOf("Very small values") -ge 0) { throw "the tight-value (camera busyness) sentence must not appear with the gate OFF" }
+    $man = Get-ToleranceTooltipText -GateOn $true -Auto $false -TolPct 7.25
+    if ($man.IndexOf("Manual: 7.3%") -lt 0) { throw "manual value missing: $man" }
+    $old = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+        $de = Get-ToleranceTooltipText -GateOn $true -Auto $false -TolPct 7.25 -WorstPct 6.25
+        if ($de.IndexOf("Manual: 7.3%") -lt 0 -or $de.IndexOf("worst 6.3%") -lt 0) { throw "de-DE must still show '7.3' / '6.3': $de" }
+    } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $old }
 }
 
 Write-Output "$passed passed, $($failures.Count) failed"

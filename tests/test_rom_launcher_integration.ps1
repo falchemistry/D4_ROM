@@ -86,6 +86,31 @@ function Wait-ForStatus([string]$expected, [int]$timeoutSeconds) {
     return $script:runStatus -eq $expected
 }
 
+function Wait-ForCondition([scriptblock]$condition, [int]$timeoutSeconds, [int]$pollMs = 50) {
+    # General bounded-poll helper (task17, 2026-09-30): checks a condition
+    # tightly and returns as soon as it's true, pumping the WPF dispatcher
+    # between checks (same DispatcherFrame/DispatcherTimer idiom as
+    # Wait-ForStatus above) so any pending UI/process-exit callback this
+    # process needs to observe actually gets a chance to run -- a plain
+    # Start-Sleep loop would starve the dispatcher and could never see the
+    # condition flip. Used to replace a fixed blind sleep with "poll
+    # tightly for results, cap the wait" (this workspace's own testing
+    # policy, TOOL_DEVELOPMENT_WORKFLOW.md section 4.3) wherever a test was
+    # previously waiting out a fixed guess at how long some async state
+    # takes to settle, rather than actually checking for it.
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while (-not (& $condition) -and (Get-Date) -lt $deadline) {
+        $frame = New-Object System.Windows.Threading.DispatcherFrame
+        $t = New-Object System.Windows.Threading.DispatcherTimer
+        $t.Interval = [TimeSpan]::FromMilliseconds($pollMs)
+        $t.Add_Tick({ $frame.Continue = $false })
+        $t.Start()
+        [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+        $t.Stop()
+    }
+    return [bool](& $condition)
+}
+
 Check "Capture is the default active tab at startup, Settings hidden" {
     if ($capturePanel.Visibility -ne [System.Windows.Visibility]::Visible) { throw "expected Capture panel visible by default" }
     if ($settingsPanel.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "expected Settings panel collapsed by default" }
@@ -510,17 +535,18 @@ Check "Stop Recording kills the running process and runs cleanup, reaching Done 
     )
     Start-Steps $longFakeStep $true $startRecordingButton "Stop Recording"
 
-    # Give the process a moment to actually start before trying to stop it.
-    $frame = New-Object System.Windows.Threading.DispatcherFrame
-    $t = New-Object System.Windows.Threading.DispatcherTimer
-    $t.Interval = [TimeSpan]::FromMilliseconds(300)
-    $t.Add_Tick({ $frame.Continue = $false })
-    $t.Start()
-    [System.Windows.Threading.Dispatcher]::PushFrame($frame)
-    $t.Stop()
-
-    if ($script:currentProcess -eq $null) { throw "expected a process to be running before Stop" }
-    if ($script:currentProcess.HasExited) { throw "the long ping should not have finished on its own yet -- Stop wouldn't be proving anything" }
+    # Poll for the process actually being up, instead of blindly waiting a
+    # fixed 300ms and hoping that was enough (task17, 2026-09-30) --
+    # confirmed intermittently flaky: process creation (a real Win32
+    # CreateProcess call under Start-Steps) is not guaranteed to land
+    # inside any fixed short window on a loaded machine, so a wait tuned
+    # to the common case could still occasionally fire before
+    # $script:currentProcess was even assigned. Bounded to 10s -- a `ping`
+    # child process starting should never take remotely that long; if it
+    # does, something is actually wrong and the test should fail loudly
+    # rather than silently proceed into a false pass/fail below.
+    $started = Wait-ForCondition { $script:currentProcess -ne $null -and -not $script:currentProcess.HasExited } 10
+    if (-not $started) { throw "expected a process to be running before Stop -- never observed one within 10s" }
     if ($startRecordingButton.Content -ne "Stop Recording") { throw "Capture button should read Stop Recording while its run is active" }
 
     Stop-CurrentRun
@@ -891,12 +917,31 @@ Check "Test-MayaPortReachable returns false quickly for a definitely-closed port
 }
 
 Check "Test-MayaPortReachable returns true for a port with a real listener" {
+    # Was a single Test-MayaPortReachable call with a tight 300ms
+    # TimeoutMs -- confirmed intermittently flaky (task17, 2026-09-30):
+    # a real listener should answer near-instantly, but an occasional
+    # scheduling/GC pause on a loaded machine could push one single
+    # BeginConnect/WaitOne attempt past 300ms even though the listener was
+    # never actually unreachable. Per this workspace's testing policy
+    # (poll tightly for results rather than a blind fixed wait), this now
+    # retries the SAME real check in a bounded loop instead of either
+    # widening the timeout (a band-aid that just moves the flake threshold)
+    # or trusting a single attempt -- any successful attempt within the
+    # bound proves the listener is genuinely reachable, and the loop only
+    # fails the test if every attempt in the whole window comes back false.
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     $freePort = $listener.LocalEndpoint.Port
     try {
-        $result = Test-MayaPortReachable -MayaHost "127.0.0.1" -Port $freePort -TimeoutMs 300
-        if ($result -ne $true) { throw "expected true for a port with an active listener" }
+        $reachable = $false
+        $attempts = 0
+        $deadline = (Get-Date).AddSeconds(5)
+        while (-not $reachable -and (Get-Date) -lt $deadline) {
+            $attempts++
+            $reachable = Test-MayaPortReachable -MayaHost "127.0.0.1" -Port $freePort -TimeoutMs 300
+            if (-not $reachable) { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $reachable) { throw "expected true for a port with an active listener -- still false after $attempts attempts over 5s" }
     } finally {
         $listener.Stop()
     }
@@ -2683,6 +2728,952 @@ Check "Get-ToleranceReadoutEstimate: All axis picks the worse-worst-overflow pai
         throw "expected All to exactly match FrontBack when LeftRight never clips, got Keys=$($all.Keys)/W=$($all.WorstOverflowPct) vs FB Keys=$($fb.Keys)/W=$($fb.WorstOverflowPct)"
     }
 }
+
+# --- Arrow / wheel stepping on every numeric box (task48, 2026-10-07) -----
+# Real handler paths: a synthetic KeyEventArgs / MouseWheelEventArgs is raised
+# on each REAL box with RaiseEvent, so the actual Add_PreviewKeyDown /
+# Add_PreviewMouseWheel handler, the Step-* function and the field's real write
+# path all run. The invisible HwndSource below only gives the synthetic key
+# event a PresentationSource; nothing is shown and no focus is taken.
+# Synthetic events cannot carry Shift/Ctrl (the launcher reads the physical
+# keyboard), so modifier routing is covered by the pure Get-SteppedNumber
+# checks in test_rom_launcher_logic.ps1 plus direct Step-*/Invoke-NumericStep
+# calls with explicit flags below -- never by pressing real keys.
+$script:t48Zoom = Join-Path $env:TEMP "rom_launcher_test_t48_zoom.txt"
+$script:t48Tol = Join-Path $env:TEMP "rom_launcher_test_t48_tol.txt"
+$script:t48RealZoomPathFn = ${function:Get-CameraZoomPctPath}
+$script:t48RealTolPathFn = ${function:Get-CameraTolerancePctPath}
+function Get-CameraZoomPctPath { return $script:t48Zoom }
+function Get-CameraTolerancePctPath { return $script:t48Tol }
+$script:t48SourceParams = New-Object System.Windows.Interop.HwndSourceParameters("t48_test_source")
+$script:t48Source = New-Object System.Windows.Interop.HwndSource($script:t48SourceParams)
+
+function Send-T48Key($target, $key, [bool]$preview = $true) {
+    $ev = New-Object System.Windows.Input.KeyEventArgs([System.Windows.Input.Keyboard]::PrimaryDevice, $script:t48Source, 0, $key)
+    $ev.RoutedEvent = if ($preview) { [System.Windows.Input.Keyboard]::PreviewKeyDownEvent } else { [System.Windows.Input.Keyboard]::KeyDownEvent }
+    $target.RaiseEvent($ev)
+    return $ev
+}
+function Send-T48Wheel($target, [int]$delta, [bool]$preview = $true) {
+    $ev = New-Object System.Windows.Input.MouseWheelEventArgs([System.Windows.Input.Mouse]::PrimaryDevice, [Environment]::TickCount, $delta)
+    $ev.RoutedEvent = if ($preview) { [System.Windows.Input.Mouse]::PreviewMouseWheelEvent } else { [System.Windows.Input.Mouse]::MouseWheelEvent }
+    $target.RaiseEvent($ev)
+    return $ev
+}
+function Reset-T48State {
+    # task48 rebuild: the modifier seam defaults to 'nothing held', so a Shift/Ctrl the
+    # user happens to hold on the real keyboard during a run cannot leak into a check.
+    $script:modifierKeysOverride = [System.Windows.Input.ModifierKeys]::None
+    $script:wheelSettleTimer.Stop()
+    $script:wheelNudgeAxis = $null
+    if ($script:zoomStepSettleTimer) { $script:zoomStepSettleTimer.Stop() }
+    $script:zoomStepActive = $false
+    $script:zoomSliderDragging = $false
+    $script:zoomThumbDragging = $false     # a check that throws mid-drag must not leak its drag into the next one
+    Reset-LiveTuneTestState
+    $script:lastValidTolerancePct = $null
+    $toleranceValueBox.Text = "Auto"
+    $startFrameBox.Text = "0"
+    $endFrameBox.Text = "100"
+    $script:lastCachePath = $null
+    $script:cachedFrameArrays = $null
+    Remove-Item $script:t48Zoom -ErrorAction SilentlyContinue
+    Remove-Item $script:t48Tol -ErrorAction SilentlyContinue
+}
+function Get-T48FileText($path) { return ([IO.File]::ReadAllText($path)).Trim() }
+function Get-T48FileBytes($path) { return ([IO.File]::ReadAllBytes($path) -join ",") }
+
+Check "Zoom box: real Up/Down PreviewKeyDown steps by 10, clamps at +/-50, file bytes equal the plain writer's, Maya push held until settle" {
+    Reset-T48State
+    $ev = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled) { throw "Up must be marked handled" }
+    if ($zoomSlider.Value -ne 10) { throw "expected slider 10 after Up, got $($zoomSlider.Value)" }
+    if ($zoomValueBox.Text -ne "+10") { throw "expected box '+10', got '$($zoomValueBox.Text)'" }
+    if ((Get-T48FileText $script:t48Zoom) -ne "10") { throw "expected zoom file '10', got '$(Get-T48FileText $script:t48Zoom)'" }
+    $stepBytes = Get-T48FileBytes $script:t48Zoom
+    Write-CameraZoomPct -Value 10
+    if ($stepBytes -ne (Get-T48FileBytes $script:t48Zoom)) { throw "file bytes after a key step ($stepBytes) differ from the plain writer's ($(Get-T48FileBytes $script:t48Zoom))" }
+    if ($script:pendingZoomPush) { throw "push must be held while the key burst is still going" }
+    if (-not $script:zoomStepActive -or -not $script:zoomSliderDragging) { throw "step session should hold the push flag" }
+
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Down)
+    if ($zoomSlider.Value -ne 10) { throw "Up,Up,Down should net +10, got $($zoomSlider.Value)" }
+    if ($script:pendingZoomPush) { throw "still no push mid-burst" }
+    Stop-ZoomStep
+    if (-not $script:pendingZoomPush) { throw "expected exactly one push once the burst settles" }
+    if ($script:zoomSliderDragging -or $script:zoomStepActive) { throw "settle must release the hold" }
+
+    # Ends where it began: no push at all.
+    Reset-T48State
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Down)
+    Stop-ZoomStep
+    if ($script:pendingZoomPush) { throw "a burst that ends where it began must not push" }
+
+    # Range ends.
+    Reset-T48State
+    $zoomSlider.Value = 45
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    if ($zoomSlider.Value -ne 50) { throw "45 + 10 must clamp to 50, got $($zoomSlider.Value)" }
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    if ($zoomSlider.Value -ne 50 -or $zoomValueBox.Text -ne "+50") { throw "must stay at +50, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    $zoomSlider.Value = -45
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Down)
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Down)
+    if ($zoomSlider.Value -ne -50 -or $zoomValueBox.Text -ne "-50") { throw "must stop at -50, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    Stop-ZoomStep
+}
+
+Check "Zoom box: typed-but-uncommitted text is committed first then stepped; garbage reverts first then steps" {
+    Reset-T48State
+    $zoomValueBox.Text = "25"
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    if ($zoomSlider.Value -ne 35) { throw "typed 25 then Up must give 35, got $($zoomSlider.Value)" }
+    $zoomValueBox.Text = "zzz"
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Down)
+    if ($zoomSlider.Value -ne 25) { throw "garbage reverts to 35 then Down gives 25, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    Stop-ZoomStep
+}
+
+Check "Zoom steps from the Step-/Invoke- functions honour Shift (100 -> clamps) and Ctrl (1), Ctrl wins" {
+    Reset-T48State
+    Invoke-NumericStep "Zoom" 1 $false $true
+    if ($zoomSlider.Value -ne 1) { throw "Ctrl+Up should be +1, got $($zoomSlider.Value)" }
+    Invoke-NumericStep "Zoom" 1 $true $true
+    if ($zoomSlider.Value -ne 2) { throw "Shift+Ctrl+Up: Ctrl wins, +1, got $($zoomSlider.Value)" }
+    Invoke-NumericStep "Zoom" 1 $true $false
+    if ($zoomSlider.Value -ne 50) { throw "Shift+Up (100) must clamp to 50, got $($zoomSlider.Value)" }
+    Invoke-NumericStep "Zoom" -1 $true $false
+    if ($zoomSlider.Value -ne -50) { throw "Shift+Down must clamp to -50, got $($zoomSlider.Value)" }
+    Stop-ZoomStep
+}
+
+Check "Offset X/Y boxes: real Up/Down step 10 through the wheel session (one push after settle); file is 'X,Y'; typed text commits first" {
+    Reset-T48State
+    $ev = Send-T48Key $offsetXBox ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled) { throw "Up must be handled on X" }
+    if ($offsetXBox.Text -ne "10") { throw "expected X box '10' live, got '$($offsetXBox.Text)'" }
+    $null = Send-T48Key $offsetXBox ([System.Windows.Input.Key]::Up)
+    $null = Send-T48Key $offsetXBox ([System.Windows.Input.Key]::Down)
+    if ($script:pendingNudgeDeltaX -ne 0) { throw "no live push mid-burst, got $($script:pendingNudgeDeltaX)" }
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 10 -or $script:pendingNudgeDeltaX -ne 10) { throw "expected X=10 and one pending delta of 10, got X=$($script:lastValidOffsetX) delta=$($script:pendingNudgeDeltaX)" }
+    if ((Get-T48FileText $script:liveTuneOffsetPath) -ne "10,0") { throw "expected file '10,0', got '$(Get-T48FileText $script:liveTuneOffsetPath)'" }
+
+    $ev = Send-T48Key $offsetYBox ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled) { throw "Up must be handled on Y" }
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne 10 -or $script:lastValidOffsetX -ne 10) { throw "Y Up must change only Y (+10, subject up); got X=$($script:lastValidOffsetX) Y=$($script:lastValidOffsetY)" }
+    $null = Send-T48Key $offsetYBox ([System.Windows.Input.Key]::Down)
+    $null = Send-T48Key $offsetYBox ([System.Windows.Input.Key]::Down)
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne -10) { throw "Y Down,Down from 10 must give -10, got $($script:lastValidOffsetY)" }
+    if ((Get-T48FileText $script:liveTuneOffsetPath) -ne "10,-10") { throw "expected file '10,-10', got '$(Get-T48FileText $script:liveTuneOffsetPath)'" }
+
+    # Typed but not committed: committed first, then stepped (25 -> 35, not 10).
+    Reset-T48State
+    $offsetXBox.Text = "25"
+    $null = Send-T48Key $offsetXBox ([System.Windows.Input.Key]::Up)
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 35) { throw "typed 25 then Up must give 35, got $($script:lastValidOffsetX)" }
+    if ($script:pendingNudgeDeltaX -ne 35) { throw "the Maya delta must be the whole 0->35 move exactly once, got $($script:pendingNudgeDeltaX)" }
+    $offsetYBox.Text = "abc"
+    $null = Send-T48Key $offsetYBox ([System.Windows.Input.Key]::Up)
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne 10) { throw "garbage reverts to 0 then Up gives 10, got $($script:lastValidOffsetY)" }
+}
+
+Check "Offset X/Y step sizes via explicit flags: plain 10, Shift 100, Ctrl 1, Ctrl wins; wheel session accepts -CtrlHeld" {
+    Reset-T48State
+    Invoke-NumericStep "OffsetX" 1 $true $false;  Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 100) { throw "Shift+Up should be +100, got $($script:lastValidOffsetX)" }
+    Invoke-NumericStep "OffsetX" -1 $false $true; Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 99) { throw "Ctrl+Down should be -1, got $($script:lastValidOffsetX)" }
+    Invoke-NumericStep "OffsetY" 1 $true $true;   Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne 1) { throw "Shift+Ctrl+Up: Ctrl wins, +1, got $($script:lastValidOffsetY)" }
+    Update-OffsetWheelNudge -Axis "X" -Delta -120 -ShiftHeld $false -CtrlHeld $true
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 98) { throw "wheel with -CtrlHeld should be -1, got $($script:lastValidOffsetX)" }
+}
+
+Check "Tolerance box: Auto + Up/Down starts from Auto's zoom value (2.0 at zoom 0, no cache needed), Down at 0 stays 0, clamps at 20, file is a plain number" {
+    Reset-T48State
+    $ev = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled) { throw "Up must be handled on Tolerance" }
+    if ($toleranceValueBox.Text -ne "3" -or $script:lastValidTolerancePct -ne 3) { throw "Auto at zoom 0 (2.0, no cache) then Up = 3, got '$($toleranceValueBox.Text)' / $($script:lastValidTolerancePct)" }
+    if ((Get-T48FileText $script:t48Tol) -ne "3") { throw "expected tolerance file '3', got '$(Get-T48FileText $script:t48Tol)'" }
+    $stepBytes = Get-T48FileBytes $script:t48Tol
+    Write-CameraTolerancePct -Value 3.0
+    if ($stepBytes -ne (Get-T48FileBytes $script:t48Tol)) { throw "tolerance file bytes after a step differ from the plain writer's" }
+
+    Reset-T48State
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($toleranceValueBox.Text -ne "1" -or $script:lastValidTolerancePct -ne 1) { throw "Auto at zoom 0 (2.0) then Down = 1, got '$($toleranceValueBox.Text)'" }
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($toleranceValueBox.Text -ne "0" -or $script:lastValidTolerancePct -ne 0) { throw "1 then Down = 0, got '$($toleranceValueBox.Text)'" }
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($toleranceValueBox.Text -ne "0" -or $null -eq $script:lastValidTolerancePct) { throw "Down at 0 must stay 0 (not wrap to Auto), got '$($toleranceValueBox.Text)'" }
+    if ((Get-T48FileText $script:t48Tol) -ne "0") { throw "file must hold 0 (a real zero, not Auto), got '$(Get-T48FileText $script:t48Tol)'" }
+
+    Reset-T48State
+    $script:lastValidTolerancePct = 19.5; $toleranceValueBox.Text = "19.5"
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($toleranceValueBox.Text -ne "20" -or $script:lastValidTolerancePct -ne 20) { throw "must clamp at 20, got '$($toleranceValueBox.Text)'" }
+
+    # Ctrl-fine steps land exactly (no float drift in the box).
+    Reset-T48State
+    $script:lastValidTolerancePct = 0.2; $toleranceValueBox.Text = "0.2"
+    Invoke-NumericStep "Tolerance" 1 $false $true
+    if ($toleranceValueBox.Text -ne "0.3") { throw "0.2 + 0.1 must display exactly '0.3', got '$($toleranceValueBox.Text)'" }
+    Invoke-NumericStep "Tolerance" 1 $true $false
+    if ($toleranceValueBox.Text -ne "10.3") { throw "Shift step is 10: expected '10.3', got '$($toleranceValueBox.Text)'" }
+    Invoke-NumericStep "Tolerance" 1 $true $false
+    if ($toleranceValueBox.Text -ne "20") { throw "10.3 + 10 clamps to 20, got '$($toleranceValueBox.Text)'" }
+}
+
+Check "Tolerance box: typed text commits first then steps; clearing returns to Auto (Enter); a manual value always wins over Auto's" {
+    Reset-T48State
+    $toleranceValueBox.Text = "7"
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($script:lastValidTolerancePct -ne 8) { throw "typed 7 then Up must give 8, got $($script:lastValidTolerancePct)" }
+    $toleranceValueBox.Text = "nope"
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($script:lastValidTolerancePct -ne 7) { throw "garbage reverts to 8 then Down gives 7, got $($script:lastValidTolerancePct)" }
+    $toleranceValueBox.Text = ""
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Left)
+    $enter = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Return) $false
+    if ($null -ne $script:lastValidTolerancePct -or $toleranceValueBox.Text -ne "Auto") { throw "clearing + Enter must return to Auto, got '$($toleranceValueBox.Text)'" }
+    if ((Get-T48FileText $script:t48Tol) -ne "") { throw "Auto must write an empty file, got '$(Get-T48FileText $script:t48Tol)'" }
+}
+
+Check "Tolerance box: from Auto with a KNOWN effective value, Up/Down seed from it (percent, 1 decimal) then step" {
+    Reset-T48State
+    Reset-FrameGateTestState        # max_w 200, panel 1000 wide: Auto at zoom 0 / offset 0 is exactly 2.0%
+    $script:lastValidTolerancePct = $null
+    $toleranceValueBox.Text = "Auto"
+    Remove-Item $script:t48Tol -ErrorAction SilentlyContinue
+    $auto = Get-AutoEffectiveTolerancePct
+    if ($null -eq $auto -or [Math]::Abs($auto - 2.0) -gt 1e-6) { throw "fixture should give Auto = 2.0%, got '$auto'" }
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($script:lastValidTolerancePct -ne 3) { throw "Auto 2.0% then Up must give 3, got $($script:lastValidTolerancePct)" }
+
+    $script:lastValidTolerancePct = $null
+    $toleranceValueBox.Text = "Auto"
+    Remove-Item $script:t48Tol -ErrorAction SilentlyContinue
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($script:lastValidTolerancePct -ne 1) { throw "Auto 2.0% then Down must give 1, got $($script:lastValidTolerancePct)" }
+    $script:lastCachePath = $null
+    $script:cachedFrameArrays = $null
+}
+
+Check "Start/End boxes: real Up/Down step by 1 (Shift 10), no lower limit; non-numeric text -> Up/Down do nothing (still handled)" {
+    Reset-T48State
+    $startFrameBox.Text = "5"
+    $ev = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled -or $startFrameBox.Text -ne "6") { throw "Start 5 + Up should be '6' and handled, got '$($startFrameBox.Text)'" }
+    $null = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Down)
+    $null = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Down)
+    if ($startFrameBox.Text -ne "4") { throw "Start Down,Down from 6 should give 4, got '$($startFrameBox.Text)'" }
+    $startFrameBox.Text = "0"
+    $null = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Down)
+    if ($startFrameBox.Text -ne "-1") { throw "no lower limit: 0 Down must give -1, got '$($startFrameBox.Text)'" }
+    Invoke-NumericStep "StartFrame" 1 $true $false
+    if ($startFrameBox.Text -ne "9") { throw "Shift+Up from -1 should give 9, got '$($startFrameBox.Text)'" }
+    Invoke-NumericStep "StartFrame" 1 $true $true
+    if ($startFrameBox.Text -ne "10") { throw "Shift+Ctrl+Up: Ctrl wins (+1), got '$($startFrameBox.Text)'" }
+
+    $endFrameBox.Text = "100"
+    $null = Send-T48Key $endFrameBox ([System.Windows.Input.Key]::Up)
+    if ($endFrameBox.Text -ne "101") { throw "End 100 + Up should be '101', got '$($endFrameBox.Text)'" }
+    foreach ($bad in @("abc", "", "5.5", "12x")) {
+        $startFrameBox.Text = $bad
+        $ev = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Up)
+        $ev2 = Send-T48Key $startFrameBox ([System.Windows.Input.Key]::Down)
+        if ($startFrameBox.Text -ne $bad) { throw "non-numeric '$bad' must be left alone by Up/Down, got '$($startFrameBox.Text)'" }
+        if (-not $ev.Handled -or -not $ev2.Handled) { throw "Up/Down on '$bad' must still be swallowed so the caret does not jump" }
+    }
+}
+
+Check "keys other than Up/Down are never claimed or acted on, on every numeric box and the slider (typing/caret/Tab/Enter untouched)" {
+    Reset-T48State
+    $targets = @($zoomValueBox, $zoomSlider, $offsetXBox, $offsetYBox, $toleranceValueBox, $startFrameBox, $endFrameBox)
+    $keys = @([System.Windows.Input.Key]::Left, [System.Windows.Input.Key]::Right, [System.Windows.Input.Key]::Home, [System.Windows.Input.Key]::End,
+              [System.Windows.Input.Key]::Back, [System.Windows.Input.Key]::Tab, [System.Windows.Input.Key]::Return, [System.Windows.Input.Key]::D5,
+              [System.Windows.Input.Key]::A, [System.Windows.Input.Key]::OemMinus, [System.Windows.Input.Key]::PageUp, [System.Windows.Input.Key]::PageDown)
+    foreach ($t in $targets) {
+        foreach ($k in $keys) {
+            $ev = Send-T48Key $t $k
+            if ($ev.Handled) { throw "$($t.Name): key $k must not be handled by the stepping handler" }
+        }
+    }
+    if ($zoomSlider.Value -ne 0 -or $zoomValueBox.Text -ne "0") { throw "no zoom change expected, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    if ($script:lastValidOffsetX -ne 0 -or $script:lastValidOffsetY -ne 0 -or $offsetXBox.Text -ne "0" -or $offsetYBox.Text -ne "0") { throw "no offset change expected" }
+    if ($null -ne $script:lastValidTolerancePct -or $toleranceValueBox.Text -ne "Auto") { throw "no tolerance change expected" }
+    if ($startFrameBox.Text -ne "0" -or $endFrameBox.Text -ne "100") { throw "no Start/End change expected" }
+    if (Test-Path $script:t48Tol) { throw "no tolerance file write expected from non-step keys" }
+}
+
+Check "Zoom slider: SmallChange 1 / LargeChange 10; its own Right/Left keys step whole percent visibly; Up/Down route through the zoom step" {
+    Reset-T48State
+    if ($zoomSlider.SmallChange -ne 1 -or $zoomSlider.LargeChange -ne 10) { throw "expected SmallChange 1 / LargeChange 10, got $($zoomSlider.SmallChange) / $($zoomSlider.LargeChange)" }
+    $null = Send-T48Key $zoomSlider ([System.Windows.Input.Key]::Right) $false
+    if ($zoomSlider.Value -ne 1 -or $zoomValueBox.Text -ne "+1") { throw "slider native Right key must move +1 whole percent visibly, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    $null = Send-T48Key $zoomSlider ([System.Windows.Input.Key]::Left) $false
+    if ($zoomSlider.Value -ne 0) { throw "slider native Left key must move -1, got $($zoomSlider.Value)" }
+    $ev = Send-T48Key $zoomSlider ([System.Windows.Input.Key]::Up)
+    if (-not $ev.Handled -or $zoomSlider.Value -ne 10) { throw "slider Up must step +10 like the box, got $($zoomSlider.Value)" }
+    Stop-ZoomStep
+}
+
+Check "mouse wheel (real PreviewMouseWheel path): Zoom box, slider, Tolerance, Start/End step like the arrows; X/Y wheel still works; Delta 0 is ignored" {
+    Reset-T48State
+    $ev = Send-T48Wheel $zoomValueBox 120
+    if (-not $ev.Handled -or $zoomSlider.Value -ne 10) { throw "Zoom box wheel up should be +10 and handled, got $($zoomSlider.Value)" }
+    $null = Send-T48Wheel $zoomSlider -120
+    $null = Send-T48Wheel $zoomSlider -120
+    if ($zoomSlider.Value -ne -10) { throw "slider wheel down x2 from 10 should be -10, got $($zoomSlider.Value)" }
+    Stop-ZoomStep
+    $null = Send-T48Wheel $toleranceValueBox 120
+    if ($script:lastValidTolerancePct -ne 7.4) { throw "Tolerance wheel up from Auto at zoom -10 (6.36 -> 6.4) should be 7.4 (and step once, not twice), got $($script:lastValidTolerancePct)" }
+    $null = Send-T48Wheel $startFrameBox 120
+    $null = Send-T48Wheel $endFrameBox -120
+    if ($startFrameBox.Text -ne "1" -or $endFrameBox.Text -ne "99") { throw "Start/End wheel should give '1' / '99', got '$($startFrameBox.Text)' / '$($endFrameBox.Text)'" }
+    # X/Y keep their existing bubbling MouseWheel handler (raised as the real wheel does after Preview).
+    $ev = Send-T48Wheel $offsetXBox 120 $false
+    if (-not $ev.Handled) { throw "X wheel must still be handled" }
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 10) { throw "X wheel up should still be +10, got $($script:lastValidOffsetX)" }
+    $ev = Send-T48Wheel $zoomValueBox 0
+    if ($ev.Handled) { throw "a zero-delta wheel event must be ignored" }
+}
+
+Check "Shift/Ctrl routing through the REAL key and wheel handlers via the virtual modifier seam (physical keyboard never touched); Ctrl wins when both are held" {
+    Reset-T48State
+    $MK = [System.Windows.Input.ModifierKeys]
+    $Both = [System.Windows.Input.ModifierKeys]([int]$MK::Shift -bor [int]$MK::Control)
+    $Up = [System.Windows.Input.Key]::Up
+    $Down = [System.Windows.Input.Key]::Down
+    try {
+        # Zoom (keys): Ctrl = 1, Shift = 100 (clamps to the limit), both = Ctrl.
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Key $zoomValueBox $Up
+        if ($zoomSlider.Value -ne 1) { throw "Ctrl+Up on Zoom should be +1, got $($zoomSlider.Value)" }
+        $script:modifierKeysOverride = $Both
+        $null = Send-T48Key $zoomValueBox $Up
+        if ($zoomSlider.Value -ne 2) { throw "Shift+Ctrl+Up on Zoom should be +1 (Ctrl wins), got $($zoomSlider.Value)" }
+        $script:modifierKeysOverride = $MK::Shift
+        $null = Send-T48Key $zoomValueBox $Up
+        if ($zoomSlider.Value -ne 50) { throw "Shift+Up on Zoom (100) should clamp to 50, got $($zoomSlider.Value)" }
+        $null = Send-T48Key $zoomValueBox $Down
+        $null = Send-T48Key $zoomValueBox $Down
+        if ($zoomSlider.Value -ne -50) { throw "Shift+Down x2 on Zoom should clamp to -50, got $($zoomSlider.Value)" }
+        Stop-ZoomStep
+
+        # Offset X/Y (keys and the existing wheel): Ctrl = 1, Shift = 100, both = Ctrl.
+        $script:modifierKeysOverride = $MK::Shift
+        $null = Send-T48Key $offsetXBox $Up
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetX -ne 100) { throw "Shift+Up on X should be +100, got $($script:lastValidOffsetX)" }
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Key $offsetXBox $Up
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetX -ne 101) { throw "Ctrl+Up on X should be +1, got $($script:lastValidOffsetX)" }
+        $script:modifierKeysOverride = $Both
+        $null = Send-T48Key $offsetYBox $Down
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetY -ne -1) { throw "Shift+Ctrl+Down on Y should be -1 (Ctrl wins), got $($script:lastValidOffsetY)" }
+        # X/Y wheel (bubbling MouseWheel, the existing handlers): this is the path that
+        # used to read a property MouseWheelEventArgs does not have.
+        $script:modifierKeysOverride = $MK::Shift
+        $null = Send-T48Wheel $offsetXBox 120 $false
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetX -ne 201) { throw "Shift+wheel on X should now be +100 (was dead before), got $($script:lastValidOffsetX)" }
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Wheel $offsetXBox -120 $false
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetX -ne 200) { throw "Ctrl+wheel down on X should be -1, got $($script:lastValidOffsetX)" }
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Wheel $offsetYBox 120 $false
+        Stop-OffsetWheelNudge
+        if ($script:lastValidOffsetY -ne 0) { throw "Ctrl+wheel up on Y from -1 should be 0, got $($script:lastValidOffsetY)" }
+
+        # Tolerance: Ctrl = 0.1, Shift = 10, both = Ctrl; wheel too.
+        $script:lastValidTolerancePct = 5.0; $toleranceValueBox.Text = "5"
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Key $toleranceValueBox $Up
+        if ($toleranceValueBox.Text -ne "5.1") { throw "Ctrl+Up on Tolerance should give 5.1, got '$($toleranceValueBox.Text)'" }
+        $script:modifierKeysOverride = $MK::Shift
+        $null = Send-T48Key $toleranceValueBox $Up
+        if ($toleranceValueBox.Text -ne "15.1") { throw "Shift+Up on Tolerance should give 15.1, got '$($toleranceValueBox.Text)'" }
+        $script:modifierKeysOverride = $Both
+        $null = Send-T48Wheel $toleranceValueBox -120
+        if ($toleranceValueBox.Text -ne "15") { throw "Shift+Ctrl+wheel down on Tolerance should be -0.1 -> 15, got '$($toleranceValueBox.Text)'" }
+
+        # Start/End: Shift = 10, Ctrl = 1; wheel too.
+        $startFrameBox.Text = "0"
+        $script:modifierKeysOverride = $MK::Shift
+        $null = Send-T48Key $startFrameBox $Up
+        if ($startFrameBox.Text -ne "10") { throw "Shift+Up on Start should be 10, got '$($startFrameBox.Text)'" }
+        $null = Send-T48Wheel $endFrameBox -120
+        if ($endFrameBox.Text -ne "90") { throw "Shift+wheel down on End (100) should be 90, got '$($endFrameBox.Text)'" }
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Key $startFrameBox $Up
+        if ($startFrameBox.Text -ne "11") { throw "Ctrl+Up on Start should be 11, got '$($startFrameBox.Text)'" }
+
+        # Zoom wheel and slider wheel carry modifiers too.
+        $zoomSlider.Value = 0
+        $script:modifierKeysOverride = $MK::Control
+        $null = Send-T48Wheel $zoomSlider 120
+        if ($zoomSlider.Value -ne 1) { throw "Ctrl+wheel on the slider should be +1, got $($zoomSlider.Value)" }
+        Stop-ZoomStep
+    } finally {
+        $script:modifierKeysOverride = $null
+    }
+    # With no override the real keyboard is read: nothing is held, so plain steps apply.
+    Reset-T48State
+    $script:modifierKeysOverride = $null
+    $null = Send-T48Key $zoomValueBox $Up
+    if ($zoomSlider.Value -ne 10) { throw "with the seam cleared a plain Up should be +10, got $($zoomSlider.Value)" }
+    Stop-ZoomStep
+}
+
+Check "Reset button and the step functions coexist: Reset after a zoom step still zeroes Zoom/X/Y (single write path intact)" {
+    Reset-T48State
+    Invoke-NumericStep "Zoom" 1 $false $false
+    Invoke-NumericStep "OffsetX" 1 $false $false
+    Stop-ZoomStep; Stop-OffsetWheelNudge
+    $resetFrameOffsetsButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    if ($zoomSlider.Value -ne 0 -or $offsetXBox.Text -ne "0") { throw "Reset should zero zoom/X, got $($zoomSlider.Value) / '$($offsetXBox.Text)'" }
+    if ((Get-T48FileText $script:t48Zoom) -ne "0") { throw "zoom file should read 0 after Reset, got '$(Get-T48FileText $script:t48Zoom)'" }
+}
+
+# --- Adjust section rebuild (task48, 2026-10-12): layout 3a, Tolerance bar, time range, F1-F6 ---
+# Headless geometry: Measure/Arrange/UpdateLayout on the never-shown window's
+# content tree (window size minus a typical 8px side / 39px caption+bottom
+# frame), measured positions via TransformToAncestor. No window is shown, no
+# focus is taken, the real pointer and keyboard are never used. The Tolerance
+# bar's shapes carry Tags (frame, used-L/R, slack-L/R, over-L/R, auto-L/R,
+# auto-A, cap-L/R, bang-over, bang-off) so their pixel geometry is measured
+# directly. Real Segoe UI pixels and "does it look right" stay with the
+# headless PNG renders plus a hands-on look.
+function Get-T48Geo($name, $root) {
+    $e = $window.FindName($name)
+    if ($null -eq $e) { throw "element '$name' not found" }
+    $p = $e.TransformToAncestor($root).Transform((New-Object System.Windows.Point(0, 0)))
+    return [PSCustomObject]@{ X = $p.X; Y = $p.Y; W = $e.ActualWidth; H = $e.ActualHeight; Element = $e }
+}
+function Invoke-T48Layout([double]$clientW, [double]$clientH) {
+    $root = $window.Content
+    $root.Measure((New-Object System.Windows.Size($clientW, $clientH)))
+    $root.Arrange((New-Object System.Windows.Rect(0, 0, $clientW, $clientH)))
+    $root.UpdateLayout()
+    return $root
+}
+function Get-T48Shapes([string]$tag) {
+    return @($tolVisualHost.Child.Children | Where-Object { $_.Tag -eq $tag })
+}
+function Get-T48ShapeLeft([string]$tag) { return [System.Windows.Controls.Canvas]::GetLeft((Get-T48Shapes $tag)[0]) }
+function Get-T48Hex($brush) { return $brush.Color.ToString() }
+function Get-T48Readout {
+    if ($toleranceReadoutText.Text -notmatch "^Estimated: (\d+) keys, [\d.]+% of frames over tolerance, worst ([\d.]+)% of frame width\.$") { return "text:" + $toleranceReadoutText.Text }
+    return "$($Matches[1]) keys, worst $($Matches[2])"
+}
+function Reset-T48RangeState {
+    $allFramesRadio.IsChecked = $true
+    $frontBackRadio.IsChecked = $true
+    $script:lastTimeSliderRangeStart = $null
+    $script:lastTimeSliderRangeEnd = $null
+    $script:lastEstimateWorstPct = $null
+    $script:lastEstimateRange = $null
+    $script:tolVisualKey = $null
+    $frameGateCheckBox.IsChecked = $true
+}
+# Set the Tolerance bar's inputs directly (no cache) and redraw.
+function Set-T48Bar($tolPct, $worstPct, [bool]$gateOn = $true, [double]$zoom = 0) {
+    $frameGateCheckBox.IsChecked = $gateOn
+    $zoomSlider.Value = $zoom
+    $script:lastValidTolerancePct = $tolPct
+    $toleranceValueBox.Text = $(if ($null -eq $tolPct) { "Auto" } else { "$tolPct" })
+    $script:lastEstimateWorstPct = $worstPct
+    $script:tolVisualKey = $null
+    Update-ToleranceVisual
+}
+
+# Range fixture: 6 frames, every pose 200 wide (max_w 200 -> frame 212.5,
+# halfOrtho 106.25, with the 0..1000 rect from Reset-FrameGateTestState).
+# Centres [0,0,0,30,30,30]. Gate ON, T = 2 % (cushion 4.25): the whole-take
+# guard keys at 0 (anchor), 3 (cam -> 19.5) and 5 (end); frames 3-5 then sit
+# exactly 4.25 past the frame edge = worst 2.0 %, frames 0-2 never pass it.
+# A guard RESTARTED at frame 3 (cam 30) would show worst 0 over 3-5 -- the
+# fixture tells the two apart. Gate OFF (camera parked at the range's Start):
+# All / 0-5 -> parked at 0, frames 3-5 are 23.75 past = 11.18 %; 3-5 -> parked
+# at 30, nothing clips.
+$script:t48RangeCachePath = Join-Path $env:TEMP "rom_launcher_test_t48_range_cache.json"
+function Set-T48RangeCache {
+    Set-Content -Path $script:frameGateTestRectPath -Value "0,0,1000,1080" -Encoding ASCII
+    @{ frames = @(0,1,2,3,4,5); x_width = @(200,200,200,200,200,200); x_center = @(0,0,0,30,30,30); z_width = @(10,10,10,10,10,10); z_center = @(0,0,0,0,0,0) } |
+        ConvertTo-Json | Set-Content -Path $script:t48RangeCachePath -Encoding UTF8
+    $script:lastCachePath = $script:t48RangeCachePath
+    $script:cachedFrameArrays = $null
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 0
+}
+
+Check "layout 3a: Adjust header with Reset at its right end, Zoom row, X/Y row with the pad, then toggle + 284 px Tolerance cell (226 diagram + 58 cap) with the readout under it; window 600 / MinHeight 522" {
+    Reset-T48State; Reset-T48RangeState
+    if ($window.Height -ne 600 -or $window.MinHeight -ne 549) { throw "window should be 600 high with MinHeight 549, got $($window.Height) / $($window.MinHeight)" }
+    $root = Invoke-T48Layout ($window.Width - 16) ($window.Height - 39)
+    $top = $window.FindName("AdjustTopGrid")
+    $hdr = @($top.Children | Where-Object { $_ -is [System.Windows.Controls.TextBlock] -and $_.Text -eq "Adjust" -and $_.FontWeight -eq [System.Windows.FontWeights]::Bold })
+    if ($hdr.Count -ne 1 -or [System.Windows.Controls.Grid]::GetRow($hdr[0]) -ne 0) { throw "expected one bold 'Adjust' header in row 0" }
+    if (@($top.Children | Where-Object { $_ -is [System.Windows.Controls.TextBlock] -and @("Frame Offsets", "Frame Gate", "Tolerance") -contains $_.Text }).Count -ne 0) { throw "old section titles / the 'Tolerance' label must be gone" }
+    if (@($window.FindName("AdjustGateGrid").Children | Where-Object { $_ -is [System.Windows.Controls.TextBlock] -and $_.Text -eq "Tolerance" }).Count -ne 0) { throw "no 'Tolerance' text label (user decision)" }
+    $block = Get-T48Geo "FrameOffsetsGrid" $root
+    $reset = Get-T48Geo "ResetFrameOffsetsButton" $root; $zoom = Get-T48Geo "ZoomValueBox" $root
+    if ([Math]::Abs(($reset.X + $reset.W) - ($block.X + $block.W)) -gt 0.5) { throw "Reset must sit at the right end of the header (reset right $($reset.X + $reset.W), block right $($block.X + $block.W))" }
+    if ($reset.Y + $reset.H -gt $zoom.Y + 0.5) { throw "Reset must be in the header, above the Zoom row" }
+    $x = Get-T48Geo "OffsetXBox" $root; $y = Get-T48Geo "OffsetYBox" $root; $pad = Get-T48Geo "ArrowNudgePad" $root
+    if (-not ($zoom.Y -lt $x.Y -and [Math]::Abs($x.Y - $y.Y) -lt 0.5)) { throw "X and Y share the row under Zoom" }
+    if ($pad.X -lt $y.X + $y.W -or [Math]::Abs($pad.W - 24) -gt 0.5) { throw "24 px pad right of Y" }
+    foreach ($b in @($zoom, $x, $y)) { if ([Math]::Abs($b.H - 24) -gt 0.5 -or $b.W -lt 44 - 0.5) { throw "boxes are 24 high, at least 44 wide" } }
+    $gate = Get-T48Geo "FrameGateCheckBox" $root; $cell = Get-T48Geo "ToleranceCell" $root
+    $vis = Get-T48Geo "TolVisualHost" $root; $cap = Get-T48Geo "TolNumberCap" $root; $ro = Get-T48Geo "ToleranceReadoutText" $root
+    if ([Math]::Abs($cell.W - 284) -gt 0.5 -or [Math]::Abs($vis.W - 226) -gt 0.5 -or [Math]::Abs($cap.W - 58) -gt 0.5) { throw "cell 284 = 226 + 58, got $($cell.W) / $($vis.W) / $($cap.W)" }
+    if ([Math]::Abs($vis.X - $cell.X) -gt 0.5 -or [Math]::Abs(($cap.X + $cap.W) - ($cell.X + $cell.W)) -gt 0.5) { throw "diagram at the left, cap at the right end" }
+    if ($gate.X + $gate.W -gt $cell.X + 0.5 -or $gate.Y -lt $y.Y + 24) { throw "toggle left of the cell, under the X/Y row" }
+    if ([Math]::Abs($ro.X - $cell.X) -gt 0.5 -or $ro.Y -lt $cell.Y + 24 - 0.5) { throw "readout starts under the cell" }
+    $tb = Get-T48Geo "ToleranceValueBox" $root
+    if ($tb.X -lt $cap.X -or $tb.X + $tb.W -gt $cap.X + $cap.W) { throw "the number box sits inside the cap" }
+    if ($toleranceValueBox.BorderThickness.Left -ne 0 -or $toleranceValueBox.Background.Color.A -ne 0) { throw "the number box is transparent and borderless inside the cap" }
+}
+
+Check "layout 3a: nothing clipped at the default, 520 and MINIMUM widths, with the All AND the Start/End radio (its boxes shown) and a two-line readout; the log keeps its 80 px INSIDE its container; block 138.6 px with an empty readout" {
+    Reset-T48State; Reset-T48RangeState
+    $sizes = @(@(($window.Width - 16), ($window.Height - 39)), @(520, ($window.Height - 39)), @(($window.MinWidth - 16), ($window.MinHeight - 39)))
+    $logParent = [System.Windows.Media.VisualTreeHelper]::GetParent($window.FindName("LogBox"))
+    foreach ($mode in @("All", "StartEnd")) {
+    if ($mode -eq "StartEnd") { $startEndRadio.IsChecked = $true } else { $allFramesRadio.IsChecked = $true }
+    foreach ($sz in $sizes) {
+        $toleranceReadoutText.Text = "Estimated: 480 keys, 44.6% of frames over tolerance, worst 20.7% of frame width."
+        $root = Invoke-T48Layout $sz[0] $sz[1]
+        $block = Get-T48Geo "FrameOffsetsGrid" $root
+        foreach ($n in @("ZoomValueBox", "ZoomSlider", "OffsetXBox", "OffsetYBox", "ArrowNudgePad", "ResetFrameOffsetsButton", "FrameGateCheckBox", "ToleranceCell", "TolNumberCap", "ToleranceReadoutText")) {
+            $g = Get-T48Geo $n $root
+            if ($g.X + $g.W -gt $block.X + $block.W + 0.5) { throw "$n overflows the right edge at $($sz[0]) px (right $($g.X + $g.W) > $($block.X + $block.W))" }
+            if ($g.W -le 0 -or $g.H -le 0) { throw "$n collapsed at $($sz[0]) px" }
+        }
+        if ($sz[0] -eq $window.MinWidth - 16 -and $toleranceReadoutText.ActualHeight -lt 25) { throw "the readout should wrap to two lines here ($mode, $($sz[0]) px), got height $($toleranceReadoutText.ActualHeight)" }
+        $log = Get-T48Geo "LogBox" $root
+        $lp = $logParent.TransformToAncestor($root).Transform((New-Object System.Windows.Point(0, 0)))
+        if ($log.H -lt 80 - 0.5) { throw "log squeezed below 80 at $($sz[0])x$($sz[1]) ($mode): $($log.H)" }
+        if ($log.Y + $log.H -gt $lp.Y + $logParent.ActualHeight + 0.5) { throw "log clipped by its container at $($sz[0])x$($sz[1]) ($mode): log bottom $($log.Y + $log.H) > container bottom $($lp.Y + $logParent.ActualHeight)" }
+    }
+    }
+    $allFramesRadio.IsChecked = $true
+    $frameGateCheckBox.IsChecked = $false     # gate OFF clears the readout
+    $root = Invoke-T48Layout ($window.Width - 16) ($window.Height - 39)
+    $block = Get-T48Geo "FrameOffsetsGrid" $root
+    if ($toleranceReadoutText.Text -ne "" -or [Math]::Abs($block.H - 138.6) -gt 1.0) { throw "block with an empty readout should be about 138.6 px, got $($block.H) ('$($toleranceReadoutText.Text)')" }
+    $frameGateCheckBox.IsChecked = $true
+}
+
+Check "Tab order: Zoom box, slider, X, Y, Reset, Frame gate, Tolerance -- and no new Tab stop (diagram, cap, cell are not focusable)" {
+    $order = @()
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($window.FindName("FrameOffsetsGrid"))
+    $visit = New-Object System.Collections.Generic.List[object]
+    function Walk-T48($node) {
+        if ($node -is [System.Windows.Controls.Control] -and $node.Focusable -and $node.IsTabStop) { $visit.Add($node.Name) }
+        foreach ($c in [System.Windows.LogicalTreeHelper]::GetChildren($node)) { if ($c -is [System.Windows.DependencyObject]) { Walk-T48 $c } }
+    }
+    Walk-T48 $window.FindName("FrameOffsetsGrid")
+    $want = @("ZoomValueBox", "ZoomSlider", "OffsetXBox", "OffsetYBox", "ResetFrameOffsetsButton", "FrameGateCheckBox", "ToleranceValueBox")
+    if (($visit -join ",") -ne ($want -join ",")) { throw "Tab stops in order: expected $($want -join ', '), got $($visit -join ', ')" }
+    foreach ($n in @("ToleranceCell", "TolVisualHost", "TolNumberCap", "ArrowNudgePad")) {
+        if ($window.FindName($n).Focusable) { throw "$n must not be focusable" }
+    }
+    foreach ($e in @($frameGateCheckBox, $toleranceValueBox, $resetFrameOffsetsButton)) { if ([System.Windows.Input.KeyboardNavigation]::GetTabIndex($e) -ne [int]::MaxValue) { throw "$($e.Name): no explicit TabIndex (document order rules)" } }
+}
+
+Check "Frame gate toggle (7a / ON-2): icon only; ON = dark pill + thin blue ring, blue fill, light brackets, no slash; OFF = grey fill, struck through; state tooltip" {
+    Reset-T48State; Reset-T48RangeState
+    $null = Invoke-T48Layout ($window.Width - 16) ($window.Height - 39)
+    if ("$($frameGateCheckBox.Content)" -ne "" -or [System.Windows.Automation.AutomationProperties]::GetName($frameGateCheckBox) -ne "Frame gate") { throw "icon-only, but named 'Frame gate' for accessibility" }
+    $t = $frameGateCheckBox.Template
+    $pill = $t.FindName("Pill", $frameGateCheckBox); $fill = $t.FindName("GateFill", $frameGateCheckBox); $brk = $t.FindName("GateBrackets", $frameGateCheckBox); $slash = $t.FindName("GateSlash", $frameGateCheckBox)
+    if ($null -eq $pill -or $null -eq $fill) { throw "template parts missing" }
+    if ((Get-T48Hex $pill.Background) -ne "#FF1F1F1F" -or (Get-T48Hex $pill.BorderBrush) -ne "#FF2F8CFF" -or (Get-T48Hex $fill.Fill) -ne "#FF2F8CFF" -or (Get-T48Hex $brk.Stroke) -ne "#FFE6E6E6" -or $slash.Visibility -ne "Collapsed") {
+        throw "ON look wrong: bg $(Get-T48Hex $pill.Background) ring $(Get-T48Hex $pill.BorderBrush) fill $(Get-T48Hex $fill.Fill) brackets $(Get-T48Hex $brk.Stroke) slash $($slash.Visibility)"
+    }
+    if ("$($frameGateCheckBox.ToolTip)" -notmatch "^Frame gate is ON") { throw "ON tooltip" }
+    $frameGateCheckBox.IsChecked = $false
+    $null = Invoke-T48Layout ($window.Width - 16) ($window.Height - 39)
+    if ((Get-T48Hex $pill.Background) -ne "#FF1F1F1F" -or (Get-T48Hex $pill.BorderBrush) -ne "#FF5A5A5A" -or (Get-T48Hex $fill.Fill) -ne "#FF5A5A5A" -or $slash.Visibility -ne "Visible") { throw "OFF look wrong" }
+    if ("$($frameGateCheckBox.ToolTip)" -notmatch "^Frame gate is OFF") { throw "OFF tooltip" }
+    $frameGateCheckBox.IsChecked = $true
+}
+
+Check "Reset = the whole Adjust section: Zoom/X/Y 0, Frame gate back ON, Tolerance back to Auto (files written by the plain writers); a settling session is flushed first" {
+    $testGatePath = Join-Path $env:TEMP "rom_launcher_test_t48_reset_gate.txt"
+    function Get-FrameGatePath { return $testGatePath }
+    Reset-T48State; Reset-T48RangeState
+    $zoomSlider.Value = 10
+    $offsetXBox.Text = "40"; Commit-OffsetBoxes
+    $script:lastValidTolerancePct = 7.0; $toleranceValueBox.Text = "7"; Commit-ToleranceValueBox
+    $frameGateCheckBox.IsChecked = $false
+    Invoke-NumericStep "OffsetY" 1 $false $false      # a Y wheel session still settling
+    $resetFrameOffsetsButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    Stop-OffsetWheelNudge                             # a late settle must not resurrect Y = 10
+    if ($zoomSlider.Value -ne 0 -or $script:lastValidOffsetX -ne 0 -or $script:lastValidOffsetY -ne 0) { throw "Zoom/X/Y must be 0, got $($zoomSlider.Value) / $($script:lastValidOffsetX) / $($script:lastValidOffsetY)" }
+    if (-not $frameGateCheckBox.IsChecked) { throw "Frame gate must be back ON" }
+    if ($null -ne $script:lastValidTolerancePct -or $toleranceValueBox.Text -ne "Auto") { throw "Tolerance must be back to Auto, got '$($toleranceValueBox.Text)'" }
+    if ((Get-T48FileText $script:t48Zoom) -ne "0" -or (Get-T48FileText $script:liveTuneOffsetPath) -ne "0,0" -or (Get-T48FileText $script:t48Tol) -ne "" -or (Get-T48FileText $testGatePath) -ne "1") {
+        throw "state files after Reset: zoom '$(Get-T48FileText $script:t48Zoom)' offset '$(Get-T48FileText $script:liveTuneOffsetPath)' tol '$(Get-T48FileText $script:t48Tol)' gate '$(Get-T48FileText $testGatePath)'"
+    }
+    $tolBytes = Get-T48FileBytes $script:t48Tol; Write-CameraTolerancePct -Value $null
+    if ($tolBytes -ne (Get-T48FileBytes $script:t48Tol)) { throw "Reset's Auto tolerance bytes differ from the plain writer's" }
+    $gateBytes = Get-T48FileBytes $testGatePath; Write-FrameGateEnabled -Enabled $true
+    if ($gateBytes -ne (Get-T48FileBytes $testGatePath)) { throw "Reset's gate bytes differ from the plain writer's" }
+    Remove-Item $testGatePath -ErrorAction SilentlyContinue
+}
+
+Check "Tolerance bar: LINEAR 10x mapping (0.5 / 2 / 10 / 20 % = 2.24 / 8.96 / 44.8 / 89.6 px per side), frame a fifth and centred, symmetric; % shown for a number, hidden for Auto" {
+    Reset-T48State; Reset-T48RangeState
+    foreach ($c in @(@(0.5, 2.24), @(2.0, 8.96), @(10.0, 44.8), @(20.0, 89.6))) {
+        Set-T48Bar $c[0] $null
+        $r = (Get-T48Shapes "used-R")[0]; $l = (Get-T48Shapes "used-L")[0]
+        if ([Math]::Abs($r.Width - $c[1]) -gt 1e-6 -or [Math]::Abs($l.Width - $c[1]) -gt 1e-6) { throw "$($c[0])%: expected $($c[1]) px per side, got L $($l.Width) / R $($r.Width)" }
+        if ([Math]::Abs((Get-T48ShapeLeft "used-R") - 134.4) -gt 1e-6 -or [Math]::Abs((Get-T48ShapeLeft "used-L") - (89.6 - $c[1])) -gt 1e-6) { throw "$($c[0])%: bands must start at the frame edges 89.6 / 134.4" }
+        if ((Get-T48Shapes "slack-R").Count -ne 0 -or (Get-T48Shapes "over-R").Count -ne 0 -or (Get-T48Shapes "auto-R").Count -ne 0) { throw "$($c[0])% with no estimate: solid only" }
+        if ($tolPctSuffix.Visibility -ne "Visible") { throw "'%' must show for a number" }
+    }
+    $f = (Get-T48Shapes "frame")[0]
+    if ([Math]::Abs($f.Width - 44.8) -gt 1e-6 -or [Math]::Abs((Get-T48ShapeLeft "frame") - 89.6) -gt 1e-6) { throw "grey frame must be 44.8 px at 89.6" }
+    if ((Get-T48Shapes "label-100").Count -ne 1 -or (Get-T48Shapes "label-x10").Count -ne 1 -or (Get-T48Shapes "tick-label").Count -ne 3) { throw "100% label, x10 mark and the 5/10/20 labels expected" }
+    if ((@($tolVisualHost.Child.Children | Where-Object { $_.Tag -eq "tick-label" } | ForEach-Object { $_.Text }) -join ",") -ne "5,10,20") { throw "tick labels 5,10,20" }
+    if ($tolVisualHost.Focusable -or $tolVisualHost.Child.Focusable) { throw "display-only" }
+}
+
+Check "Tolerance bar: Auto = zoom-derived value with a dashed outline + 'A' (2.0 at zoom 0, 0 at +20); gate OFF = fixed 2.0, '!' at the left and dashed caps; '%' hidden for Auto" {
+    Reset-T48State; Reset-T48RangeState
+    Set-T48Bar $null $null $true 0
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 8.96) -gt 1e-6 -or [Math]::Abs((Get-T48Shapes "auto-R")[0].Width - 8.96) -gt 1e-6) { throw "Auto at zoom 0 = 2.0 % = 8.96 px, dashed" }
+    if ((Get-T48Shapes "auto-R")[0].StrokeDashArray.Count -eq 0 -or (Get-T48Shapes "auto-A").Count -ne 1 -or (Get-T48Shapes "used-R")[0].Opacity -ge 1) { throw "Auto must be dashed, paler, with an 'A'" }
+    if ($tolPctSuffix.Visibility -ne "Collapsed") { throw "'%' hidden for Auto" }
+    if ((Get-T48Shapes "cap-R")[0] -isnot [System.Windows.Shapes.Rectangle] -or (Get-T48Shapes "bang-off").Count -ne 0) { throw "gate ON: solid caps, no '!'" }
+    Set-T48Bar $null $null $true 20
+    if ((Get-T48Shapes "used-R").Count -ne 0 -or (Get-T48Shapes "auto-A").Count -ne 1) { throw "Auto at zoom +20 = 0: no band, still the 'A'" }
+    Set-T48Bar $null $null $true -50
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 18.0 * 4.48) -gt 1e-6) { throw "Auto at zoom -50 = 18 %" }
+    Set-T48Bar $null $null $false 20
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 8.96) -gt 1e-6) { throw "gate OFF Auto = fixed 2.0 % whatever the zoom" }
+    if ((Get-T48Shapes "bang-off").Count -ne 1 -or (Get-T48Shapes "cap-L")[0] -isnot [System.Windows.Shapes.Line] -or (Get-T48Shapes "cap-L")[0].StrokeDashArray.Count -eq 0) { throw "gate OFF: '!' + dashed caps" }
+    Set-T48Bar 5.0 $null $false 0
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 22.4) -gt 1e-6 -or (Get-T48Shapes "auto-A").Count -ne 0) { throw "gate OFF manual 5 % (threshold) = 22.4 px, no 'A'" }
+    if ($toleranceValueBox.IsEnabled -eq $false) { throw "Tolerance stays editable with the gate OFF" }
+    $frameGateCheckBox.IsChecked = $true; $zoomSlider.Value = 0
+}
+
+Check "Tolerance bar W5 split from the stored worst NUMBER: lt = solid used + pale dashed slack; eq = all solid; gt = red outlined over + '!'; no estimate = no marker" {
+    Reset-T48State; Reset-T48RangeState
+    Set-T48Bar 10.0 6.3
+    $script:lastEstimateWorstPct = 2.0; Update-ToleranceVisual       # ONLY the worst changes: the bar must redraw
+    if ([Math]::Abs((Get-T48Shapes "slack-R")[0].Width - 8.0 * 4.48) -gt 1e-6) { throw "a new worst value alone must redraw the bar (slack 8 %), got $((Get-T48Shapes 'slack-R')[0].Width)" }
+    $script:lastEstimateWorstPct = 6.3; Update-ToleranceVisual
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 6.3 * 4.48) -gt 1e-6 -or [Math]::Abs((Get-T48Shapes "slack-R")[0].Width - 3.7 * 4.48) -gt 1e-6) { throw "lt: used 6.3 % + slack 3.7 %" }
+    if ([Math]::Abs((Get-T48ShapeLeft "slack-R") - (134.4 + 6.3 * 4.48)) -gt 1e-6 -or (Get-T48Shapes "slack-R")[0].StrokeDashArray.Count -eq 0) { throw "slack sits after the used part, dashed" }
+    if ((Get-T48Shapes "over-R").Count -ne 0 -or (Get-T48Shapes "bang-over").Count -ne 0) { throw "lt: no over" }
+    if ("$($tolVisualHost.ToolTip)".IndexOf("worst 6.3%") -lt 0) { throw "tooltip carries the worst value" }
+    Set-T48Bar 2.0 2.0
+    if ([Math]::Abs((Get-T48Shapes "used-R")[0].Width - 8.96) -gt 1e-6 -or (Get-T48Shapes "slack-R").Count -ne 0 -or (Get-T48Shapes "over-R").Count -ne 0) { throw "eq: all solid" }
+    Set-T48Bar 2.0 12.0
+    $over = (Get-T48Shapes "over-R")[0]
+    if ($null -eq $over -or [Math]::Abs($over.Width - 10 * 4.48) -gt 1e-6 -or [Math]::Abs((Get-T48ShapeLeft "over-R") - (134.4 + 8.96)) -gt 1e-6) { throw "gt: red over 10 % after the 2 % margin" }
+    if ((Get-T48Hex $over.Stroke) -ne "#FFE0786E" -or (Get-T48Shapes "bang-over").Count -ne 1 -or (Get-T48Shapes "over-L").Count -ne 1) { throw "gt: red outline + '!' (colour AND mark), both sides" }
+    Set-T48Bar 2.0 $null
+    if ((Get-T48Shapes "slack-R").Count + (Get-T48Shapes "over-R").Count + (Get-T48Shapes "bang-over").Count -ne 0) { throw "no estimate: no marker" }
+    $script:lastValidTolerancePct = $null; $toleranceValueBox.Text = "Auto"
+}
+
+Check "Tolerance cell: the wheel over the diagram / the cap steps the number like the box (once; from Auto at Auto's value); the cap click focuses the box; clicks on the box are left alone" {
+    Reset-T48State; Reset-T48RangeState
+    $script:t48FocusCalls = 0
+    function Set-ToleranceBoxFocus { $script:t48FocusCalls++ }
+    $ev = Send-T48Wheel $tolVisualHost 120
+    if (-not $ev.Handled -or $script:lastValidTolerancePct -ne 3) { throw "wheel over the diagram from Auto (zoom 0) should give 3, got $($script:lastValidTolerancePct)" }
+    $null = Send-T48Wheel $tolNumberCap -120
+    if ($script:lastValidTolerancePct -ne 2) { throw "wheel over the cap should step down to 2, got $($script:lastValidTolerancePct)" }
+    $null = Send-T48Wheel $toleranceValueBox 120
+    if ($script:lastValidTolerancePct -ne 3) { throw "wheel over the box steps ONCE (3), got $($script:lastValidTolerancePct)" }
+    $script:modifierKeysOverride = [System.Windows.Input.ModifierKeys]::Control
+    try { $null = Send-T48Wheel $tolVisualHost 120 } finally { $script:modifierKeysOverride = $null }
+    if ($toleranceValueBox.Text -ne "3.1") { throw "Ctrl+wheel over the diagram = 0.1, got '$($toleranceValueBox.Text)'" }
+    $md = New-Object System.Windows.Input.MouseButtonEventArgs([System.Windows.Input.Mouse]::PrimaryDevice, 0, [System.Windows.Input.MouseButton]::Left)
+    $md.RoutedEvent = [System.Windows.Input.Mouse]::PreviewMouseDownEvent
+    $tolNumberCap.Child.RaiseEvent($md)              # the cap's padding (the "%" is not hit-testable)
+    if ($script:t48FocusCalls -ne 1 -or -not $md.Handled) { throw "a click on the cap ('%') must focus the box, calls=$($script:t48FocusCalls)" }
+    $md2 = New-Object System.Windows.Input.MouseButtonEventArgs([System.Windows.Input.Mouse]::PrimaryDevice, 0, [System.Windows.Input.MouseButton]::Left)
+    $md2.RoutedEvent = [System.Windows.Input.Mouse]::PreviewMouseDownEvent
+    $toleranceValueBox.RaiseEvent($md2)
+    if ($script:t48FocusCalls -ne 1) { throw "a click on the box itself is the box's own (caret/selection)" }
+}
+
+Check "time range (gate ON): Estimated / worst / bar are measured over the chosen range on the WHOLE-take guard curve (never restarted at Start); recomputed on radio and Start/End changes" {
+    Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
+    $script:lastValidTolerancePct = 2.0; $toleranceValueBox.Text = "2"; Commit-ToleranceValueBox
+    Update-ToleranceReadout
+    if ((Get-T48Readout) -ne "3 keys, worst 2") { throw "All: '$($toleranceReadoutText.Text)'" }
+    if ([Math]::Abs($script:lastEstimateWorstPct - 2.0) -gt 1e-9) { throw "All: worst stored as the number 2.0, got $($script:lastEstimateWorstPct)" }
+    $startFrameBox.Text = "0"; $endFrameBox.Text = "2"
+    $startEndRadio.IsChecked = $true                  # recompute on the radio, no explicit call
+    if ((Get-T48Readout) -ne "1 keys, worst 0" -or $script:lastEstimateWorstPct -ne 0) { throw "0-2: '$($toleranceReadoutText.Text)' worst $($script:lastEstimateWorstPct)" }
+    $startFrameBox.Text = "3"; $endFrameBox.Text = "5"   # recompute on TextChanged
+    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "3-5 must keep the whole-take curve (worst 2.0, not a restarted 0): '$($toleranceReadoutText.Text)'" }
+    $endFrameBox.Text = "1"
+    if ($toleranceReadoutText.Text -ne "Estimated: -- (Start is after End)" -or $null -ne $script:lastEstimateWorstPct) { throw "reversed: '$($toleranceReadoutText.Text)'" }
+    if ((Get-T48Shapes "slack-R").Count + (Get-T48Shapes "over-R").Count -ne 0) { throw "unknown range: no worst marker on the bar" }
+    $endFrameBox.Text = "3"                           # 3-3: the Start frame alone is recentred (apply_recenter_override), so 0
+    if ((Get-T48Readout) -ne "1 keys, worst 0") { throw "3-3: the recording's Start frame is the true-centre key, got '$($toleranceReadoutText.Text)'" }
+    $endFrameBox.Text = "5"; $startFrameBox.Text = "4"
+    if ((Get-T48Readout) -ne "1 keys, worst 2") { throw "4-5: '$($toleranceReadoutText.Text)'" }
+    if ("$($tolVisualHost.ToolTip)".IndexOf("over frames 4-5") -lt 0) { throw "tooltip names the measured frames" }
+    $allFramesRadio.IsChecked = $true
+    if ((Get-T48Readout) -ne "3 keys, worst 2") { throw "back to All: '$($toleranceReadoutText.Text)'" }
+}
+
+Check "time range: Time Slider = the last range a Preview / Start Recording click resolved from Maya; none yet -> 'range unknown', never a guess" {
+    Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
+    $script:lastValidTolerancePct = 2.0; $toleranceValueBox.Text = "2"; Commit-ToleranceValueBox
+    $timeSliderRadio.IsChecked = $true
+    if ($toleranceReadoutText.Text -ne "Estimated: -- (Time Slider range unknown until Preview reads it from Maya)" -or $null -ne $script:lastEstimateWorstPct) { throw "unknown: '$($toleranceReadoutText.Text)'" }
+    function Get-TimeSliderRange { return [PSCustomObject]@{ Success = $true; Start = 3; End = 5; ErrorMessage = $null } }
+    $resolved = Get-ResolvedTimeRange
+    if (-not $resolved.Success) { throw "resolution should succeed" }
+    Update-ToleranceReadout
+    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "Time Slider 3-5: '$($toleranceReadoutText.Text)'" }
+    function Get-TimeSliderRange { return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "No response from Maya." } }
+    $null = Get-ResolvedTimeRange
+    Update-ToleranceReadout
+    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "a failed later read keeps the last known range" }
+    $allFramesRadio.IsChecked = $true
+}
+
+Check "time range (gate OFF): the bar's worst and the Preview glow use the fixed-camera estimate over the chosen range (camera parked at its Start)" {
+    Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
+    $frameGateCheckBox.IsChecked = $false
+    Update-ToleranceReadout; Update-FrameGateGlow
+    if ($toleranceReadoutText.Text -ne "" -or [Math]::Abs($script:lastEstimateWorstPct - (100 * 23.75 / 212.5)) -gt 1e-9) { throw "All: worst should be 11.18 %, got $($script:lastEstimateWorstPct)" }
+    if ($null -eq $previewButton.Effect) { throw "All: red glow expected" }
+    if ((Get-T48Shapes "over-R").Count -ne 1 -or (Get-T48Shapes "bang-over").Count -ne 1) { throw "All: red over on the bar" }
+    $startFrameBox.Text = "3"; $endFrameBox.Text = "5"; $startEndRadio.IsChecked = $true
+    Update-FrameGateGlow
+    if ($script:lastEstimateWorstPct -ne 0 -or $null -ne $previewButton.Effect) { throw "3-5 (parked at 30): nothing clips, got worst $($script:lastEstimateWorstPct)" }
+    $startFrameBox.Text = "0"
+    Update-FrameGateGlow
+    if ([Math]::Abs($script:lastEstimateWorstPct - (100 * 23.75 / 212.5)) -gt 1e-9 -or $null -eq $previewButton.Effect) { throw "0-5: parked at 0, 11.18 % again" }
+    $frameGateCheckBox.IsChecked = $true; $allFramesRadio.IsChecked = $true; $previewButton.Effect = $null
+}
+
+Check "no estimate: no cache -> 'Estimated: -- (open Preview once to see keys and worst overshoot)', worst `$null, no marker" {
+    Reset-T48State; Reset-T48RangeState
+    $script:lastCachePath = $null; $script:cachedFrameArrays = $null
+    Update-ToleranceReadout
+    if ($toleranceReadoutText.Text -ne "Estimated: -- (open Preview once to see keys and worst overshoot)" -or $null -ne $script:lastEstimateWorstPct) { throw "got '$($toleranceReadoutText.Text)'" }
+    if ((Get-T48Shapes "slack-R").Count + (Get-T48Shapes "over-R").Count + (Get-T48Shapes "bang-over").Count -ne 0) { throw "no marker without an estimate" }
+}
+
+Check "F1: Tolerance Up/Down from Auto seed from Auto's ZOOM value (gate ON) or the fixed 2.0 (gate OFF), no cache needed" {
+    Reset-T48State; Reset-T48RangeState
+    $zoomSlider.Value = 20
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($script:lastValidTolerancePct -ne 1) { throw "gate ON zoom +20: Auto 0 then Up = 1, got $($script:lastValidTolerancePct)" }
+    $script:lastValidTolerancePct = $null; $toleranceValueBox.Text = "Auto"
+    $frameGateCheckBox.IsChecked = $false
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($script:lastValidTolerancePct -ne 3) { throw "gate OFF: Auto = 2.0 threshold then Up = 3, got $($script:lastValidTolerancePct)" }
+    $script:lastValidTolerancePct = $null; $toleranceValueBox.Text = "Auto"
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Down)
+    if ($script:lastValidTolerancePct -ne 1) { throw "gate OFF: 2.0 then Down = 1, got $($script:lastValidTolerancePct)" }
+    $frameGateCheckBox.IsChecked = $true
+    $script:lastValidTolerancePct = $null; $toleranceValueBox.Text = "Auto"; $zoomSlider.Value = -50
+    $null = Send-T48Key $toleranceValueBox ([System.Windows.Input.Key]::Up)
+    if ($script:lastValidTolerancePct -ne 19) { throw "zoom -50: Auto 18 then Up = 19, got $($script:lastValidTolerancePct)" }
+}
+
+Check "F2: the X/Y WHEEL commits typed-but-uncommitted text first (like Up/Down), then steps" {
+    Reset-T48State; Reset-T48RangeState
+    $offsetXBox.Text = "25"
+    $null = Send-T48Wheel $offsetXBox 120 $false
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetX -ne 35 -or $script:pendingNudgeDeltaX -ne 35) { throw "typed 25 then wheel up = 35 (one delta of 35), got $($script:lastValidOffsetX) / $($script:pendingNudgeDeltaX)" }
+    $offsetYBox.Text = "-5"
+    $null = Send-T48Wheel $offsetYBox -120 $false
+    Stop-OffsetWheelNudge
+    if ($script:lastValidOffsetY -ne -15) { throw "typed -5 then wheel down = -15, got $($script:lastValidOffsetY)" }
+    if ((Get-T48FileText $script:liveTuneOffsetPath) -ne "35,-15") { throw "file '35,-15' expected, got '$(Get-T48FileText $script:liveTuneOffsetPath)'" }
+}
+
+Check "F3: a real thumb drag that starts while a key/wheel step is settling keeps its push-hold until the drag completes" {
+    Reset-T48State; Reset-T48RangeState
+    Invoke-NumericStep "Zoom" 1 $false $false
+    $ds = New-Object System.Windows.Controls.Primitives.DragStartedEventArgs(0.0, 0.0)
+    $zoomSlider.RaiseEvent($ds)
+    Stop-ZoomStep                                       # the 400 ms settle fires mid-drag
+    if (-not $script:zoomSliderDragging) { throw "the settle must not release the hold during a real drag" }
+    if ($script:pendingZoomPush) { throw "no Maya push from the settle while the thumb is held (the drag's completion pushes once)" }
+    $zoomSlider.Value = 25                              # the drag moves on: no live push yet
+    if ($script:pendingZoomPush) { throw "no push while the thumb is still held" }
+    $dc = New-Object System.Windows.Controls.Primitives.DragCompletedEventArgs(0.0, 0.0, $false)
+    $zoomSlider.RaiseEvent($dc)
+    if ($script:zoomSliderDragging -or $script:zoomThumbDragging -or -not $script:pendingZoomPush) { throw "drag completion releases the hold and pushes once" }
+}
+
+Check "F4: 'NaN' / 'Infinity' typed in Zoom, Tolerance or X/Y revert like garbage; Zoom Up after NaN steps from the last value and the push-hold always has its settle" {
+    Reset-T48State; Reset-T48RangeState
+    $zoomValueBox.Text = "NaN"
+    $null = Send-T48Key $zoomValueBox ([System.Windows.Input.Key]::Up)
+    if ($zoomSlider.Value -ne 10 -or $zoomValueBox.Text -ne "+10") { throw "NaN reverts to 0 then Up = +10, got $($zoomSlider.Value) / '$($zoomValueBox.Text)'" }
+    if (-not $script:zoomStepActive -or -not $script:zoomStepSettleTimer.IsEnabled) { throw "the hold must come with a running settle timer" }
+    Stop-ZoomStep
+    if ($script:zoomSliderDragging -or -not $script:pendingZoomPush) { throw "settle releases and pushes" }
+    $zoomValueBox.Text = "-Infinity"; Commit-ZoomValueBox
+    if ($zoomSlider.Value -ne 10 -or $zoomValueBox.Text -ne "+10") { throw "-Infinity reverts" }
+    $script:lastValidTolerancePct = 4.0; $toleranceValueBox.Text = "NaN"; Commit-ToleranceValueBox
+    if ($script:lastValidTolerancePct -ne 4 -or $toleranceValueBox.Text -ne "4" -or (Get-T48FileText $script:t48Tol) -ne "4") { throw "NaN tolerance reverts to 4, got '$($toleranceValueBox.Text)'" }
+    $offsetXBox.Text = "Infinity"; $offsetYBox.Text = "NaN"; Commit-OffsetBoxes
+    if ($script:lastValidOffsetX -ne 0 -or $script:lastValidOffsetY -ne 0 -or $offsetXBox.Text -ne "0" -or (Get-T48FileText $script:liveTuneOffsetPath) -ne "0,0") { throw "non-finite X/Y revert" }
+}
+
+Check "F6: the slider's own Right/Left/PageUp/PageDown/Home/End keys still move it, but push to Maya once after the settle, not per press" {
+    # The real tunnelling key event goes through the launcher's handler; the slider's
+    # OWN move is then driven by its routed command (what its key gesture invokes).
+    # WPF matches those gestures against the PHYSICAL keyboard's modifiers, which no
+    # test seam can override, so raising the native key here would make this check
+    # depend on what the user happens to hold during the run.
+    Reset-T48State; Reset-T48RangeState
+    $S = [System.Windows.Controls.Slider]
+    foreach ($kc in @(@([System.Windows.Input.Key]::Right, $S::IncreaseSmall), @([System.Windows.Input.Key]::Right, $S::IncreaseSmall), @([System.Windows.Input.Key]::PageUp, $S::IncreaseLarge))) {
+        $pre = Send-T48Key $zoomSlider $kc[0]                # tunnelling: joins the hold, not claimed
+        if ($pre.Handled) { throw "$($kc[0]) must not be claimed by the stepping handler" }
+        $kc[1].Execute($null, $zoomSlider)                   # the slider moves itself
+    }
+    if ($zoomSlider.Value -ne 12) { throw "Right, Right, PageUp = +12, got $($zoomSlider.Value)" }
+    if ($script:pendingZoomPush) { throw "no push per press" }
+    Stop-ZoomStep
+    if (-not $script:pendingZoomPush -or $script:zoomSliderDragging) { throw "one push after the settle" }
+    $script:pendingZoomPush = $false
+    $null = Send-T48Key $zoomSlider ([System.Windows.Input.Key]::Home)
+    $S::MinimizeValue.Execute($null, $zoomSlider)
+    if ($zoomSlider.Value -ne -50 -or $script:pendingZoomPush) { throw "Home -> -50, held" }
+    Stop-ZoomStep
+    if (-not $script:pendingZoomPush) { throw "Home pushes once after the settle" }
+    foreach ($k in @([System.Windows.Input.Key]::Left, [System.Windows.Input.Key]::PageDown, [System.Windows.Input.Key]::End)) {
+        Reset-T48State
+        $null = Send-T48Key $zoomSlider $k
+        if (-not $script:zoomStepActive) { throw "$k must join the push-hold" }
+    }
+    Reset-T48State
+    $null = Send-T48Key $zoomSlider ([System.Windows.Input.Key]::A)
+    if ($script:zoomStepActive) { throw "other keys must not start a hold" }
+}
+Check "settle delays: the zoom key/wheel step and the X/Y wheel/arrow sessions push to Maya 400 ms after the last input" {
+    if ($script:zoomStepSettleTimer.Interval.TotalMilliseconds -ne 400) { throw "zoom step settle should be 400 ms, got $($script:zoomStepSettleTimer.Interval.TotalMilliseconds)" }
+    if ($script:wheelSettleTimer.Interval.TotalMilliseconds -ne 400) { throw "X/Y wheel settle should be 400 ms, got $($script:wheelSettleTimer.Interval.TotalMilliseconds)" }
+}
+
+Check "over-tolerance counts ignore floating-point noise at the limit (1e-9 x frame width); keys and worst unchanged (real barM, offset 0)" {
+    Set-RealBarmCacheState
+    $script:lastValidOffsetX = 0
+    $cases = @(@(0, $null, 70, 2.0, 0.0), @(0, 2.0, 70, 2.0, 0.0), @(20, 2.0, 395, 15.82, 14.01))
+    foreach ($c in $cases) {
+        $r = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $c[0] -OffsetXPx 0 -ManualTolerancePct $c[1]
+        if ($r.Keys -ne $c[2] -or [Math]::Abs($r.WorstOverflowPct - $c[3]) -gt 0.01) { throw "zoom $($c[0]) T $($c[1]): keys/worst must stay $($c[2]) / $($c[3]), got $($r.Keys) / $($r.WorstOverflowPct)" }
+        if ([Math]::Abs($r.PercentOverTolerance - $c[4]) -gt 0.01) { throw "zoom $($c[0]) T $($c[1]): frames parked AT the limit are not over: expected $($c[4])%, got $($r.PercentOverTolerance)" }
+    }
+    # gate OFF core: a pose whose edge sits on the frame edge up to float noise (0.1 + 0.2 vs 0.3) is not clipped
+    $off = Get-ClippingEstimateCore -CenterX @(0.1 + 0.2) -WidthX @(0.0) -CamPosX 0.0 -HalfOrtho 0.3 -StartIndex 0 -EndIndex 0
+    if ($off.PercentClipped -ne 0) { throw "float noise at the edge must not count as clipped, got $($off.PercentClipped)%" }
+    $off2 = Get-ClippingEstimateCore -CenterX @(0.31) -WidthX @(0.0) -CamPosX 0.0 -HalfOrtho 0.3 -StartIndex 0 -EndIndex 0
+    if ($off2.PercentClipped -ne 100) { throw "a real overshoot still counts, got $($off2.PercentClipped)%" }
+    $script:lastCachePath = $null; $script:cachedFrameArrays = $null; $zoomSlider.Value = 0
+}
+
+Check "per-tick memo: the Estimated line and the gate-OFF worst recompute when ANY input changes (zoom, X, tolerance, cache, monitor rect), and a repeat tick with nothing changed returns the same numbers" {
+    Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
+    $script:lastValidTolerancePct = 2.0; $toleranceValueBox.Text = "2"; Commit-ToleranceValueBox
+    Update-ToleranceReadout; $base = $toleranceReadoutText.Text; $baseW = $script:lastEstimateWorstPct
+    Update-ToleranceReadout
+    if ($toleranceReadoutText.Text -ne $base -or $script:lastEstimateWorstPct -ne $baseW) { throw "an idle repeat must give the same numbers" }
+    $zoomSlider.Value = 20; Update-ToleranceReadout
+    if ($script:lastEstimateWorstPct -le 20) { throw "zoom +20 must recompute (poses wider than the frame), worst $($script:lastEstimateWorstPct)" }
+    $zoomSlider.Value = 0; Update-ToleranceReadout
+    if ($script:lastEstimateWorstPct -ne $baseW) { throw "back to zoom 0 must give the zoom-0 worst again" }
+    $script:lastValidOffsetX = 50; Update-ToleranceReadout
+    $w50 = $script:lastEstimateWorstPct
+    if ($w50 -eq $baseW) { throw "X offset 50 must recompute" }
+    Set-Content -Path $script:frameGateTestRectPath -Value "0,0,2000,1080" -Encoding ASCII; Update-ToleranceReadout
+    if ($script:lastEstimateWorstPct -eq $w50) { throw "a different monitor rect (px -> world) must recompute" }
+    Set-Content -Path $script:frameGateTestRectPath -Value "0,0,1000,1080" -Encoding ASCII
+    $script:lastValidOffsetX = 0
+    $script:lastValidTolerancePct = 10.0; $toleranceValueBox.Text = "10"; Commit-ToleranceValueBox; Update-ToleranceReadout
+    if ($toleranceReadoutText.Text -eq $base) { throw "a new tolerance must recompute" }
+    $script:lastValidTolerancePct = 2.0; $toleranceValueBox.Text = "2"; Commit-ToleranceValueBox
+    @{ frames = @(0,1,2,3,4,5); x_width = @(200,200,200,200,200,200); x_center = @(0,0,0,0,0,0); z_width = @(10,10,10,10,10,10); z_center = @(0,0,0,0,0,0) } |
+        ConvertTo-Json | Set-Content -Path $script:t48RangeCachePath -Encoding UTF8
+    $script:cachedFrameArrays = $null; Update-ToleranceReadout
+    if ($script:lastEstimateWorstPct -ne 0) { throw "a re-parsed cache must recompute (static poses: worst 0), got $($script:lastEstimateWorstPct)" }
+    Set-T48RangeCache
+    $frameGateCheckBox.IsChecked = $false
+    $offBase = $script:lastEstimateWorstPct
+    $script:lastValidOffsetX = 40; Update-ToleranceReadout
+    if ($script:lastEstimateWorstPct -eq $offBase) { throw "gate OFF: X offset must recompute the fixed-camera worst" }
+    $zoomSlider.Value = 10; Update-ToleranceReadout
+    $offZ = $script:lastEstimateWorstPct
+    $zoomSlider.Value = 0; Update-ToleranceReadout
+    if ($offZ -eq $script:lastEstimateWorstPct) { throw "gate OFF: zoom must recompute" }
+    $script:lastValidOffsetX = 0; $frameGateCheckBox.IsChecked = $true
+}
+Check "the Estimated line goes through the ONE formatter (Format-EstimateReadoutText, the bar's rounding rule)" {
+    Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
+    function Format-EstimateReadoutText { param($Keys, $OverPct, $WorstPct) return "FORMATTER:$Keys" }
+    Update-ToleranceReadout
+    if ($toleranceReadoutText.Text -ne "FORMATTER:3") { throw "readout must come from Format-EstimateReadoutText, got '$($toleranceReadoutText.Text)'" }
+}
+
+Check "Maya-bound state bytes: zoom / offset / tolerance / gate files written by the rebuilt paths equal the plain writers' for the same values" {
+    $testGatePath = Join-Path $env:TEMP "rom_launcher_test_t48_bytes_gate.txt"
+    function Get-FrameGatePath { return $testGatePath }
+    Reset-T48State; Reset-T48RangeState
+    $cases = @(
+        @{ Do = { $zoomValueBox.Text = "17"; Commit-ZoomValueBox }; File = { $script:t48Zoom }; Plain = { Write-CameraZoomPct -Value 17 } },
+        @{ Do = { $offsetXBox.Text = "-33"; $offsetYBox.Text = "8"; Commit-OffsetBoxes }; File = { $script:liveTuneOffsetPath }; Plain = { Write-CameraOffsetPx -X -33 -Y 8 } },
+        @{ Do = { $toleranceValueBox.Text = "3.5"; Commit-ToleranceValueBox }; File = { $script:t48Tol }; Plain = { Write-CameraTolerancePct -Value 3.5 } },
+        @{ Do = { $toleranceValueBox.Text = ""; Commit-ToleranceValueBox }; File = { $script:t48Tol }; Plain = { Write-CameraTolerancePct -Value $null } },
+        @{ Do = { $frameGateCheckBox.IsChecked = $false }; File = { $testGatePath }; Plain = { Write-FrameGateEnabled -Enabled $false } }
+    )
+    foreach ($c in $cases) {
+        & $c.Do
+        $a = Get-T48FileBytes (& $c.File)
+        & $c.Plain
+        if ($a -ne (Get-T48FileBytes (& $c.File))) { throw "bytes differ for $($c.Do)" }
+    }
+    $frameGateCheckBox.IsChecked = $true
+    Remove-Item $testGatePath -ErrorAction SilentlyContinue
+}
+
+Reset-T48RangeState
+Remove-Item $script:t48RangeCachePath -ErrorAction SilentlyContinue
+
+Reset-T48State
+$zoomSlider.Value = 0
+$script:pendingZoomPush = $false
+${function:Get-CameraZoomPctPath} = $script:t48RealZoomPathFn
+${function:Get-CameraTolerancePctPath} = $script:t48RealTolPathFn
+Remove-Item $script:t48Zoom -ErrorAction SilentlyContinue
+Remove-Item $script:t48Tol -ErrorAction SilentlyContinue
+try { $script:t48Source.Dispose() } catch { }
 
 Remove-Item $script:frameGateTestCachePath -ErrorAction SilentlyContinue
 Remove-Item $script:frameGateTestRectPath -ErrorAction SilentlyContinue

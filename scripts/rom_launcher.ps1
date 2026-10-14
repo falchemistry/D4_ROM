@@ -33,7 +33,7 @@ $script:ToolVersion = "1.0.0"
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="D4 ROM Capture" Width="420" Height="600" MinWidth="380" MinHeight="450"
+        Title="D4 ROM Capture" Width="420" Height="600" MinWidth="380" MinHeight="549"
         ResizeMode="CanResize" Background="#FF3C3C3C">
     <Window.Resources>
         <!-- Same dark palette as MayaSkinningCheck/MayaShelves' shared
@@ -599,9 +599,11 @@ $script:ToolVersion = "1.0.0"
             </StackPanel>
             <StackPanel x:Name="StartEndPanel" Orientation="Horizontal" Margin="0,0,0,4" Visibility="Collapsed">
                 <TextBlock Text="Start" VerticalAlignment="Center" Margin="0,0,4,0"/>
-                <TextBox x:Name="StartFrameBox" Width="50" Text="0" Margin="0,0,10,0"/>
+                <TextBox x:Name="StartFrameBox" Width="50" Text="0" Margin="0,0,10,0"
+                         ToolTip="First frame to record. Up/Down arrows or the mouse wheel step by 1 (Shift = 10)."/>
                 <TextBlock Text="End" VerticalAlignment="Center" Margin="0,0,4,0"/>
-                <TextBox x:Name="EndFrameBox" Width="50" Text="100"/>
+                <TextBox x:Name="EndFrameBox" Width="50" Text="100"
+                         ToolTip="Last frame to record. Up/Down arrows or the mouse wheel step by 1 (Shift = 10)."/>
             </StackPanel>
             <TextBlock Text="Only applies to Start Recording -- Preview never records."
                        TextWrapping="Wrap" FontSize="10" Foreground="#FFA0A0A0" Margin="0,2,0,10"/>
@@ -616,102 +618,190 @@ $script:ToolVersion = "1.0.0"
                  Recording, since it just fixes a real mismatch (Maya's
                  current-time cursor vs. the capture range's actual Start)
                  rather than being an optional creative choice. -->
-            <TextBlock Text="Frame Offsets" FontWeight="Bold" Margin="0,0,0,4"/>
+            <!-- Adjust section (task48 rebuild, 2026-10-12; user-approved mock 3a):
+                 one "Adjust" header with the Reset icon at its right end, then
+                 hairline-separated rows: Zoom / X, Y + arrow pad / Frame gate
+                 toggle + Tolerance diagram with its number cap, and the
+                 Estimated readout under it. Reset is DECLARED after Y although it
+                 sits in the header, so Tab still goes Zoom box, slider, X, Y,
+                 Reset, Frame gate, Tolerance; the diagram and the cap are plain
+                 Borders, never Tab stops. Reset covers the whole section (Zoom/X/Y
+                 0, Frame gate ON, Tolerance Auto). Live updates stay DEFERRED to
+                 release / key-settle (2026-09-08, user feedback after trying
+                 continuous live update: "it feels jumpy"): box and slider text
+                 update instantly, the Maya push fires once input settles, via
+                 $script:zoomSliderDragging / Stop-ZoomStep / Stop-OffsetWheelNudge
+                 / the arrow pad's KeyUp. A single click or a typed commit is a
+                 one-shot and applies at once. The Zoom box is editable, not just
+                 the slider: typing an exact value goes through the SAME
+                 Write-CameraZoomPct path as the slider (Commit-ZoomValueBox moves
+                 the slider), so there is only one place that writes the file. -->
+            <StackPanel x:Name="FrameOffsetsGrid" Grid.IsSharedSizeScope="True" Margin="0,0,0,10">
+                <Grid x:Name="AdjustTopGrid">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" SharedSizeGroup="AdjLabel"/>
+                        <ColumnDefinition Width="*" MinWidth="44"/>
+                        <ColumnDefinition Width="Auto" SharedSizeGroup="AdjUnit"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*" MinWidth="44"/>
+                        <ColumnDefinition Width="Auto" SharedSizeGroup="AdjUnit"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
 
-            <!-- Zoom, Offset, arrow-nudge pad, and Reset all share one row
-                 (2026-09-08 revision): compact, left-aligned, no full-panel
-                 stretch. Zoom order is label, typed value, slider: the
-                 exact value box comes right after the label since typing
-                 is the precise way to set this, with the slider last for
-                 casual dragging.
+                    <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="7" Text="Adjust" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,0,4"/>
 
-                 Live updates are DEFERRED to release, not continuous
-                 (2026-09-08, user feedback after trying continuous live
-                 update: "it feels jumpy"). The compromise is that
-                 box/slider text updates instantly, but the actual Maya
-                 push only fires once the drag/key/slider-thumb is
-                 released, via $script:zoomSliderDragging /
-                 Stop-OffsetBoxDrag / the arrow-pad's KeyUp handler below.
-                 A single click (not a drag) or a typed commit is already
-                 a one-shot action and still applies immediately. Only
-                 genuinely CONTINUOUS interactions get deferred. -->
-            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-                <TextBlock Text="Zoom" VerticalAlignment="Center" Margin="0,0,4,0"/>
-                <!-- Editable, not just the slider: typing an exact value and
-                     pressing Enter (or clicking away) is more precise than
-                     dragging for repeatable settings. Commits go through the
-                     SAME Write-CameraZoomPct path as the slider (see
-                     Commit-ZoomValueBox below), just by moving the slider to
-                     match, so there is only one place that writes the file. -->
-                <TextBox x:Name="ZoomValueBox" Width="36" Height="24" VerticalContentAlignment="Center" TextAlignment="Right" Margin="0,0,2,0"
-                         ToolTip="Type an exact magnifier value from -50 to 50, then press Enter or click away to apply. 0 is the safe default sized to fit the widest pose."/>
-                <TextBlock Text="%" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                <Slider x:Name="ZoomSlider" Width="60" Minimum="-50" Maximum="50" Value="0"
-                        TickFrequency="10" IsSnapToTickEnabled="False" VerticalAlignment="Center" Margin="0,0,10,0"
-                        ToolTip="Adjusts the camera framing +/-50% around the safe default (0%), which is sized to always fit the animation's widest pose. Positive zooms in, negative zooms out for more headroom. Applies once you release the drag; type an exact value instead if you prefer instant apply."/>
-                <!-- Repositioned before X/Y (2026-09-08) and repurposed:
-                     no longer a drag surface (drag moved to the X/Y boxes
-                     themselves). Hovering here activates all 4 arrow
-                     keys to nudge offset, X/Y boxes updating live, without
-                     needing to click into anything first. -->
-                <Border x:Name="ArrowNudgePad" Width="28" Height="28" Background="#FF3A3A3A" BorderBrush="#FF707070" BorderThickness="1"
-                        Margin="0,0,10,0"
-                        ToolTip="Hover here, then use the arrow keys to nudge offset 10px at a time (Shift = 100px) -- X/Y update as you go, applied once you release the key. Type an exact value in the box for finer precision.">
-                    <Path Data="M4,14 L24,14 M14,4 L14,24" Stroke="#FFA0A0A0" StrokeThickness="1"/>
-                </Border>
-                <TextBlock Text="X" FontWeight="Bold" Foreground="Red" VerticalAlignment="Center" Margin="0,0,4,0"
-                           ToolTip="Horizontal pixel offset, +/- (positive moves the subject right on screen)."/>
-                <TextBox x:Name="OffsetXBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center" Margin="0,0,10,0"
-                         ToolTip="Type a horizontal pixel offset (Enter or click away to apply), or scroll the mouse wheel here: 10px per notch, Shift = 100px -- applies once you stop scrolling."/>
-                <TextBlock Text="Y" FontWeight="Bold" Foreground="LimeGreen" VerticalAlignment="Center" Margin="0,0,4,0"
-                           ToolTip="Vertical pixel offset, +/- (positive moves the subject up on screen)."/>
-                <TextBox x:Name="OffsetYBox" Text="0" Width="36" Height="24" TextAlignment="Right" VerticalContentAlignment="Center" Margin="0,0,10,0"
-                         ToolTip="Type a vertical pixel offset (Enter or click away to apply), or scroll the mouse wheel here: 10px per notch, Shift = 100px -- applies once you stop scrolling."/>
-                <Button x:Name="ResetFrameOffsetsButton" Width="24" Height="24" Padding="0"
-                        ToolTip="Reset Zoom, X, and Y to their safe defaults (0). Applies immediately.">
-                    <TextBlock Text="&#x21BA;" FontSize="14"/>
-                </Button>
+                    <!-- Zoom -->
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Zoom" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox Grid.Row="1" Grid.Column="1" x:Name="ZoomValueBox" Height="24" VerticalContentAlignment="Center" TextAlignment="Right"
+                             ToolTip="Type an exact magnifier value from -50 to 50, then press Enter or click away to apply. 0 is the safe default sized to fit the widest pose. Up/Down arrows or the mouse wheel step by 10 (Shift = 100, Ctrl = 1); Maya follows once you stop."/>
+                    <TextBlock Grid.Row="1" Grid.Column="2" Text="%" VerticalAlignment="Center" Margin="4,0,0,0"/>
+                    <!-- SmallChange/LargeChange (task48): WPF's defaults (0.1 / 1)
+                         are rounded away by the ValueChanged handler, so the
+                         focused slider's own arrow / PageUp / PageDown keys
+                         looked dead. 1 / 10 move whole percent, visibly. -->
+                    <Slider Grid.Row="1" Grid.Column="3" Grid.ColumnSpan="5" x:Name="ZoomSlider" Minimum="-50" Maximum="50" Value="0" SmallChange="1" LargeChange="10"
+                            TickFrequency="10" IsSnapToTickEnabled="False" VerticalAlignment="Center" Margin="12,0,0,0"
+                            ToolTip="Adjusts the camera framing +/-50% around the safe default (0%), which is sized to always fit the animation's widest pose. Positive zooms in, negative zooms out for more headroom. Applies once you release the drag; type an exact value instead if you prefer instant apply. Up/Down arrows or the mouse wheel: 10 per step (Shift = 100, Ctrl = 1); Left/Right: 1."/>
+
+                    <Border Grid.Row="2" Grid.ColumnSpan="8" Height="1" Background="#FF686868" Margin="0,5,0,5"/>
+
+                    <!-- Offset X / Y, with the hover-gated arrow-nudge pad beside them
+                         (24x24, same height as the boxes). Hovering the pad activates
+                         all 4 arrow keys to nudge offset, X/Y boxes updating live,
+                         without clicking into anything. -->
+                    <TextBlock Grid.Row="3" Grid.Column="0" Text="X" FontWeight="Bold" Foreground="Red" VerticalAlignment="Center" Margin="0,0,6,0"
+                               ToolTip="Horizontal pixel offset, +/- (positive moves the subject right on screen)."/>
+                    <TextBox Grid.Row="3" Grid.Column="1" x:Name="OffsetXBox" Text="0" Height="24" TextAlignment="Right" VerticalContentAlignment="Center"
+                             ToolTip="Type a horizontal pixel offset (Enter or click away to apply), or use the Up/Down arrows or the mouse wheel here: 10px per step, Shift = 100px, Ctrl = 1px -- applies once you stop."/>
+                    <TextBlock Grid.Row="3" Grid.Column="2" Text="px" VerticalAlignment="Center" Margin="4,0,0,0"/>
+                    <TextBlock Grid.Row="3" Grid.Column="3" Text="Y" FontWeight="Bold" Foreground="LimeGreen" VerticalAlignment="Center" Margin="12,0,6,0"
+                               ToolTip="Vertical pixel offset, +/- (positive moves the subject up on screen)."/>
+                    <TextBox Grid.Row="3" Grid.Column="4" x:Name="OffsetYBox" Text="0" Height="24" TextAlignment="Right" VerticalContentAlignment="Center"
+                             ToolTip="Type a vertical pixel offset (Enter or click away to apply), or use the Up/Down arrows or the mouse wheel here: 10px per step, Shift = 100px, Ctrl = 1px -- applies once you stop."/>
+                    <TextBlock Grid.Row="3" Grid.Column="5" Text="px" VerticalAlignment="Center" Margin="4,0,0,0"/>
+                    <Border Grid.Row="3" Grid.Column="6" x:Name="ArrowNudgePad" Width="24" Height="24" Background="#FF3A3A3A" BorderBrush="#FF707070" BorderThickness="1" Margin="12,0,0,0"
+                            ToolTip="Hover here, then use the arrow keys to nudge offset 10px at a time (Shift = 100px) -- X/Y update as you go, applied once you release the key. Type an exact value in the box for finer precision.">
+                        <Path Data="M3,11 L19,11 M11,3 L11,19" Stroke="#FFA0A0A0" StrokeThickness="1"/>
+                    </Border>
+
+                    <!-- Reset (whole Adjust section) sits in the header, declared after Y for the Tab order. -->
+                    <Button Grid.Row="0" Grid.Column="7" x:Name="ResetFrameOffsetsButton" Width="24" Height="24" Padding="0" Margin="8,0,0,4" HorizontalAlignment="Right" VerticalAlignment="Center"
+                            AutomationProperties.Name="Reset Adjust section"
+                            ToolTip="Reset the Adjust section: Zoom 0, X 0, Y 0, Frame gate back ON, Tolerance back to Auto. Applies immediately.">
+                        <TextBlock Text="&#x21BA;" FontSize="14"/>
+                    </Button>
+                </Grid>
+
+                <Border Height="1" Background="#FF686868" Margin="0,5,0,5"/>
+
+                <Grid x:Name="AdjustGateGrid">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <!-- Frame gate: the same CheckBox, drawn as an icon-only toggle
+                         (user decision 7a / ON-2): viewfinder brackets with a blue
+                         box filling their interior; ON = dark pill, thin blue ring,
+                         light brackets; OFF = dark pill, grey box, struck through.
+                         Unchecked turns off only the automatic drift TRACKING
+                         (frame-WIDTH sizing always stays), leaving the camera fixed
+                         at the current framing. Default checked and reset to checked
+                         every launch (the startup reset block near the end of this
+                         file). Focusable, Space toggles, white ring on keyboard focus. -->
+                    <CheckBox Grid.Row="0" Grid.Column="0" x:Name="FrameGateCheckBox" Content="" IsChecked="True" Height="24" VerticalAlignment="Center" HorizontalAlignment="Left"
+                              FocusVisualStyle="{x:Null}" AutomationProperties.Name="Frame gate">
+                        <CheckBox.Style>
+                            <Style TargetType="CheckBox">
+                                <Setter Property="ToolTip" Value="Frame gate is ON: the camera tracks the subject and nudges back small drift. Click (or press Space) to turn it OFF and keep the camera fixed at the current framing."/>
+                                <Style.Triggers>
+                                    <Trigger Property="IsChecked" Value="False">
+                                        <Setter Property="ToolTip" Value="Frame gate is OFF: the camera stays fixed for the whole take at the current framing; watch the Preview glow and the Tolerance bar for clipping. Click (or press Space) to turn it ON."/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </CheckBox.Style>
+                        <CheckBox.Template>
+                            <ControlTemplate TargetType="CheckBox">
+                                <Border x:Name="Pill" CornerRadius="3" Background="#FF1F1F1F" BorderBrush="#FF5A5A5A" BorderThickness="1" Padding="6,0,6,0" Height="24">
+                                    <Canvas Width="16" Height="16" VerticalAlignment="Center">
+                                        <Rectangle x:Name="GateFill" Canvas.Left="1" Canvas.Top="1" Width="14" Height="14" Fill="#FF5A5A5A"/>
+                                        <Path x:Name="GateBrackets" Data="M1,5 L1,1 L5,1 M11,1 L15,1 L15,5 M15,11 L15,15 L11,15 M5,15 L1,15 L1,11" Stroke="#FFB4B4B4" StrokeThickness="1.7"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+                                        <Path x:Name="GateSlash" Data="M3,13 L13,3" Stroke="#FFD0D0D0" StrokeThickness="1.7" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    </Canvas>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="True">
+                                        <Setter TargetName="Pill" Property="BorderBrush" Value="#FF2F8CFF"/>
+                                        <Setter TargetName="GateBrackets" Property="Stroke" Value="#FFE6E6E6"/>
+                                        <Setter TargetName="GateFill" Property="Fill" Value="#FF2F8CFF"/>
+                                        <Setter TargetName="GateSlash" Property="Visibility" Value="Collapsed"/>
+                                    </Trigger>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="Pill" Property="BorderBrush" Value="#FFC8C8C8"/>
+                                    </Trigger>
+                                    <Trigger Property="IsKeyboardFocused" Value="True">
+                                        <Setter TargetName="Pill" Property="BorderBrush" Value="#FFFFFFFF"/>
+                                        <Setter TargetName="Pill" Property="BorderThickness" Value="2"/>
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </CheckBox.Template>
+                    </CheckBox>
+                    <!-- Tolerance (user decisions 8a / 10b / W5): a display-only
+                         diagram (TolVisualHost, drawn by Update-ToleranceVisual) and the
+                         editable number in a cap at its right end. The number is the
+                         same ToleranceValueBox as always (transparent, borderless inside
+                         the bordered cap; "Auto" hides the %), so Up/Down, wheel, Enter,
+                         LostFocus and typing are unchanged; clicking anywhere on the cap
+                         focuses it. The wheel anywhere over this cell steps the number.
+                         Blank/"Auto" (the default, reset every launch) keeps the
+                         zoom-derived formula; a typed 0.0-20.0 fixes the slack. With the
+                         gate OFF the SAME number is the clipping-warning threshold (Q4:
+                         reuse), so it is deliberately NOT greyed out. -->
+                    <Grid Grid.Row="0" Grid.Column="1" x:Name="ToleranceCell" Margin="10,0,0,0" HorizontalAlignment="Left" Width="284" Height="24">
+                        <Border x:Name="TolVisualHost" HorizontalAlignment="Left" Width="226" Height="24" Background="#FF1C1C1C" BorderBrush="#FF4C4C4C" BorderThickness="1"/>
+                        <Border x:Name="TolNumberCap" HorizontalAlignment="Right" Width="58" Height="24" Cursor="IBeam">
+                            <Border.Style>
+                                <Style TargetType="Border">
+                                    <Setter Property="Background" Value="#FF1C1C1C"/>
+                                    <Setter Property="BorderBrush" Value="#FF4C4C4C"/>
+                                    <Setter Property="BorderThickness" Value="1"/>
+                                    <Style.Triggers>
+                                        <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                            <Setter Property="BorderBrush" Value="#FFFFFFFF"/>
+                                            <Setter Property="BorderThickness" Value="2"/>
+                                        </Trigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Border.Style>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,6,0">
+                                <TextBox x:Name="ToleranceValueBox" Width="32" Height="20" Background="Transparent" BorderThickness="0" Padding="0" TextAlignment="Right" VerticalContentAlignment="Center" Text="Auto"
+                                         ToolTip="Tolerance, 0-20 percent of the frame width per side, or Auto (the zoom-derived value). Type a number and press Enter, clear the box to go back to Auto. Up/Down arrows or the mouse wheel step by 1 (Shift = 10, Ctrl = 0.1); from Auto they start at Auto's current value. With Frame gate OFF this same number is the clipping-warning threshold instead."/>
+                                <TextBlock x:Name="TolPctSuffix" Text="%" Margin="2,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                    <!-- Estimated readout (2026-09-29, Q6; task48 rebuild): read-only,
+                         gate ON only, for whichever tolerance is in effect, measured
+                         over the frames the chosen Time Range would record
+                         (Update-ToleranceReadout); a dash placeholder plus the reason
+                         when there is nothing to measure yet. -->
+                    <TextBlock Grid.Row="1" Grid.Column="1" x:Name="ToleranceReadoutText" Text="" FontSize="11" Foreground="Gray" TextWrapping="Wrap" Margin="10,2,0,0"
+                               ToolTip="What the automatic guard is predicted to do at the current Zoom/Offset/Tolerance over the frames the chosen Time Range records -- keys written, percent of frames still over tolerance, and the worst single frame's overflow as a percent of the frame width."/>
+                </Grid>
             </StackPanel>
-
-            <!-- Frame gate (2026-09-28): its own row directly under Zoom/
-                 Offset, per the project's own three-piece breakdown:
-                 frame-WIDTH sizing above always stays; this checkbox only
-                 turns off the automatic drift TRACKING/correction, leaving
-                 the camera fixed at whatever framing was already set.
-                 Default checked; reset to checked every launch, same
-                 "never silently restore a forgotten value" rule as
-                 Offset/Recenter (see the startup reset block near the end
-                 of this file). Text ON the checkbox, not a separate
-                 TextBlock, established alignment convention. The Reset
-                 (arrow) button above is deliberately scoped to Zoom/X/Y
-                 only and does not touch this row. -->
-            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-                <CheckBox x:Name="FrameGateCheckBox" Content="Frame gate" IsChecked="True" VerticalAlignment="Center" Margin="0,0,12,0"
-                          ToolTip="Checked: the camera automatically tracks the subject and nudges back small drift. Unchecked: the camera stays fixed for the whole take at the current framing -- watch the Preview glow/tooltip for clipping."/>
-                <!-- Tolerance box (2026-09-29, Part 3): manual override for
-                     the guard's own drift slack. Blank/"Auto" (the default,
-                     reset every launch like every other Frame Offsets
-                     control) keeps today's zoom-derived formula; a typed
-                     0.0-20.0 number fixes the slack at that value regardless
-                     of zoom/offset. With the gate OFF, the SAME number is
-                     reused as the clipping-warning threshold instead of the
-                     hardcoded 2% default (Q4: reuse, recommended). -->
-                <TextBlock Text="Tolerance" VerticalAlignment="Center" Margin="0,0,4,0"/>
-                <TextBox x:Name="ToleranceValueBox" Width="44" Height="24" VerticalContentAlignment="Center" TextAlignment="Right" Margin="0,0,2,0" Text="Auto"
-                         ToolTip="Camera reacts when the character passes the frame edge by more than this. Auto = today's formula (shrinks as you zoom in). Type 0.0-20.0 to fix it regardless of zoom/offset. With Frame gate OFF, this same number is the clipping-warning threshold instead of the default 2%."/>
-                <TextBlock Text="%" VerticalAlignment="Center"/>
-            </StackPanel>
-
-            <!-- Tolerance readout (2026-09-29, Part 3 step 3, Q6: recommended
-                 and included). Read-only: reflects whichever tolerance is
-                 actually in effect (Auto or manual), so a deliberate manual
-                 value is never a silent surprise. Updated on the SAME
-                 60ms live-apply tick as the glow (Update-ToleranceReadout,
-                 called alongside Update-FrameGateGlow): ON-mode only, per
-                 its own function's gating; text is cleared while the gate
-                 is OFF or nothing is known yet. -->
-            <TextBlock x:Name="ToleranceReadoutText" Text="" FontSize="11" Foreground="Gray" Margin="0,0,0,10" TextWrapping="Wrap"
-                       ToolTip="What the automatic guard is predicted to do at the current Zoom/Offset/Tolerance, over the whole cached take -- keys written, percent of frames still over tolerance, and the worst single frame's overflow as a percent of the frame width."/>
 
             <!-- Only Start Recording toggles into Stop Recording, matching
                  that this is the one action that mirrors OBS's own
@@ -823,6 +913,10 @@ $resetFrameOffsetsButton = $window.FindName("ResetFrameOffsetsButton")
 $frameGateCheckBox = $window.FindName("FrameGateCheckBox")
 $toleranceValueBox = $window.FindName("ToleranceValueBox")
 $toleranceReadoutText = $window.FindName("ToleranceReadoutText")
+$toleranceCell = $window.FindName("ToleranceCell")
+$tolVisualHost = $window.FindName("TolVisualHost")
+$tolNumberCap = $window.FindName("TolNumberCap")
+$tolPctSuffix = $window.FindName("TolPctSuffix")
 $previewButton = $window.FindName("PreviewButton")
 $startRecordingButton = $window.FindName("StartRecordingButton")
 $resetButton = $window.FindName("ResetButton")
@@ -2002,13 +2096,15 @@ function Get-ClippingEstimateCore {
     if ($total -le 0) { return [PSCustomObject]@{ PercentClipped = 0.0; WorstOverflowPct = 0.0 } }
     $clipped = 0
     $worst = 0.0
+    # task48 fix round: a frame only counts as clipped past a tiny relative
+    # epsilon (1e-9 x the frame width), so floating-point noise at exactly
+    # the frame edge is not counted; the worst value is tracked as before.
+    $noise = 1e-9 * 2.0 * $HalfOrtho
     for ($i = $StartIndex; $i -le $EndIndex; $i++) {
         $halfX = $WidthX[$i] / 2.0
         $ov = [Math]::Max(($CamPosX - $HalfOrtho) - ($CenterX[$i] - $halfX), ($CenterX[$i] + $halfX) - ($CamPosX + $HalfOrtho))
-        if ($ov -gt 0) {
-            $clipped++
-            if ($ov -gt $worst) { $worst = $ov }
-        }
+        if ($ov -gt 0 -and $ov -gt $worst) { $worst = $ov }
+        if ($ov -gt $noise) { $clipped++ }
     }
     $frameWidth = 2.0 * $HalfOrtho
     return [PSCustomObject]@{
@@ -2124,14 +2220,33 @@ function Get-EdgeGuardCurveEstimateCore {
         [Parameter(Mandatory=$true)][double]$Overflow,
         [Parameter(Mandatory=$true)][double]$OffsetShift,
         [Parameter(Mandatory=$true)][int]$StartIndex,
-        [Parameter(Mandatory=$true)][int]$EndIndex
+        [Parameter(Mandatory=$true)][int]$EndIndex,
+        # task48 rebuild (time range): the curve is ALWAYS simulated over
+        # StartIndex..EndIndex (the whole cache, exactly like the keyer, which
+        # never restarts at the capture range), but keys / frames over
+        # tolerance / worst are MEASURED only over MeasureStart..MeasureEnd --
+        # the frames the chosen Time Range records. Omitted = the whole
+        # simulated span (the pre-rebuild behaviour, byte-identical). The first
+        # measured frame is the recording's Start, where apply_recenter_override
+        # puts a true-centre key (single-frame notch, maya_key_from_cache.py),
+        # so it is measured at the cached centre there; at index 0 that is the
+        # curve's own anchor anyway. Keys = the guard keys whose frame lies in
+        # the measured span (the recenter's own pinning keys are not counted,
+        # same as before).
+        [Nullable[int]]$MeasureStartIndex = $null,
+        [Nullable[int]]$MeasureEndIndex = $null
     )
     $total = $EndIndex - $StartIndex + 1
     if ($total -le 0) { return [PSCustomObject]@{ Keys = 0; PercentOverTolerance = 0.0; WorstOverflowPct = 0.0 } }
+    $measureStart = if ($null -ne $MeasureStartIndex) { [Math]::Max($StartIndex, [int]$MeasureStartIndex) } else { $StartIndex }
+    $measureEnd = if ($null -ne $MeasureEndIndex) { [Math]::Min($EndIndex, [int]$MeasureEndIndex) } else { $EndIndex }
+    if ($measureEnd -lt $measureStart) { return [PSCustomObject]@{ Keys = 0; PercentOverTolerance = 0.0; WorstOverflowPct = 0.0 } }
 
     $camPos = $CenterX[$StartIndex]
     $keys = 1
     $lastKeyedIndex = $StartIndex
+    $keyedIndices = New-Object 'System.Collections.Generic.List[int]'
+    $keyedIndices.Add($StartIndex)
     [double[]]$camPosAt = New-Object 'double[]' $total
     $camPosAt[0] = $camPos
 
@@ -2146,24 +2261,32 @@ function Get-EdgeGuardCurveEstimateCore {
                 $camPos = $leftEdge + $HalfOrtho + $Overflow
                 $keys++
                 $lastKeyedIndex = $i
+                $keyedIndices.Add($i)
             } elseif ($rightEdge -gt $allowedRight) {
                 $camPos = $rightEdge - $HalfOrtho - $Overflow
                 $keys++
                 $lastKeyedIndex = $i
+                $keyedIndices.Add($i)
             }
             # else: within tolerance already, cam_pos unchanged, no new key.
         }
         # else: [B] hold -- pose cannot fit even at full tolerance.
         $camPosAt[$i - $StartIndex] = $camPos
     }
-    if ($lastKeyedIndex -ne $EndIndex) { $keys++ }
+    if ($lastKeyedIndex -ne $EndIndex) { $keys++; $keyedIndices.Add($EndIndex) }
+    if ($measureStart -ne $StartIndex -or $measureEnd -ne $EndIndex) {
+        $keys = 0
+        foreach ($k in $keyedIndices) { if ($k -ge $measureStart -and $k -le $measureEnd) { $keys++ } }
+    }
 
     $overCount = 0
     $worst = 0.0
     $frameWidth = 2.0 * $HalfOrtho
-    for ($i = $StartIndex; $i -le $EndIndex; $i++) {
+    $total = $measureEnd - $measureStart + 1
+    for ($i = $measureStart; $i -le $measureEnd; $i++) {
         $halfW2 = $WidthX[$i] / 2.0
-        $shiftedCamPos = $camPosAt[$i - $StartIndex] - $OffsetShift
+        $heldCamPos = if ($i -eq $measureStart) { $CenterX[$i] } else { $camPosAt[$i - $StartIndex] }
+        $shiftedCamPos = $heldCamPos - $OffsetShift
         $ov = [Math]::Max(($shiftedCamPos - $HalfOrtho) - ($CenterX[$i] - $halfW2), ($CenterX[$i] + $halfW2) - ($shiftedCamPos + $HalfOrtho))
         # "Over tolerance" means the raw overflow (beyond the plain HalfOrtho
         # edge) EXCEEDS the tolerance cushion itself (Overflow, already in
@@ -2176,7 +2299,11 @@ function Get-EdgeGuardCurveEstimateCore {
         # positive ov can be the worst, whether or not it individually
         # exceeds the cushion) -- only the COUNT needed the T-relative check.
         if ($ov -gt 0 -and $ov -gt $worst) { $worst = $ov }
-        if ($ov -gt $Overflow) {
+        # task48 fix round: the guard parks an edge EXACTLY at the limit, so
+        # "over" needs a tiny relative epsilon (1e-9 x the frame width) or
+        # floating-point noise at the limit counts as over (zoom 0 Auto read
+        # 2.1% over while nothing actually passed it).
+        if ($ov -gt $Overflow + 1e-9 * $frameWidth) {
             $overCount++
         }
     }
@@ -2193,16 +2320,20 @@ function Get-ToleranceReadoutEstimate {
     # frame width" readout (2026-09-29, Part 3 step 3, Q6: recommended and
     # included). ON-mode only -- this simulates the G+B guard itself, which
     # only runs while Frame gate is ON; callers branch on the checkbox the
-    # same way Update-FrameGateGlow already does. Always the WHOLE cached
-    # take, no resolved-range option -- same convention as the glow's own
-    # continuous display (Q-rng: "whole cached take on the glow tick"),
-    # unlike the click-time OFF-mode prompt which resolves a real range.
+    # same way Update-FrameGateGlow already does. The guard is always
+    # simulated over the WHOLE cached take (the keyer builds its curve that
+    # way, whatever the capture range); task48 rebuild: the numbers are
+    # MEASURED over -MeasureStartIndex..-MeasureEndIndex, the cached frames
+    # the chosen Time Range records (Get-EstimateRange). Omitted = the whole
+    # take, as before.
     param(
         [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")]
         [string]$Axis,
         [Parameter(Mandatory=$true)][double]$ZoomPct,
         [Parameter(Mandatory=$true)][double]$OffsetXPx,
-        [Nullable[double]]$ManualTolerancePct = $null
+        [Nullable[double]]$ManualTolerancePct = $null,
+        [Nullable[int]]$MeasureStartIndex = $null,
+        [Nullable[int]]$MeasureEndIndex = $null
     )
     $arrays = Get-CachedFrameArrays
     if ($arrays -eq $null) { return $null }
@@ -2246,21 +2377,24 @@ function Get-ToleranceReadoutEstimate {
     $startIdx = 0
     $endIdx = $frames.Count - 1
 
+    $mStart = $MeasureStartIndex
+    $mEnd = $MeasureEndIndex
+
     if ($Axis -eq "LeftRight") {
         return Get-EdgeGuardCurveEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
-            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx -MeasureStartIndex $mStart -MeasureEndIndex $mEnd
     }
     if ($Axis -eq "FrontBack") {
         return Get-EdgeGuardCurveEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
-            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+            -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx -MeasureStartIndex $mStart -MeasureEndIndex $mEnd
     }
     # "All": same "independent per axis, report the worse W with its own P"
     # rule as Get-ClippingEstimate, for the same reason (never mix a P from
     # one camera with a W from the other).
     $fb = Get-EdgeGuardCurveEstimateCore -CenterX $arrays.XCenter -WidthX $arrays.XWidth `
-        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx -MeasureStartIndex $mStart -MeasureEndIndex $mEnd
     $lr = Get-EdgeGuardCurveEstimateCore -CenterX $arrays.ZCenter -WidthX $arrays.ZWidth `
-        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx
+        -HalfOrtho $halfOrtho -Overflow $overflow -OffsetShift $offsetShift -StartIndex $startIdx -EndIndex $endIdx -MeasureStartIndex $mStart -MeasureEndIndex $mEnd
     if ($lr.WorstOverflowPct -gt $fb.WorstOverflowPct) { return $lr }
     return $fb
 }
@@ -2305,8 +2439,16 @@ function Update-FrameGateGlow {
     # see Get-ClippingWarningThresholdPct). P never gates the glow color,
     # only feeds the wording -- same "worst overflow alone decides" rule
     # Get-ClippingEstimate's own "All" resolution follows.
+    # task48 rebuild: over the frames the chosen Time Range records (same
+    # range as the Tolerance bar); a range the launcher cannot know yet falls
+    # back to the whole cached take, as before, so the warning is never lost.
     $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
-    $estimate = Get-ClippingEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX
+    $estimateRange = Get-CurrentEstimateRange
+    if ($estimateRange.Known) {
+        $estimate = Get-GateOffRangeEstimate $estimateRange
+    } else {
+        $estimate = Get-ClippingEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX
+    }
     $threshold = Get-ClippingWarningThresholdPct
     if ($estimate -eq $null) {
         $previewButton.Effect = $null
@@ -2330,23 +2472,246 @@ function Update-ToleranceReadout {
     # Live "Estimated: N keys, X% of frames over tolerance, worst Y% of
     # frame width" (2026-09-29, Part 3 step 3, Q6). ON-mode only -- this
     # simulates the G+B guard itself, which only runs while Frame gate is
-    # ON; cleared (not left stale) while OFF or unknown, same "never leave
-    # a forgotten value visible" discipline as every other Frame Offsets
-    # control's own reset behavior.
+    # ON; the text is cleared while OFF, same "never leave a forgotten value
+    # visible" discipline as every other Adjust control.
+    # task48 rebuild: measured over the frames the chosen Time Range records
+    # (Get-CurrentEstimateRange); nothing to measure -> "Estimated: --" with
+    # the reason. The worst value is also kept as a NUMBER
+    # ($script:lastEstimateWorstPct, $null when unknown) for the Tolerance
+    # bar; with the gate OFF it is the fixed-camera clipping estimate over the
+    # same range instead (the bar's red "over" part = the glow's red).
+    $range = Get-CurrentEstimateRange
+    $script:lastEstimateRange = $range
     if (-not $frameGateCheckBox.IsChecked) {
         $toleranceReadoutText.Text = ""
+        $offEstimate = if ($range.Known) { Get-GateOffRangeEstimate $range } else { $null }
+        $script:lastEstimateWorstPct = if ($null -ne $offEstimate) { [double]$offEstimate.WorstOverflowPct } else { $null }
+        Update-ToleranceVisual
         return
     }
-    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
-    $manualPct = Read-CameraTolerancePct
-    $estimate = Get-ToleranceReadoutEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct $manualPct
+    $estimate = $null
+    if ($range.Known) {
+        $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+        $manualPct = Read-CameraTolerancePct
+        $estimate = Invoke-EstimateMemo "readout" "$axis|$($zoomSlider.Value)|$($script:lastValidOffsetX)|$manualPct|$($range.StartIndex)|$($range.EndIndex)" {
+            Get-ToleranceReadoutEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct $manualPct `
+                -MeasureStartIndex $range.StartIndex -MeasureEndIndex $range.EndIndex
+        }
+    }
     if ($estimate -eq $null) {
-        $toleranceReadoutText.Text = ""
-        return
+        $script:lastEstimateWorstPct = $null
+        $toleranceReadoutText.Text = Get-EstimatePendingText -Reason $range.Reason
+    } else {
+        $script:lastEstimateWorstPct = [double]$estimate.WorstOverflowPct
+        # One rounding rule with the bar (Format-EstimateReadoutText, the
+        # split's half-away-from-zero), same text format as before.
+        $toleranceReadoutText.Text = Format-EstimateReadoutText -Keys $estimate.Keys -OverPct $estimate.PercentOverTolerance -WorstPct $estimate.WorstOverflowPct
     }
-    $overRounded = [Math]::Round($estimate.PercentOverTolerance, 1)
-    $worstRounded = [Math]::Round($estimate.WorstOverflowPct, 1)
-    $toleranceReadoutText.Text = "Estimated: $($estimate.Keys) keys, $overRounded% of frames over tolerance, worst $worstRounded% of frame width."
+    Update-ToleranceVisual
+}
+
+# --- Estimate range + Tolerance bar (task48 rebuild, 2026-10-12) -----------
+# Which frames the estimate measures: the chosen Time Range (see
+# Get-EstimateRange in rom_launcher_logic.ps1). "Time Slider" can only be
+# known from the last Preview / Start Recording click that resolved it from
+# Maya (Get-ResolvedTimeRange stores it below) -- never queried on the tick.
+$script:lastTimeSliderRangeStart = $null
+$script:lastTimeSliderRangeEnd = $null
+$script:lastEstimateRange = $null
+$script:lastEstimateWorstPct = $null
+
+function Get-SelectedTimeRangeMode {
+    if ($timeSliderRadio.IsChecked) { return "TimeSlider" }
+    if ($startEndRadio.IsChecked) { return "StartEnd" }
+    return "All"
+}
+
+# Per-tick cost (task48 fix round): the range and both estimates are pure
+# functions of their inputs, so each is memoized on ALL of them -- its own
+# arguments plus the parsed cache (by object identity: Get-CachedFrameArrays
+# re-parses on a new path / mtime and returns a NEW object) and the monitor
+# rect text (frame width per pixel). The glow and the readout then share one
+# computation per tick, and an idle tick recomputes nothing. Numbers are
+# unchanged: a hit returns exactly what the same call computed before.
+$script:estimateMemo = @{}
+function Invoke-EstimateMemo([string]$Name, [string]$ArgsKey, [scriptblock]$Compute) {
+    $arrays = Get-CachedFrameArrays
+    $rectPath = Get-RecordingMonitorRectPath
+    $rectText = if (Test-Path $rectPath) { [IO.File]::ReadAllText($rectPath) } else { "" }
+    $key = "$ArgsKey|$rectText"
+    $memo = $script:estimateMemo[$Name]
+    if ($null -ne $memo -and $memo.Key -eq $key -and [object]::ReferenceEquals($memo.Arrays, $arrays)) { return $memo.Result }
+    $result = & $Compute
+    $script:estimateMemo[$Name] = [PSCustomObject]@{ Key = $key; Arrays = $arrays; Result = $result }
+    return $result
+}
+
+$script:estimateRangeMemo = $null
+function Get-CurrentEstimateRange {
+    # Memoized on the radio, the box texts, the remembered Time Slider range
+    # and the cache identity; the cached frame array is passed by reference
+    # (an if-expression around it would unroll and re-allocate it per call).
+    $arrays = Get-CachedFrameArrays
+    $mode = Get-SelectedTimeRangeMode
+    $key = "$mode|$($startFrameBox.Text)|$($endFrameBox.Text)|$($script:lastTimeSliderRangeStart)|$($script:lastTimeSliderRangeEnd)"
+    $memo = $script:estimateRangeMemo
+    if ($null -ne $memo -and $memo.Key -eq $key -and [object]::ReferenceEquals($memo.Arrays, $arrays)) { return $memo.Range }
+    $frames = [double[]]@()
+    if ($null -ne $arrays) { $frames = $arrays.Frames }
+    $range = Get-EstimateRange -Mode $mode -Frames $frames -StartText $startFrameBox.Text -EndText $endFrameBox.Text `
+        -LastTimeSliderStart $script:lastTimeSliderRangeStart -LastTimeSliderEnd $script:lastTimeSliderRangeEnd
+    $script:estimateRangeMemo = [PSCustomObject]@{ Key = $key; Arrays = $arrays; Range = $range }
+    return $range
+}
+
+# Gate OFF fixed-camera estimate over a KNOWN range: the same
+# Get-ClippingEstimate Start Recording's click-time prompt uses, given the
+# range's first/last cached frame (reference frame = Start, where
+# frame_camera() parks the camera). Memoized (Invoke-EstimateMemo), so the
+# glow and the readout share it.
+function Get-GateOffRangeEstimate($Range) {
+    $arrays = Get-CachedFrameArrays
+    if ($null -eq $arrays -or -not $Range.Known) { return $null }
+    $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    $rs = [int][Math]::Round($arrays.Frames[$Range.StartIndex])
+    $re = [int][Math]::Round($arrays.Frames[$Range.EndIndex])
+    return Invoke-EstimateMemo "gateoff" "$axis|$($zoomSlider.Value)|$($script:lastValidOffsetX)|$rs|$re" {
+        Get-ClippingEstimate -Axis $axis -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -RangeStart $rs -RangeEnd $re
+    }
+}
+
+# The bar's inputs, from the live controls: tolerance in effect (Auto = the
+# zoom-derived value, or the fixed 2.0 threshold with the gate OFF) and the
+# last worst overshoot.
+function Get-ToleranceVisualState {
+    $gateOn = [bool]$frameGateCheckBox.IsChecked
+    $auto = ($null -eq $script:lastValidTolerancePct)
+    $tol = if ($auto) { Get-AutoTolFromZoom -ZoomPct ([Math]::Round($zoomSlider.Value)) -GateOn $gateOn } else { [double]$script:lastValidTolerancePct }
+    if ($null -eq $tol) { $tol = 0.0 }
+    return [PSCustomObject]@{ GateOn = $gateOn; Auto = $auto; TolPct = [double]$tol; WorstPct = $script:lastEstimateWorstPct }
+}
+
+$script:tolBlue = "#FF2F8CFF"
+$script:tolRed = "#FFE0786E"
+function New-TolBrush([string]$Hex) {
+    return [System.Windows.Media.SolidColorBrush]([System.Windows.Media.ColorConverter]::ConvertFromString($Hex))
+}
+function Add-TolShape($Canvas, $Element, [double]$X, [double]$Y, [string]$Tag) {
+    [System.Windows.Controls.Canvas]::SetLeft($Element, $X)
+    [System.Windows.Controls.Canvas]::SetTop($Element, $Y)
+    $Element.Tag = $Tag
+    [void]$Canvas.Children.Add($Element)
+}
+function New-TolRect([double]$W, [double]$H, [string]$Fill, [string]$Stroke = "", [double]$Thickness = 0, [string]$Dash = "") {
+    $r = New-Object System.Windows.Shapes.Rectangle
+    $r.Width = [Math]::Max(0.0, $W); $r.Height = $H
+    if ($Fill) { $r.Fill = New-TolBrush $Fill }
+    if ($Stroke) {
+        $r.Stroke = New-TolBrush $Stroke; $r.StrokeThickness = $Thickness
+        if ($Dash) { $r.StrokeDashArray = [System.Windows.Media.DoubleCollection]::Parse($Dash) }
+    }
+    return $r
+}
+function New-TolText([string]$Text, [double]$Size, [string]$Color, [bool]$Bold = $false) {
+    $t = New-Object System.Windows.Controls.TextBlock
+    $t.Text = $Text; $t.FontSize = $Size; $t.Foreground = New-TolBrush $Color
+    if ($Bold) { $t.FontWeight = [System.Windows.FontWeights]::Bold }
+    $t.Measure((New-Object System.Windows.Size(300, 30)))
+    return $t
+}
+
+# Draws the display-only diagram (user decisions 10b + W5, approved mocks
+# task48_mock10/11/12): grey frame = 100 % of the frame width (a fifth of the
+# bar, faint "100%" inside), the allowed margin on BOTH sides on the linear
+# 10x scale, split into solid blue (used, up to the worst overshoot), pale
+# dashed blue (unused slack) and a red outlined extension + "!" (overshoot
+# beyond the margin). Auto = dashed outline + "A"; gate OFF = "!" at the left
+# and dashed frame caps. Every shape carries a Tag so tests can measure it.
+function New-ToleranceDiagram($State, [double]$CanvasWidth = 224.0, [double]$CanvasHeight = 22.0) {
+    $cv = New-Object System.Windows.Controls.Canvas
+    $cv.Width = $CanvasWidth; $cv.Height = $CanvasHeight; $cv.ClipToBounds = $true
+    $geo = Get-ToleranceVisualGeometry -CanvasWidth $CanvasWidth
+    $cx = $geo.CenterX; $fw = $geo.FrameWidth; $k = $geo.PxPerPct
+    $by = 11.0; $bh = 10.0
+    $lab = "#FFB0B0B0"; $cap = "#FFC8C8C8"; $hair = "#FFD0D0D0"
+    $left0 = $cx - $fw / 2.0; $right0 = $cx + $fw / 2.0
+    $split = Get-ToleranceBandSplit -TolerancePct $State.TolPct -WorstPct $State.WorstPct
+    $tw = Get-ToleranceMarginPx -Pct $State.TolPct -PxPerPct $k
+    $uw = Get-ToleranceMarginPx -Pct $split.UsedPct -PxPerPct $k
+    $sw = [Math]::Max(0.0, $tw - $uw)
+    $ow = if ($split.IsOver) { (Get-ToleranceMarginPx -Pct ($split.UsedPct + $split.OverPct) -PxPerPct $k) - $tw } else { 0.0 }
+
+    Add-TolShape $cv (New-TolRect $fw $bh "#FF707070") $left0 $by "frame"
+    Add-TolShape $cv (New-TolText "100%" 6.5 "#FF2A2A2A") ($cx - 11) ($by - 0.5) "label-100"
+    foreach ($side in @("L", "R")) {
+        $sign = if ($side -eq "R") { 1 } else { -1 }
+        $edge = if ($side -eq "R") { $right0 } else { $left0 }
+        if ($uw -gt 0.01) {
+            $used = New-TolRect $uw $bh $script:tolBlue
+            if ($State.Auto) { $used.Opacity = 0.65 }
+            Add-TolShape $cv $used $(if ($sign -gt 0) { $edge } else { $edge - $uw }) $by "used-$side"
+        }
+        if ($sw -gt 0.3) {
+            Add-TolShape $cv (New-TolRect $sw $bh "#552F8CFF" $script:tolBlue 1 "2,2") $(if ($sign -gt 0) { $edge + $uw } else { $edge - $uw - $sw }) $by "slack-$side"
+        }
+        if ($ow -gt 0.01) {
+            Add-TolShape $cv (New-TolRect $ow $bh "#66E0786E" $script:tolRed 1.2) $(if ($sign -gt 0) { $edge + $tw } else { $edge - $tw - $ow }) $by "over-$side"
+        }
+        if ($State.Auto -and $tw -gt 0.01) {
+            Add-TolShape $cv (New-TolRect $tw ($bh + 4) "" $hair 1 "2,2") $(if ($sign -gt 0) { $edge } else { $edge - $tw }) ($by - 2) "auto-$side"
+        }
+        # frame-edge caps: solid with the gate ON, dashed with it OFF (camera fixed)
+        if ($State.GateOn) {
+            Add-TolShape $cv (New-TolRect 2 ($bh + 4) $cap) ($edge - 1) ($by - 2) "cap-$side"
+        } else {
+            $ln = New-Object System.Windows.Shapes.Line
+            $ln.X1 = 0; $ln.X2 = 0; $ln.Y1 = 0; $ln.Y2 = ($bh + 4)
+            $ln.Stroke = New-TolBrush $cap; $ln.StrokeThickness = 2
+            $ln.StrokeDashArray = [System.Windows.Media.DoubleCollection]::Parse("2,1.5")
+            Add-TolShape $cv $ln $edge ($by - 2) "cap-$side"
+        }
+    }
+    # scale: ticks at 5 / 10 / 20 % on both sides; numbers and "x10" on the
+    # LEFT so the right-hand label row stays free for "!" / "A"
+    foreach ($tp in @(5.0, 10.0, 20.0)) {
+        foreach ($tx in @(($left0 - $tp * $k), ($right0 + $tp * $k))) {
+            Add-TolShape $cv (New-TolRect 1 3 $lab) ([Math]::Min([Math]::Max($tx, 0.0), $CanvasWidth - 1.0)) ($by - 3) "tick"
+        }
+        $t = New-TolText ("{0:0}" -f $tp) 7 $lab
+        Add-TolShape $cv $t ([Math]::Max(1.0, ($left0 - $tp * $k) - $t.DesiredSize.Width / 2.0)) -1 "tick-label"
+    }
+    Add-TolShape $cv (New-TolText "x10" 7 $lab) 73 -1 "label-x10"
+    if ($split.IsOver) {
+        $bang = New-TolText "!" 11 $script:tolRed $true
+        Add-TolShape $cv $bang ([Math]::Min($right0 + $tw + $ow + 2, $CanvasWidth - $bang.DesiredSize.Width)) -2 "bang-over"
+    }
+    if ($State.Auto) {
+        $a = New-TolText "A" 7 $hair
+        $ax = $right0 + $tw + 2
+        if ($split.IsOver -or $ax + $a.DesiredSize.Width -gt $CanvasWidth - 1) { $ax = $right0 + $tw - 2 - $a.DesiredSize.Width }
+        Add-TolShape $cv $a $ax -1 "auto-A"
+    }
+    if (-not $State.GateOn) { Add-TolShape $cv (New-TolText "!" 12 "#FFFFFFFF" $true) 3 8 "bang-off" }
+    return $cv
+}
+
+# Rebuilds the bar only when one of its inputs changed (it is also called on
+# every 60 ms tick through Update-ToleranceReadout), then refreshes the
+# tooltip and hides the "%" after "Auto".
+$script:tolVisualKey = $null
+function Update-ToleranceVisual {
+    if ($null -eq $tolVisualHost) { return }
+    $state = Get-ToleranceVisualState
+    $range = $script:lastEstimateRange
+    $rangeText = ""
+    if ($null -ne $range -and $range.Known) { $rangeText = "frames $($range.StartFrame)-$($range.EndFrame)" }
+    $reason = if ($null -ne $range) { $range.Reason } else { $null }
+    $key = "$($state.GateOn)|$($state.Auto)|$($state.TolPct)|$($state.WorstPct)|$rangeText|$reason"
+    $tolPctSuffix.Visibility = if ($state.Auto) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    if ($key -eq $script:tolVisualKey -and $null -ne $tolVisualHost.Child) { return }
+    $script:tolVisualKey = $key
+    $tolVisualHost.Child = New-ToleranceDiagram $state
+    $tolVisualHost.ToolTip = Get-ToleranceTooltipText -GateOn $state.GateOn -Auto $state.Auto -TolPct $state.TolPct -WorstPct $state.WorstPct -RangeText $rangeText -PendingReason $reason
 }
 
 $script:liveApplyTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -3184,9 +3549,15 @@ $startEndRadio.Add_Checked({
     $isIdle = ($script:currentProcess -eq $null)
     $startFrameBox.IsEnabled = $isIdle
     $endFrameBox.IsEnabled = $isIdle
+    Update-ToleranceReadout
 })
-$timeSliderRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
-$allFramesRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed })
+# task48 rebuild: the Estimated line and the Tolerance bar measure the chosen
+# Time Range, so they recompute at once when it changes (the 60 ms tick would
+# catch up anyway; this makes it immediate and testable).
+$timeSliderRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed; Update-ToleranceReadout })
+$allFramesRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibility]::Collapsed; Update-ToleranceReadout })
+$startFrameBox.Add_TextChanged({ if ($startEndRadio.IsChecked) { Update-ToleranceReadout } })
+$endFrameBox.Add_TextChanged({ if ($startEndRadio.IsChecked) { Update-ToleranceReadout } })
 
 # Deferred-to-release (2026-09-08, user feedback: continuous live update
 # "feels jumpy"): the slider's OWN value/text update instantly and always
@@ -3196,12 +3567,17 @@ $allFramesRadio.Add_Checked({ $startEndPanel.Visibility = [System.Windows.Visibi
 # never sets that flag at all, so it still applies immediately -- only a
 # genuine held-drag gets deferred.
 $script:zoomSliderDragging = $false
+# task48 F3: a REAL thumb drag is tracked on its own flag, so a key/wheel step
+# session settling mid-drag (Stop-ZoomStep) can no longer clear the push hold
+# under the user's mouse; the drag's own completion releases it.
+$script:zoomThumbDragging = $false
 $zoomSlider.AddHandler(
     [System.Windows.Controls.Primitives.Thumb]::DragStartedEvent,
-    [System.Windows.RoutedEventHandler]{ $script:zoomSliderDragging = $true })
+    [System.Windows.RoutedEventHandler]{ $script:zoomThumbDragging = $true; $script:zoomSliderDragging = $true })
 $zoomSlider.AddHandler(
     [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent,
     [System.Windows.RoutedEventHandler]{
+        $script:zoomThumbDragging = $false
         $script:zoomSliderDragging = $false
         $script:pendingZoomPush = $true
     })
@@ -3218,6 +3594,9 @@ $zoomSlider.Add_ValueChanged({
     if (-not $script:zoomSliderDragging) {
         $script:pendingZoomPush = $true
     }
+    # Auto's dashed mark follows Zoom at once (task48 rebuild); the estimate
+    # itself catches up on the next 60 ms tick.
+    Update-ToleranceVisual
 })
 
 # --- Offset wheel-nudge on the X/Y boxes (2026-09-08: replaces drag) --
@@ -3233,6 +3612,18 @@ $zoomSlider.Add_ValueChanged({
 # Core logic lives in named functions taking an EXPLICIT direction/shift
 # flag, not hidden behind e.Delta -- same reasoning as the other nudge
 # paths above.
+# Modifier state for the numeric-box key/wheel handlers (task48). Reads the real
+# keyboard via the static Keyboard.Modifiers -- NOT $e.KeyboardDevice, which
+# MouseWheelEventArgs does not have (the old X/Y wheel handlers read that and
+# always got $null, so Shift never registered on the wheel). Tests set
+# $script:modifierKeysOverride to a [ModifierKeys] value to drive Shift/Ctrl
+# through the real handlers without touching the physical keyboard.
+$script:modifierKeysOverride = $null
+function Get-CurrentModifierKeys {
+    if ($null -ne $script:modifierKeysOverride) { return $script:modifierKeysOverride }
+    return [System.Windows.Input.Keyboard]::Modifiers
+}
+
 $script:wheelNudgeAxis = $null   # $null, "X", or "Y"
 $script:wheelNudgeStartValue = 0
 $script:wheelNudgeCurrentValue = 0.0
@@ -3241,7 +3632,7 @@ $script:wheelSettleTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:wheelSettleTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $script:wheelSettleTimer.Add_Tick({ Stop-OffsetWheelNudge })
 
-function Update-OffsetWheelNudge([string]$Axis, [int]$Delta, [bool]$ShiftHeld) {
+function Update-OffsetWheelNudge([string]$Axis, [int]$Delta, [bool]$ShiftHeld, [bool]$CtrlHeld = $false) {
     if ($script:wheelNudgeAxis -ne $null -and $script:wheelNudgeAxis -ne $Axis) {
         # Switching axis mid-stream (rare, but possible if the mouse moves
         # to the other box while still settling) -- flush the prior one
@@ -3257,7 +3648,10 @@ function Update-OffsetWheelNudge([string]$Axis, [int]$Delta, [bool]$ShiftHeld) {
     # arrow-key -- exact values go through the typed box directly (edit
     # the last digit, e.g. 95/96/103/3), which these nudge controls were
     # never meant to replace.
-    $step = if ($ShiftHeld) { 100 } else { 10 }
+    # task48: the step now comes from the shared step table (plain 10 /
+    # Shift 100 / Ctrl 1, Ctrl wins) so wheel, arrows and tests cannot
+    # drift apart. Plain and Shift are unchanged from before.
+    $step = Get-NumericStepSize -Field $(if ($Axis -eq "X") { "OffsetX" } else { "OffsetY" }) -Shift $ShiftHeld -Ctrl $CtrlHeld
     $direction = if ($Delta -gt 0) { 1 } else { -1 }
     $script:wheelNudgeCurrentValue += $direction * $step
     $box = if ($Axis -eq "X") { $offsetXBox } else { $offsetYBox }
@@ -3283,14 +3677,31 @@ function Stop-OffsetWheelNudge {
 
 $offsetXBox.Add_MouseWheel({
     param($eventSender, $e)
-    $shiftHeld = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
-    Update-OffsetWheelNudge -Axis "X" -Delta $e.Delta -ShiftHeld $shiftHeld
+    # task48: MouseWheelEventArgs has NO KeyboardDevice property (checked by
+    # reflection), so the old $e.KeyboardDevice.Modifiers read was always $null
+    # and Shift never registered on the wheel. The static Keyboard.Modifiers
+    # is the real modifier state.
+    # task48 F2: through Step-OffsetBox (same as Up/Down), so text typed but
+    # not yet committed is committed first instead of being lost.
+    if ($e.Delta -eq 0) { return }
+    $mods = Get-CurrentModifierKeys
+    $shiftHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    $ctrlHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+    Step-OffsetBox "X" $(if ($e.Delta -gt 0) { 1 } else { -1 }) $shiftHeld $ctrlHeld
     $e.Handled = $true
 })
 $offsetYBox.Add_MouseWheel({
     param($eventSender, $e)
-    $shiftHeld = ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
-    Update-OffsetWheelNudge -Axis "Y" -Delta $e.Delta -ShiftHeld $shiftHeld
+    # task48: MouseWheelEventArgs has NO KeyboardDevice property (checked by
+    # reflection), so the old $e.KeyboardDevice.Modifiers read was always $null
+    # and Shift never registered on the wheel. The static Keyboard.Modifiers
+    # is the real modifier state.
+    # task48 F2: see the X handler above.
+    if ($e.Delta -eq 0) { return }
+    $mods = Get-CurrentModifierKeys
+    $shiftHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    $ctrlHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+    Step-OffsetBox "Y" $(if ($e.Delta -gt 0) { 1 } else { -1 }) $shiftHeld $ctrlHeld
     $e.Handled = $true
 })
 
@@ -3361,20 +3772,27 @@ $window.Add_PreviewKeyUp({
 # A discrete, one-shot action (not something "in progress"), so it
 # applies immediately -- same reasoning as a typed box commit.
 $resetFrameOffsetsButton.Add_Click({
-    # Scoped to Zoom/X/Y only, deliberately -- does NOT touch Frame gate or
-    # Tolerance (Q-rst: recommended answer, approved as-is).
+    # The whole Adjust section (task48 rebuild, user decision; was Zoom/X/Y
+    # only): Zoom 0, X 0, Y 0, Frame gate back ON, Tolerance back to Auto.
+    # Any key/wheel session still settling is flushed FIRST, so its late
+    # settle can never write its old value over the reset.
+    Stop-ZoomStep
+    Stop-OffsetWheelNudge
     $zoomSlider.Value = 0
     $offsetXBox.Text = "0"
     $offsetYBox.Text = "0"
     Commit-OffsetBoxes
+    $frameGateCheckBox.IsChecked = $true
+    $toleranceValueBox.Text = 'Auto'
+    Commit-ToleranceValueBox
 })
 
 # --- Frame gate checkbox ------------------------------------------------
 # Writes immediately on toggle (Checked/Unchecked fire synchronously on the
 # state change itself, not on the 60ms timer) -- Success Criterion 1 asks
 # for "within one tick," this is actually immediate.
-$frameGateCheckBox.Add_Checked({ Write-FrameGateEnabled -Enabled $true })
-$frameGateCheckBox.Add_Unchecked({ Write-FrameGateEnabled -Enabled $false })
+$frameGateCheckBox.Add_Checked({ Write-FrameGateEnabled -Enabled $true; Update-ToleranceReadout })
+$frameGateCheckBox.Add_Unchecked({ Write-FrameGateEnabled -Enabled $false; Update-ToleranceReadout })
 
 $script:lastValidTolerancePct = $null  # $null = Auto, the default
 
@@ -3392,8 +3810,9 @@ function Commit-ToleranceValueBox {
         $script:lastValidTolerancePct = $null
         $toleranceValueBox.Text = 'Auto'
     } else {
-        $value = 0.0
-        if ([double]::TryParse($text.TrimEnd('%'), [ref]$value)) {
+        # task48 F4: "NaN"/"Infinity" parse as doubles but are garbage here.
+        $value = ConvertFrom-FiniteNumberText -Text $text.TrimEnd('%')
+        if ($null -ne $value) {
             $script:lastValidTolerancePct = [Math]::Max(0.0, [Math]::Min(20.0, $value))
             $toleranceValueBox.Text = "$($script:lastValidTolerancePct)"
         } else {
@@ -3404,6 +3823,7 @@ function Commit-ToleranceValueBox {
         }
     }
     Write-CameraTolerancePct -Value $script:lastValidTolerancePct
+    Update-ToleranceVisual
 }
 $toleranceValueBox.Add_LostFocus({ Commit-ToleranceValueBox })
 $toleranceValueBox.Add_KeyDown({
@@ -3421,8 +3841,10 @@ function Commit-ZoomValueBox {
     # place that writes the file and only one place that formats the
     # display text -- this just decides what value to hand it.
     $text = $zoomValueBox.Text.Trim().TrimEnd('%')
-    $value = 0.0
-    if ([double]::TryParse($text, [ref]$value)) {
+    # task48 F4: "NaN"/"Infinity" revert like any other garbage (a NaN
+    # reaching the slider threw mid-step and could leave live zoom stuck).
+    $value = ConvertFrom-FiniteNumberText -Text $text
+    if ($null -ne $value) {
         $zoomSlider.Value = [Math]::Max(-50, [Math]::Min(50, [Math]::Round($value)))
     } else {
         # Empty or unparseable -- revert to the last valid value instead of
@@ -3457,14 +3879,15 @@ function Commit-OffsetBoxes {
     $priorX = $script:lastValidOffsetX
     $priorY = $script:lastValidOffsetY
 
-    $x = 0.0
-    if ([double]::TryParse($offsetXBox.Text.Trim(), [ref]$x)) {
+    # task48 F4: non-finite text ("NaN", "Infinity") reverts too.
+    $x = ConvertFrom-FiniteNumberText -Text $offsetXBox.Text.Trim()
+    if ($null -ne $x) {
         $script:lastValidOffsetX = [Math]::Round($x)
     }
     $offsetXBox.Text = "$($script:lastValidOffsetX)"
 
-    $y = 0.0
-    if ([double]::TryParse($offsetYBox.Text.Trim(), [ref]$y)) {
+    $y = ConvertFrom-FiniteNumberText -Text $offsetYBox.Text.Trim()
+    if ($null -ne $y) {
         $script:lastValidOffsetY = [Math]::Round($y)
     }
     $offsetYBox.Text = "$($script:lastValidOffsetY)"
@@ -3496,6 +3919,215 @@ $offsetYBox.Add_KeyDown({
         [System.Windows.Input.Keyboard]::ClearFocus()
     }
 })
+
+# --- Arrow-key / wheel stepping on every numeric box (task48, 2026-10-07) ---
+# Up/Down arrows and the mouse wheel step Zoom, Offset X/Y, Tolerance and
+# Start/End (and the zoom slider) by the user-approved table in
+# rom_launcher_logic.ps1 (Get-NumericFieldSpec): plain / Shift / Ctrl, Ctrl
+# wins when both are held. The step MATH is the pure Get-Stepped* functions
+# there; everything below is thin wiring that reads the key/modifier state
+# and calls the field's explicit-argument Step-* function (same shape as
+# Update-OffsetWheelNudge, so tests call them directly with a direction and
+# modifier flags, the same way they already test the wheel).
+#
+# "Commit then step": if the box holds typed-but-uncommitted text, the
+# field's own existing commit runs first (garbage reverts, as always), and
+# the step starts from that committed value. Only Up/Down (and the wheel)
+# are intercepted -- digits, Left/Right, Home/End, Backspace, Tab and Enter
+# are untouched, so typing, caret movement and the Enter/LostFocus commits
+# behave exactly as before.
+#
+# Every write goes through the field's EXISTING write path (slider
+# ValueChanged for Zoom, the wheel session for X/Y, Write-CameraTolerancePct
+# for Tolerance), so the state files keep today's exact formats.
+
+# Zoom: steps the slider's Value, so the one ValueChanged handler above still
+# formats the box and writes the file. While keys/wheel keep arriving the Maya
+# push is held back (same flag a thumb drag uses) and fires ONCE, 400 ms after
+# the last step (like the wheel on X/Y) -- a timer, not KeyUp, so a missed
+# KeyUp (Alt-Tab mid-hold) can never leave live zoom stuck off.
+$script:zoomStepActive = $false
+$script:zoomStepStartPct = 0.0
+$script:zoomStepSettleTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:zoomStepSettleTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:zoomStepSettleTimer.Add_Tick({ Stop-ZoomStep })
+
+function Start-ZoomStepHold {
+    # Own the push-hold until the settle timer fires, unless a real thumb drag
+    # already holds it; (re)starts the settle either way while a session runs.
+    if (-not $script:zoomStepActive -and -not $script:zoomSliderDragging) {
+        $script:zoomStepActive = $true
+        $script:zoomStepStartPct = [Math]::Round($zoomSlider.Value)
+        $script:zoomSliderDragging = $true
+    }
+    if ($script:zoomStepActive) {
+        $script:zoomStepSettleTimer.Stop()
+        $script:zoomStepSettleTimer.Start()
+    }
+}
+function Step-ZoomValue([int]$Direction, [bool]$ShiftHeld, [bool]$CtrlHeld) {
+    # task48 F4: the push-hold is taken through Start-ZoomStepHold, which
+    # starts the settle timer at the same moment, so nothing after it (the
+    # commit below included) can leave the hold set with no settle pending.
+    # The commit stays inside the held burst: one Maya push for the whole burst.
+    Start-ZoomStepHold
+    Commit-ZoomValueBox
+    $current = [Math]::Round($zoomSlider.Value)
+    $zoomSlider.Value = Get-SteppedNumber -Current $current -Direction $Direction -Field "Zoom" -Shift $ShiftHeld -Ctrl $CtrlHeld
+    if ($script:zoomStepActive) {
+        $script:zoomStepSettleTimer.Stop()
+        $script:zoomStepSettleTimer.Start()
+    }
+}
+function Stop-ZoomStep {
+    $script:zoomStepSettleTimer.Stop()
+    if (-not $script:zoomStepActive) { return }
+    $script:zoomStepActive = $false
+    # task48 F3: a thumb drag that started during the settle keeps its hold,
+    # and its own completion does the one push -- none from here mid-drag.
+    if ($script:zoomThumbDragging) { return }
+    $script:zoomSliderDragging = $false
+    # One push for the whole burst, and none at all if it ended where it began.
+    if ([Math]::Round($zoomSlider.Value) -ne $script:zoomStepStartPct) {
+        $script:pendingZoomPush = $true
+    }
+}
+
+# Offset X/Y: reuses the existing wheel session (live box text, ONE push after
+# the 400 ms settle, axis-switch flush) with Up = +1 notch, Down = -1 notch.
+function Step-OffsetBox([string]$Axis, [int]$Direction, [bool]$ShiftHeld, [bool]$CtrlHeld) {
+    $box = if ($Axis -eq "X") { $offsetXBox } else { $offsetYBox }
+    if ($script:wheelNudgeAxis -ne $null -and $script:wheelNudgeAxis -ne $Axis) {
+        Stop-OffsetWheelNudge
+    }
+    # Typed text is only committed when no session is running on this axis:
+    # mid-session the box shows the session's live value, which is not typed
+    # input (committing it would double-count the delta).
+    if ($script:wheelNudgeAxis -eq $null) {
+        $committed = if ($Axis -eq "X") { $script:lastValidOffsetX } else { $script:lastValidOffsetY }
+        if ($box.Text.Trim() -ne "$committed") { Commit-OffsetBoxes }
+    }
+    Update-OffsetWheelNudge -Axis $Axis -Delta ($Direction * 120) -ShiftHeld $ShiftHeld -CtrlHeld $CtrlHeld
+}
+
+# Tolerance: from Auto, start from Auto's current value (percent, from Zoom;
+# 2.0 with the gate OFF) and step; Down at 0 stays 0 (no wrap to Auto --
+# clearing the box returns to Auto). No Maya push: the keyer and the
+# glow/readout read the file.
+function Get-AutoEffectiveTolerancePct {
+    # task48 F1: Auto's value is the keyer's own zoom-only formula with the
+    # gate ON, and the fixed 2.0 warning threshold with the gate OFF
+    # (Get-AutoTolFromZoom) -- no cache needed, and no longer the glow's
+    # offset-aware mirror, which is not what the keyer uses.
+    return (Get-AutoTolFromZoom -ZoomPct ([Math]::Round($zoomSlider.Value)) -GateOn ([bool]$frameGateCheckBox.IsChecked))
+}
+function Step-ToleranceBox([int]$Direction, [bool]$ShiftHeld, [bool]$CtrlHeld) {
+    $displayed = if ($null -eq $script:lastValidTolerancePct) { 'Auto' } else { "$($script:lastValidTolerancePct)" }
+    if ($toleranceValueBox.Text.Trim() -ne $displayed) { Commit-ToleranceValueBox }
+    $current = $script:lastValidTolerancePct
+    $autoPct = if ($null -eq $current) { Get-AutoEffectiveTolerancePct } else { $null }
+    $new = Get-SteppedTolerance -CurrentPct $current -AutoEffectivePct $autoPct -Direction $Direction -Shift $ShiftHeld -Ctrl $CtrlHeld
+    $script:lastValidTolerancePct = $new
+    $toleranceValueBox.Text = "$new"
+    Write-CameraTolerancePct -Value $new
+    Update-ToleranceVisual
+}
+
+# Start/End: steps the whole number in the box. Non-numeric text: does nothing
+# (returns $false) -- Start Recording's own check still complains about it.
+function Step-FrameBox([string]$Which, [int]$Direction, [bool]$ShiftHeld, [bool]$CtrlHeld) {
+    $box = if ($Which -eq "Start") { $startFrameBox } else { $endFrameBox }
+    $field = if ($Which -eq "Start") { "StartFrame" } else { "EndFrame" }
+    $newText = Get-SteppedFrameText -Text $box.Text -Direction $Direction -Field $field -Shift $ShiftHeld -Ctrl $CtrlHeld
+    if ($null -eq $newText) { return $false }
+    $box.Text = $newText
+    return $true
+}
+
+# One entry point per field name: Zoom, OffsetX, OffsetY, Tolerance, StartFrame,
+# EndFrame. After a step the box text is selected (when the box has keyboard
+# focus) so the caret does not jump to the start and typing replaces the value.
+function Invoke-NumericStep([string]$Field, [int]$Direction, [bool]$ShiftHeld, [bool]$CtrlHeld) {
+    switch ($Field) {
+        "Zoom"       { Step-ZoomValue $Direction $ShiftHeld $CtrlHeld; $box = $zoomValueBox }
+        "OffsetX"    { Step-OffsetBox "X" $Direction $ShiftHeld $CtrlHeld; $box = $offsetXBox }
+        "OffsetY"    { Step-OffsetBox "Y" $Direction $ShiftHeld $CtrlHeld; $box = $offsetYBox }
+        "Tolerance"  { Step-ToleranceBox $Direction $ShiftHeld $CtrlHeld; $box = $toleranceValueBox }
+        "StartFrame" { Step-FrameBox "Start" $Direction $ShiftHeld $CtrlHeld | Out-Null; $box = $startFrameBox }
+        "EndFrame"   { Step-FrameBox "End" $Direction $ShiftHeld $CtrlHeld | Out-Null; $box = $endFrameBox }
+        default      { throw "Unknown numeric field '$Field'" }
+    }
+    if ($box.IsKeyboardFocusWithin) { $box.SelectAll() }
+}
+
+# Event glue. Preview (tunnelling) so Up/Down are claimed before the TextBox
+# or Slider can do anything of their own with them; anything else returns
+# $false untouched.
+function Invoke-NumericStepKey([string]$Field, $e) {
+    if ($e.Key -ne [System.Windows.Input.Key]::Up -and $e.Key -ne [System.Windows.Input.Key]::Down) { return $false }
+    $mods = Get-CurrentModifierKeys
+    $shiftHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    $ctrlHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+    $direction = if ($e.Key -eq [System.Windows.Input.Key]::Up) { 1 } else { -1 }
+    Invoke-NumericStep $Field $direction $shiftHeld $ctrlHeld
+    $e.Handled = $true
+    return $true
+}
+function Invoke-NumericStepWheel([string]$Field, $e) {
+    if ($e.Delta -eq 0) { return $false }
+    $mods = Get-CurrentModifierKeys
+    $shiftHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+    $ctrlHeld = ($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+    $direction = if ($e.Delta -gt 0) { 1 } else { -1 }
+    Invoke-NumericStep $Field $direction $shiftHeld $ctrlHeld
+    $e.Handled = $true
+    return $true
+}
+
+$zoomValueBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "Zoom" $e | Out-Null })
+# task48 F6: the slider's OWN Left/Right/PageUp/PageDown/Home/End keys (not
+# claimed here -- the slider still moves itself) now join the same push-hold
+# and 400 ms settle as Up/Down, so a held key pushes to Maya once, not per press.
+function Test-ZoomSliderNativeKey([System.Windows.Input.Key]$Key) {
+    return @([System.Windows.Input.Key]::Left, [System.Windows.Input.Key]::Right, [System.Windows.Input.Key]::PageUp,
+             [System.Windows.Input.Key]::PageDown, [System.Windows.Input.Key]::Home, [System.Windows.Input.Key]::End) -contains $Key
+}
+$zoomSlider.Add_PreviewKeyDown({
+    param($eventSender, $e)
+    if (Invoke-NumericStepKey "Zoom" $e) { return }
+    if (Test-ZoomSliderNativeKey $e.Key) { Start-ZoomStepHold }
+})
+$offsetXBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "OffsetX" $e | Out-Null })
+$offsetYBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "OffsetY" $e | Out-Null })
+$toleranceValueBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "Tolerance" $e | Out-Null })
+$startFrameBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "StartFrame" $e | Out-Null })
+$endFrameBox.Add_PreviewKeyDown({ param($eventSender, $e); Invoke-NumericStepKey "EndFrame" $e | Out-Null })
+
+# The wheel: X/Y already have theirs (above, now with Ctrl-fine); the rest get
+# the same steps and modifiers as the arrows.
+$zoomValueBox.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "Zoom" $e | Out-Null })
+$zoomSlider.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "Zoom" $e | Out-Null })
+$toleranceValueBox.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "Tolerance" $e | Out-Null })
+# Tolerance cell (task48 rebuild): the wheel anywhere over the diagram or the
+# cap steps the number exactly like over the box (it tunnels through here
+# first, so a wheel over the box itself still steps once, not twice). The
+# diagram is display-only: no focus, no click action, no Tab stop.
+$toleranceCell.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "Tolerance" $e | Out-Null })
+# Clicking anywhere on the cap (its padding, the "%") focuses the number box;
+# clicks on the box itself are left to the box (caret, selection).
+function Set-ToleranceBoxFocus { [void]$toleranceValueBox.Focus() }
+# PreviewMouseDown (a true tunnelling event), not PreviewMouseLeftButtonDown,
+# which WPF re-raises per element as a Direct event.
+$tolNumberCap.Add_PreviewMouseDown({
+    param($eventSender, $e)
+    if ($e.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) { return }
+    $src = $e.OriginalSource
+    if ($src -eq $toleranceValueBox -or ($src -is [System.Windows.Media.Visual] -and $toleranceValueBox.IsAncestorOf($src))) { return }
+    Set-ToleranceBoxFocus
+    $e.Handled = $true
+})
+$startFrameBox.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "StartFrame" $e | Out-Null })
+$endFrameBox.Add_PreviewMouseWheel({ param($eventSender, $e); Invoke-NumericStepWheel "EndFrame" $e | Out-Null })
 
 # Resolves whichever Time Range mode is currently selected (All / Time
 # Slider / Start-End) into concrete Start/End frame numbers, WITHOUT
@@ -3532,6 +4164,10 @@ function Get-ResolvedTimeRange {
         if ($range.Start -gt $range.End) {
             return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "Maya's Time Slider range is invalid (Start $($range.Start) > End $($range.End))" }
         }
+        # task48 rebuild: remembered for the Estimated line / Tolerance bar,
+        # which can never query Maya on their 60 ms tick (Get-EstimateRange).
+        $script:lastTimeSliderRangeStart = $range.Start
+        $script:lastTimeSliderRangeEnd = $range.End
         return [PSCustomObject]@{ Success = $true; Start = $range.Start; End = $range.End; ErrorMessage = $null }
     }
 
@@ -4006,6 +4642,9 @@ Write-FrameGateEnabled -Enabled $true
 $toleranceValueBox.Text = 'Auto'
 $script:lastValidTolerancePct = $null
 Write-CameraTolerancePct -Value $null
+# First draw of the Tolerance bar and the Estimated line (task48 rebuild), so
+# neither waits for the first 60 ms tick.
+Update-ToleranceReadout
 Update-MonitorList
 Write-StartupSummary -MayaReachable $script:mayaReachableAtStartup
 Set-ActiveTab "Capture"

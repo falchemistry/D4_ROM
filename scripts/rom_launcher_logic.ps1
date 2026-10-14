@@ -140,17 +140,26 @@ function Get-StopCleanupSteps {
     # variable) is lost when that process is killed -- this cleanup does
     # not attempt to restore it. Only maya_obs_capture.ps1 finishing
     # naturally restores a custom range correctly.
+    #
+    # HUD restore (task17, 2026-09-30) does NOT share that gap: unlike the
+    # frame range, Get-MayaHudState persists its saved snapshot to
+    # _hud_state.json on disk BEFORE maya_obs_capture.ps1 mutates anything,
+    # specifically so this step can recover it after a kill -- see
+    # maya_restore_hud.py, which reads that file and is a safe no-op if it
+    # doesn't exist (e.g. Stop clicked with no active capture).
     param(
         [Parameter(Mandatory=$true)][string]$ScriptDir
     )
 
     $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
     $stopPlayback = Join-Path $ScriptDir "maya_stop_playback.py"
+    $restoreHud = Join-Path $ScriptDir "maya_restore_hud.py"
     $taskbarControl = Join-Path $ScriptDir "taskbar_control.ps1"
     $obsControl = Join-Path $ScriptDir "obs_control.ps1"
 
     $steps = @()
     $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", $stopPlayback) }
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", $restoreHud) }
     $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $taskbarControl, "-Action", "show") }
     # obs_control.ps1 has $ErrorActionPreference = "Stop" and errors if OBS
     # isn't actually recording (e.g. Stop was clicked before recording
@@ -522,4 +531,311 @@ function Get-StartRecordingRequirementFailures {
     # $failures a real array for every caller, regardless of how many
     # requirements failed.
     return ,$failures
+}
+
+# --- Arrow / wheel stepping for the numeric boxes (task48, 2026-10-07) ----
+# Pure functions, no WPF: the step table, the clamped/drift-free step, and
+# the Tolerance Auto rule live here so they are hermetically testable; the
+# launcher's handlers only read the key/modifier state and call these.
+#
+# Step table (user-approved 2026-10-07), plain / Shift / Ctrl:
+#   Zoom       10 / 100 / 1    range -50..50 (Shift's 100 simply clamps)
+#   OffsetX/Y  10 / 100 / 1    unbounded
+#   Tolerance   1 /  10 / 0.1  range 0..20, 1 decimal
+#   Start/End   1 /  10 / 1    no practical limit (whole int32 range, the
+#                              limit of the int parse Start Recording does)
+# Both modifiers held: Ctrl (the finest step) wins.
+function Get-NumericFieldSpec {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Zoom", "OffsetX", "OffsetY", "Tolerance", "StartFrame", "EndFrame")]
+        [string]$Field
+    )
+    switch ($Field) {
+        "Zoom"       { return [PSCustomObject]@{ Plain = 10.0; Shift = 100.0; Ctrl = 1.0; Min = -50.0; Max = 50.0; Decimals = 0 } }
+        "OffsetX"    { return [PSCustomObject]@{ Plain = 10.0; Shift = 100.0; Ctrl = 1.0; Min = $null; Max = $null; Decimals = 0 } }
+        "OffsetY"    { return [PSCustomObject]@{ Plain = 10.0; Shift = 100.0; Ctrl = 1.0; Min = $null; Max = $null; Decimals = 0 } }
+        "Tolerance"  { return [PSCustomObject]@{ Plain = 1.0; Shift = 10.0; Ctrl = 0.1; Min = 0.0; Max = 20.0; Decimals = 1 } }
+        "StartFrame" { return [PSCustomObject]@{ Plain = 1.0; Shift = 10.0; Ctrl = 1.0; Min = [double][int]::MinValue; Max = [double][int]::MaxValue; Decimals = 0 } }
+        "EndFrame"   { return [PSCustomObject]@{ Plain = 1.0; Shift = 10.0; Ctrl = 1.0; Min = [double][int]::MinValue; Max = [double][int]::MaxValue; Decimals = 0 } }
+    }
+}
+
+# The step size for the given modifier state (Ctrl wins over Shift).
+function Get-NumericStepSize {
+    param(
+        [Parameter(Mandatory=$true)][string]$Field,
+        [bool]$Shift = $false,
+        [bool]$Ctrl = $false
+    )
+    $spec = Get-NumericFieldSpec -Field $Field
+    if ($Ctrl) { return [double]$spec.Ctrl }
+    if ($Shift) { return [double]$spec.Shift }
+    return [double]$spec.Plain
+}
+
+# One clamped step from $Current. Rounds to the field's own decimals after
+# the add so repeated 0.1 steps never show float drift (0.30000000000000004),
+# then clamps to the field's range ($null Min/Max = unbounded on that side).
+function Get-SteppedNumber {
+    param(
+        [Parameter(Mandatory=$true)][double]$Current,
+        [Parameter(Mandatory=$true)][ValidateSet(-1, 1)][int]$Direction,
+        [Parameter(Mandatory=$true)][string]$Field,
+        [bool]$Shift = $false,
+        [bool]$Ctrl = $false
+    )
+    $spec = Get-NumericFieldSpec -Field $Field
+    $step = Get-NumericStepSize -Field $Field -Shift $Shift -Ctrl $Ctrl
+    $value = [Math]::Round($Current + ($Direction * $step), [int]$spec.Decimals, [MidpointRounding]::AwayFromZero)
+    if ($null -ne $spec.Min -and $value -lt $spec.Min) { $value = [double]$spec.Min }
+    if ($null -ne $spec.Max -and $value -gt $spec.Max) { $value = [double]$spec.Max }
+    return $value
+}
+
+# Tolerance step with the Auto rule (user decision 2026-10-07): from Auto
+# ($CurrentPct = $null) start from Auto's current effective value in percent
+# ($AutoEffectivePct, rounded to the field's 1 decimal and clamped to 0..20),
+# or 1.0 if Auto has no known value ($null), THEN step. Down at 0 stays 0
+# (clamp); there is no wrap back to Auto -- clearing the box is the way back.
+function Get-SteppedTolerance {
+    param(
+        $CurrentPct = $null,
+        $AutoEffectivePct = $null,
+        [Parameter(Mandatory=$true)][ValidateSet(-1, 1)][int]$Direction,
+        [bool]$Shift = $false,
+        [bool]$Ctrl = $false
+    )
+    $spec = Get-NumericFieldSpec -Field "Tolerance"
+    if ($null -ne $CurrentPct) {
+        $start = [double]$CurrentPct
+    } elseif ($null -ne $AutoEffectivePct) {
+        $start = [Math]::Round([Math]::Max([double]$spec.Min, [Math]::Min([double]$spec.Max, [double]$AutoEffectivePct)), [int]$spec.Decimals, [MidpointRounding]::AwayFromZero)
+    } else {
+        $start = 1.0
+    }
+    return (Get-SteppedNumber -Current $start -Direction $Direction -Field "Tolerance" -Shift $Shift -Ctrl $Ctrl)
+}
+
+# Start/End frame text step. Returns the new whole-number text, or $null when
+# the text is not a whole number (Up/Down then do nothing; the existing Start
+# Recording check still complains about it). Same int parse Start Recording
+# uses, so "what steps" and "what is accepted" cannot disagree.
+function Get-SteppedFrameText {
+    param(
+        [string]$Text,
+        [Parameter(Mandatory=$true)][ValidateSet(-1, 1)][int]$Direction,
+        [Parameter(Mandatory=$true)][ValidateSet("StartFrame", "EndFrame")][string]$Field,
+        [bool]$Shift = $false,
+        [bool]$Ctrl = $false
+    )
+    $parsed = 0
+    if (-not [int]::TryParse($Text, [ref]$parsed)) { return $null }
+    $stepped = Get-SteppedNumber -Current ([double]$parsed) -Direction $Direction -Field $Field -Shift $Shift -Ctrl $Ctrl
+    return ([int]$stepped).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# Typed number for the Zoom / X / Y / Tolerance boxes (task48 F4): the same
+# [double]::TryParse the commits always used, but "NaN" / "Infinity" (which
+# TryParse happily accepts) count as garbage too, so they revert like any
+# other unparseable text instead of reaching the slider or a state file.
+# Returns the number, or $null for "not a usable number".
+function ConvertFrom-FiniteNumberText {
+    param([string]$Text)
+    if ($null -eq $Text) { return $null }
+    $value = 0.0
+    if (-not [double]::TryParse($Text, [ref]$value)) { return $null }
+    if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) { return $null }
+    return $value
+}
+
+# --- Tolerance visual (task48 rebuild, 2026-10-12) ---------------------------
+# Auto tolerance in percent, from Zoom alone (task48 F1 + the visual's dashed
+# Auto mark). Gate ON: maya_camera_panels.py compute_effective_overflow_pct
+# with offset 0 (how the keyer is really called), where max_w cancels out:
+# (1 - 0.96 / (1 - zoom/100)) / 2, floored at 0 -- 2.0 at zoom 0, 0 from about
+# +4 on, 18.0 at -50. No cache needed. Gate OFF: Auto is the fixed 2.0
+# clipping-warning threshold (Get-ClippingWarningThresholdPct). Non-finite
+# zoom -> $null (unknown, never a guessed number).
+function Get-AutoTolFromZoom {
+    param(
+        [Parameter(Mandatory=$true)][double]$ZoomPct,
+        [bool]$GateOn = $true
+    )
+    if (-not $GateOn) { return 2.0 }
+    if ([double]::IsNaN($ZoomPct) -or [double]::IsInfinity($ZoomPct)) { return $null }
+    $remaining = 1.0 - $ZoomPct / 100.0
+    if ($remaining -le 0) { return 0.0 }
+    return ([Math]::Max(0.0, (1.0 - 0.96 / $remaining) / 2.0) * 100.0)
+}
+
+# Diagram geometry (user decision 10b): the grey frame is 100 % of the frame
+# width drawn as a fifth of the canvas, centred; the allowed margin is drawn on
+# a LINEAR scale magnified so 20 % reaches the canvas edge (exactly 10x for a
+# fifth). Px per percent per side = ((canvas - frame) / 2) / 20.
+function Get-ToleranceVisualGeometry {
+    param([Parameter(Mandatory=$true)][double]$CanvasWidth)
+    $frameW = $CanvasWidth / 5.0
+    $pxPerPct = (($CanvasWidth - $frameW) / 2.0) / 20.0
+    return [PSCustomObject]@{
+        CanvasWidth = $CanvasWidth; CenterX = ($CanvasWidth / 2.0); FrameWidth = $frameW
+        PxPerPct = $pxPerPct; Magnification = ($pxPerPct / ($frameW / 100.0))
+    }
+}
+
+# Pixel width of a margin of $Pct percent on one side: clamped to the 0..20
+# drawing range; NaN / negative -> 0.
+function Get-ToleranceMarginPx {
+    param([double]$Pct, [Parameter(Mandatory=$true)][double]$PxPerPct)
+    if ([double]::IsNaN($Pct) -or $Pct -le 0) { return 0.0 }
+    return ([Math]::Min(20.0, $Pct) * $PxPerPct)
+}
+
+# W5 split band (user decision): of the allowed margin T, SOLID = the part the
+# animation actually uses (up to the worst overshoot Y), SLACK = the unused
+# rest, OVER = how far Y goes past T (drawn red with "!"). Compared at the 1
+# decimal the Estimated line shows, so "worst 2.0%" against a 2 % tolerance is
+# used-exactly, never a float-noise red. No estimate ($WorstPct $null): the
+# whole margin draws solid, no slack, no over (no worst marker).
+function Get-ToleranceBandSplit {
+    param(
+        [Parameter(Mandatory=$true)][double]$TolerancePct,
+        $WorstPct = $null
+    )
+    $t = [Math]::Round([Math]::Max(0.0, $TolerancePct), 1, [MidpointRounding]::AwayFromZero)
+    if ($null -eq $WorstPct -or [double]::IsNaN([double]$WorstPct)) {
+        return [PSCustomObject]@{ HasWorst = $false; UsedPct = $t; SlackPct = 0.0; OverPct = 0.0; IsOver = $false }
+    }
+    $y = [Math]::Round([Math]::Max(0.0, [double]$WorstPct), 1, [MidpointRounding]::AwayFromZero)
+    $used = [Math]::Min($y, $t)
+    return [PSCustomObject]@{
+        HasWorst = $true
+        UsedPct = $used
+        SlackPct = ($t - $used)
+        OverPct = [Math]::Max(0.0, [Math]::Min(20.0, $y) - $t)
+        IsOver = ($y -gt $t)
+    }
+}
+
+# Which cached frames the Estimated line and the visual measure (task48
+# rebuild: "calculated based on what time range user choose"). Mirrors what
+# Start Recording would record, without a Maya round trip:
+#   All       -> the whole cached take (the cache samples the animation's
+#                keyed extent, which "All" records).
+#   StartEnd  -> the typed boxes, parsed exactly like Get-ResolvedTimeRange
+#                ([int]::TryParse, Start must not exceed End).
+#   TimeSlider-> Maya's live Range Slider is only readable through a Maya round
+#                trip at click time, so this uses the last range a Preview /
+#                Start Recording click resolved in that mode ($LastTimeSlider*);
+#                none yet -> unknown, never a guess.
+# StartIndex/EndIndex = the first/last cached frame inside [Start, End]; a
+# range that covers no cached frame is unknown too. Known = $false always
+# carries a short Reason for the Estimated line.
+function Get-EstimateRange {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("All", "TimeSlider", "StartEnd")][string]$Mode,
+        [AllowEmptyCollection()][double[]]$Frames = @(),
+        [string]$StartText = "",
+        [string]$EndText = "",
+        $LastTimeSliderStart = $null,
+        $LastTimeSliderEnd = $null
+    )
+    $unknown = { param($why) [PSCustomObject]@{ Known = $false; StartFrame = $null; EndFrame = $null; StartIndex = $null; EndIndex = $null; Reason = $why } }
+    if ($null -eq $Frames -or $Frames.Count -eq 0) { return (& $unknown "no cache yet") }
+    if ($Mode -eq "All") {
+        return [PSCustomObject]@{ Known = $true; StartFrame = $Frames[0]; EndFrame = $Frames[$Frames.Count - 1]; StartIndex = 0; EndIndex = ($Frames.Count - 1); Reason = $null }
+    }
+    if ($Mode -eq "TimeSlider") {
+        if ($null -eq $LastTimeSliderStart -or $null -eq $LastTimeSliderEnd) {
+            return (& $unknown "Time Slider range unknown until Preview reads it from Maya")
+        }
+        $start = [double]$LastTimeSliderStart
+        $end = [double]$LastTimeSliderEnd
+    } else {
+        $s = 0; $e = 0
+        if (-not [int]::TryParse($StartText, [ref]$s) -or -not [int]::TryParse($EndText, [ref]$e)) {
+            return (& $unknown "Start/End must be whole numbers")
+        }
+        $start = [double]$s
+        $end = [double]$e
+    }
+    if ($start -gt $end) { return (& $unknown "Start is after End") }
+    $first = -1; $last = -1
+    for ($i = 0; $i -lt $Frames.Count; $i++) {
+        if ($Frames[$i] -ge $start -and $Frames[$i] -le $end) {
+            if ($first -lt 0) { $first = $i }
+            $last = $i
+        }
+    }
+    if ($first -lt 0) { return (& $unknown "frames $start-$end are outside the cached take") }
+    return [PSCustomObject]@{ Known = $true; StartFrame = $start; EndFrame = $end; StartIndex = $first; EndIndex = $last; Reason = $null }
+}
+
+# The Estimated line with numbers (task48 fix round). Rounds with the SAME
+# rule as Get-ToleranceBandSplit (1 decimal, half away from zero), so the
+# text and the bar never disagree at a midpoint (worst 2.25 vs 2.2: text
+# "2.3", bar red). The text FORMAT is unchanged from before: a whole number
+# prints without a decimal ("worst 2%").
+function Format-EstimateReadoutText {
+    param(
+        [Parameter(Mandatory=$true)][int]$Keys,
+        [Parameter(Mandatory=$true)][double]$OverPct,
+        [Parameter(Mandatory=$true)][double]$WorstPct
+    )
+    $over = [Math]::Round($OverPct, 1, [MidpointRounding]::AwayFromZero)
+    $worst = [Math]::Round($WorstPct, 1, [MidpointRounding]::AwayFromZero)
+    return "Estimated: $Keys keys, $over% of frames over tolerance, worst $worst% of frame width."
+}
+
+# The Estimated line when there is nothing to measure. No cache (or no reason
+# given) -> the user-approved wording; any other reason (range unknown) is
+# shown as-is so the line never pretends to have a number.
+function Get-EstimatePendingText {
+    param([string]$Reason = $null)
+    if ([string]::IsNullOrEmpty($Reason) -or $Reason -eq "no cache yet") {
+        return "Estimated: -- (open Preview once to see keys and worst overshoot)"
+    }
+    return "Estimated: -- ($Reason)"
+}
+
+# Tolerance diagram tooltip (task48 rebuild): truthful wording from the
+# approved mock rounds (8/10/11/12). Numbers use 1 decimal, invariant culture.
+# $RangeText describes the measured frames (e.g. "frames 0-120"); $WorstPct
+# $null = no estimate; $PendingReason = why (passed to the no-estimate part).
+function Get-ToleranceTooltipText {
+    param(
+        [bool]$GateOn = $true,
+        [bool]$Auto = $true,
+        [double]$TolPct = 0.0,
+        $WorstPct = $null,
+        [string]$RangeText = "",
+        [string]$PendingReason = $null
+    )
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $f1 = { param($v) ([Math]::Round([double]$v, 1, [MidpointRounding]::AwayFromZero)).ToString("0.0", $inv) }
+    $text = "Tolerance: how far (as % of the frame width, on each side) the character may stick out past the left or right frame edge. Grey = the capture frame, blue = the allowed margin; a WIDER blue margin means the camera reacts LESS and more of the character can be cut at the edges."
+    $text += " Margin shown magnified 10x (the grey frame, 100% of the frame width, is a fifth of this bar; ticks mark 5, 10 and 20% of the frame width per side)."
+    if ($GateOn) {
+        $text += " Frame gate ON: the camera only moves when an edge passes this limit, and then only enough to bring it back to it."
+    } else {
+        $text += " Frame gate OFF: the camera never moves; this number is only the clipping-warning threshold (amber up to it, red beyond), marked with !."
+    }
+    if ($Auto -and $GateOn) {
+        $text += " Auto (dashed outline, A) = $(& $f1 $TolPct)% at the current Zoom (2.0% at zoom 0, 0 when zoomed in about 4% or more)."
+    } elseif ($Auto) {
+        $text += " Auto (dashed outline, A) = the fixed 2.0% warning threshold."
+    } else {
+        $text += " Manual: $(& $f1 $TolPct)%."
+    }
+    if ($null -ne $WorstPct) {
+        $over = if ($RangeText) { " over $RangeText" } else { "" }
+        $text += " Solid blue = the part of your allowed margin the animation actually uses (worst $(& $f1 $WorstPct)% of the frame width$over). Pale dashed = unused slack. Red outline with ! = overshoot beyond the allowed margin."
+    } else {
+        $why = if ([string]::IsNullOrEmpty($PendingReason) -or $PendingReason -eq "no cache yet") { "open Preview once" } else { $PendingReason }
+        $text += " No estimate yet ($why): the bar shows the allowed margin only."
+    }
+    if ($GateOn) {
+        $text += " Very small values (0-2%): the camera follows the character's edges closely and nudges more often (on a real take at zoom 0: about 0.7 keys per second at 0%, 0.5 at 2%, 0.1 at 10%). It only gets busy and hugs the limit when the character is wider than the frame (zoomed in). Larger values keep the camera calmer but let the character be cut at the edges by up to that amount. A red outlined part in the bar means the animation goes past the allowed margin."
+    }
+    return ($text + " Mouse wheel here steps the number like over the box (Shift 10, Ctrl 0.1).")
 }
