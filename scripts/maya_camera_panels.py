@@ -436,6 +436,21 @@ def write_base_ortho_width(value):
         f.write('%.10f' % value)
 
 
+def write_capture_panel_names(panel_names):
+    # Hand-off to maya_obs_capture.ps1's Get-MayaHudState/Set-MayaHudState
+    # (task17, 2026-09-30): the actual Maya-generated modelPanel name (e.g.
+    # 'modelPanel4') is only known here, at creation time -- maya_obs_capture.ps1
+    # runs as a separate PowerShell process with no way to enumerate "which
+    # panels are the capture panels" on its own, so this writes the exact
+    # names out to a file, same file-hand-off pattern as every other
+    # _camera_*.txt file in this module. One name per line; overwritten
+    # (not appended) every run since close_all_view_panels() always tears
+    # down and rebuilds these panels fresh.
+    path = os.path.join(CACHE_DIR, '_capture_panels.txt')
+    with open(path, 'w') as f:
+        f.write('\n'.join(panel_names))
+
+
 def view_title(view_name):
     return TITLE_OVERRIDES.get(view_name, view_name.title()) + ' View'
 
@@ -761,6 +776,7 @@ def open_view_panels():
 
     close_all_view_panels()
 
+    panel_names = []
     for i, view_name in enumerate(VIEWS):
         cam = ensure_camera(view_name)
 
@@ -787,6 +803,7 @@ def open_view_panels():
         cmds.refresh(force=True)
 
         apply_mesh_only_display(panel)
+        panel_names.append(panel)
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
@@ -794,6 +811,7 @@ def open_view_panels():
 
     write_world_per_px(computed_world_per_px)
     write_base_ortho_width(computed_base_ortho_width)
+    write_capture_panel_names(panel_names)
     cmds.refresh(force=True)
 
 

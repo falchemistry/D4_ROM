@@ -120,6 +120,124 @@ function Set-MayaFrameRange($minTime, $maxTime) {
     Send-MayaCode "import maya.cmds as cmds`ncmds.playbackOptions(minTime=$minTime, maxTime=$maxTime)`n"
 }
 
+# --- HUD save/mutate/restore (task17, 2026-09-30) --------------------------
+# Goal: the Current Frame HUD (plus Camera Names and Frame Rate -- see
+# TARGET_HUD_ITEMS below) must be visible in every ROM capture, automatically,
+# and Maya's HUD must always end up exactly as the artist had it, even if
+# the capture crashes or is hard-stopped. Mirrors the existing
+# Get-MayaFrameRange/Set-MayaFrameRange save/mutate/finally-restore pattern
+# above, but ALSO persists the saved snapshot to disk (see Get-MayaHudState)
+# so Get-StopCleanupSteps's new restore step (rom_launcher_logic.ps1) can
+# recover it even when Process.Kill() bypasses this script's own `finally`
+# entirely -- frame range has a documented, accepted gap here; HUD does not.
+#
+# TARGET_HUD_ITEMS confirmed LIVE (bridge, port 7001, 2026-09-30) against a
+# real Maya session, not assumed from documentation -- see the design notes
+# in Get-CaptureHudState below for exactly what was verified and why these
+# three specific item names.
+$TargetHudItems = @('HUDCameraNames', 'HUDCurrentFrame', 'HUDFrameRate')
+
+function Get-CapturePanelNames() {
+    # Reads the exact Maya-generated modelPanel name(s) maya_camera_panels.py
+    # (or _LR.py) just wrote via write_capture_panel_names() -- this
+    # PowerShell process has no way to enumerate "which panels are the
+    # capture panels" on its own, so it relies on that file hand-off, same
+    # convention as every other _camera_*.txt file already used between
+    # these two scripts. Returns an empty array (not an error) if the file
+    # is missing -- e.g. this script run standalone without the panel-setup
+    # step ever having run -- so HUD save/restore still degrades gracefully
+    # to "no known capture panel, items only."
+    $path = Join-Path $ScriptDir "..\d4_anim_sample\_capture_panels.txt"
+    if (-not (Test-Path $path)) { return @() }
+    $names = @(Get-Content $path | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    return ,$names
+}
+
+function Get-MayaHudState() {
+    # Snapshots BOTH halves of what actually controls HUD text in a capture
+    # panel -- confirmed live (2026-09-30) that forcing a capture panel's
+    # own modelEditor headsUpDisplay flag from False to True is not enough
+    # on its own: whatever OTHER HUD items already happen to be globally
+    # enabled (in the verified test session: PolyCount Verts/Edges/Faces/
+    # Triangles/UVs, Symmetry, CapsLock, ViewAxis) become visible in that
+    # panel too, alongside the 3 wanted items -- so both the per-panel flag
+    # AND every item's global visibility must be captured and restored, not
+    # just the panel flag alone. Also writes the snapshot to a persistent
+    # file (not just returned in-memory) so Get-StopCleanupSteps's restore
+    # step can recover it after a Process.Kill(), which never lets this
+    # script's own `finally` run at all.
+    $panels = Get-CapturePanelNames
+    $panelsPy = (($panels | ForEach-Object { "'$($_ -replace "'", "\'")'" }) -join ", ")
+    $statePath = "$ScriptDir\_hud_state.json"
+    # r'...' raw-string form, same convention as Get-MayaFrameRange/
+    # Get-MayaPlaybackState above -- avoids any backslash-escaping games
+    # with a plain Windows path.
+    $code = @"
+import maya.cmds as cmds
+import json
+panels = [$panelsPy]
+items = cmds.headsUpDisplay(listHeadsUpDisplays=True) or []
+state = {'panels': {}, 'items': {}}
+for p in panels:
+    if cmds.control(p, exists=True):
+        state['panels'][p] = bool(cmds.modelEditor(p, query=True, headsUpDisplay=True))
+for it in items:
+    state['items'][it] = bool(cmds.headsUpDisplay(it, query=True, visible=True))
+with open(r'$statePath', 'w') as f:
+    json.dump(state, f)
+"@
+    if (Test-Path $statePath) { Remove-Item $statePath -Force }
+    Send-MayaCode $code
+    Start-Sleep -Milliseconds 300
+    if (-not (Test-Path $statePath)) {
+        throw "Failed to save Maya's current HUD state before changing it -- aborting rather than risk leaving the artist's HUD altered with no saved way to restore it."
+    }
+    return (Get-Content $statePath -Raw | ConvertFrom-Json)
+}
+
+function Set-MayaHudState($state) {
+    # Applies a full panels+items snapshot back onto Maya -- used to apply
+    # BOTH the capture-time forced state (see Get-CaptureHudState) and the
+    # restore-to-original state (the object Get-MayaHudState returned).
+    # PowerShell True/False .ToString() output ("True"/"False") is used
+    # as-is -- it matches Python's own boolean literal spelling exactly, so
+    # no case conversion is needed (and lower-casing it would produce
+    # invalid Python "true"/"false").
+    $itemAssignments = @()
+    foreach ($prop in $state.items.PSObject.Properties) {
+        $itemAssignments += "cmds.headsUpDisplay('$($prop.Name)', edit=True, visible=$($prop.Value.ToString()))"
+    }
+    $panelAssignments = @()
+    foreach ($prop in $state.panels.PSObject.Properties) {
+        $panelAssignments += "if cmds.control('$($prop.Name)', exists=True): cmds.modelEditor('$($prop.Name)', edit=True, headsUpDisplay=$($prop.Value.ToString()))"
+    }
+    $code = "import maya.cmds as cmds`n" + ($itemAssignments -join "`n") + "`n" + ($panelAssignments -join "`n") + "`n"
+    Send-MayaCode $code
+}
+
+function Get-CaptureHudState($originalState) {
+    # Desired state DURING the capture: every known capture panel's own
+    # flag forced True, and ONLY $TargetHudItems enabled -- everything else
+    # the artist had on is suppressed for the capture's duration, then
+    # restored. Built from $originalState so it covers exactly the same set
+    # of panels/items that were actually snapshotted (never invents a panel
+    # or item name that wasn't observed to exist).
+    $captureItems = [ordered]@{}
+    foreach ($prop in $originalState.items.PSObject.Properties) {
+        $captureItems[$prop.Name] = [bool]($TargetHudItems -contains $prop.Name)
+    }
+    $capturePanels = [ordered]@{}
+    foreach ($prop in $originalState.panels.PSObject.Properties) {
+        $capturePanels[$prop.Name] = $true
+    }
+    return [PSCustomObject]@{ panels = [PSCustomObject]$capturePanels; items = [PSCustomObject]$captureItems }
+}
+
+function Clear-MayaHudStateFile() {
+    $statePath = "$ScriptDir\_hud_state.json"
+    if (Test-Path $statePath) { Remove-Item $statePath -Force }
+}
+
 function Get-MayaFps() {
     # currentTimeUnitToFPS() is the same MEL proc Maya itself uses to
     # convert the scene's time unit ('ntsc', 'film', 'pal', a custom
@@ -436,6 +554,7 @@ function Invoke-ObsRecordAction($action) {
 # user's taskbar missing after a failed run.
 Hide-Taskbar
 $originalRange = $null
+$originalHud = $null
 try {
     Ensure-ObsRunning
     Repair-MonitorCaptureSourceBinding
@@ -470,6 +589,11 @@ try {
     }
     $pollIntervalSec = Get-PlaybackPollIntervalSeconds ($activeMax - $activeMin)
 
+    Write-Host "Saving current Maya HUD state..."
+    $originalHud = Get-MayaHudState
+    Set-MayaHudState (Get-CaptureHudState $originalHud)
+    Write-Host "  HUD forced on for the capture panel(s): $($TargetHudItems -join ', ')"
+
     Write-Host "Starting OBS recording..."
     Invoke-ObsRecordAction "start"
 
@@ -492,6 +616,11 @@ try {
     if ($originalRange -ne $null) {
         Write-Host "Restoring original frame range ($($originalRange.MinTime)-$($originalRange.MaxTime))..."
         Set-MayaFrameRange $originalRange.MinTime $originalRange.MaxTime
+    }
+    if ($originalHud -ne $null) {
+        Write-Host "Restoring original Maya HUD state..."
+        Set-MayaHudState $originalHud
+        Clear-MayaHudStateFile
     }
     Show-Taskbar
 }

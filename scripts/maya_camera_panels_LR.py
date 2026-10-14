@@ -295,6 +295,16 @@ def write_base_ortho_width(value):
         f.write('%.10f' % value)
 
 
+def write_capture_panel_names(panel_names):
+    # See maya_camera_panels.py's own copy for the full explanation. Same
+    # shared _capture_panels.txt file -- only whichever leg (front/back or
+    # left/right) is currently open ever has panels in it, since
+    # close_all_view_panels() always tears down every known window first.
+    path = os.path.join(CACHE_DIR, '_capture_panels.txt')
+    with open(path, 'w') as f:
+        f.write('\n'.join(panel_names))
+
+
 def view_title(view_name):
     return TITLE_OVERRIDES.get(view_name, view_name.title()) + ' View'
 
@@ -562,6 +572,7 @@ def open_view_panels():
 
     close_all_view_panels()
 
+    panel_names = []
     for i, view_name in enumerate(VIEWS):
         cam = ensure_camera(view_name)
 
@@ -588,6 +599,7 @@ def open_view_panels():
         cmds.refresh(force=True)
 
         apply_mesh_only_display(panel)
+        panel_names.append(panel)
 
         panel_w = cmds.control(panel, query=True, width=True)
         panel_h = cmds.control(panel, query=True, height=True)
@@ -595,6 +607,7 @@ def open_view_panels():
 
     write_world_per_px(computed_world_per_px)
     write_base_ortho_width(computed_base_ortho_width)
+    write_capture_panel_names(panel_names)
     cmds.refresh(force=True)
 
 
