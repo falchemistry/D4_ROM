@@ -28,7 +28,7 @@ $ScriptDir = $PSScriptRoot
 # count) -- shown in the window title so a user/screenshot/bug report can
 # say which build they're on, and so a stale d4_rom_dist copy is
 # distinguishable from the current source at a glance.
-$script:ToolVersion = "1.0.1"
+$script:ToolVersion = "1.1.0"
 
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -501,6 +501,31 @@ $script:ToolVersion = "1.0.1"
                 </Button>
             </Grid>
 
+            <!-- T97 pre/post recording scripts (approved variant V1): the
+                 dot shows gray = both scripts empty (nothing runs), green
+                 = at least one has code, amber = a file is missing; the
+                 tooltip carries the per-script state. The folder button
+                 creates any missing file from the shipped template (never
+                 overwriting) and opens <install root>\user_hooks. -->
+            <Grid Margin="0,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse x:Name="HookStatusDot" Width="10" Height="10" Fill="Gray" Margin="0,0,6,0" VerticalAlignment="Center"
+                             ToolTip="Not checked yet."/>
+                    <TextBlock x:Name="HookStatusLabel" Text="Pre-Post Recording" Foreground="#FFA0A0A0" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                </StackPanel>
+                <Button Grid.Column="1" x:Name="HookFolderButton" Width="36" Height="32" Padding="0" AutomationProperties.Name="Open Pre-Post Recording script folder"
+                        ToolTip="Not checked yet.">
+                    <Canvas Width="14" Height="14">
+                        <Path Data="M 1,3.2 L 5.2,3.2 L 6.6,4.8 L 13,4.8 L 13,12 L 1,12 Z"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3" Fill="Transparent" StrokeLineJoin="Round"/>
+                    </Canvas>
+                </Button>
+            </Grid>
+
             <Grid Margin="0,0,0,10">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -889,6 +914,8 @@ $cacheActionButton = $window.FindName("CacheActionButton")
 $cacheCheckIcon = $window.FindName("CacheCheckIcon")
 $cacheRefreshIcon = $window.FindName("CacheRefreshIcon")
 $forceRebuildMenuItem = $window.FindName("ForceRebuildMenuItem")
+$hookStatusDot = $window.FindName("HookStatusDot")
+$hookFolderButton = $window.FindName("HookFolderButton")
 $obsPasswordStatusDot = $window.FindName("ObsPasswordStatusDot")
 $obsPasswordButton = $window.FindName("ObsPasswordButton")
 $obsPasswordStatusLabel = $window.FindName("ObsPasswordStatusLabel")
@@ -1019,6 +1046,13 @@ $script:lastConfirmedMonitorIndex = -1
 # of advancing to the next step. Reset at the start of every Start-Steps
 # call so a PRIOR run's abort can't bleed into a later, unrelated one.
 $script:captureAbortReason = $null
+# T97: the current video's post-record step while its pre-record step has
+# started and the post one has not (see Update-PendingPostHook) -- what a
+# Stop click still runs. Cleared when a run starts or completes.
+$script:pendingPostHookStep = $null
+# T97: why the last Start Recording ran without the pre/post scripts ($null
+# = fine); keeps the row's dot amber until a later build succeeds.
+$script:hookBuildError = $null
 $script:pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:pollTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 # Same destructive-action red as MayaSkinningCheck's delete icon
@@ -1081,7 +1115,7 @@ function Update-PortStatusIndicator {
 
 $script:portCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:portCheckTimer.Interval = [TimeSpan]::FromSeconds(5)
-$script:portCheckTimer.Add_Tick({ Update-PortStatusIndicator | Out-Null })
+$script:portCheckTimer.Add_Tick({ Update-PortStatusIndicator | Out-Null; Update-HookStatusIndicator })
 
 # Same warning amber as MayaSkinningCheck's SEVERITY_COLORS["warning"]
 # (akStyle.py, rgb(239, 192, 84)) -- "no cache yet" is informational (the
@@ -1621,6 +1655,33 @@ function Get-ObsPasswordStatus {
         return ConvertFrom-ObsConfigContent -Content ""
     }
     return ConvertFrom-ObsConfigContent -Content (Get-Content $path -Raw)
+}
+
+# T97: the Pre-Post Recording row. Two small file reads, cheap enough for
+# the 5 s port-check tick, so the dot follows edits made in an editor while
+# the launcher stays open. Never throws (it runs inside a timer tick).
+function Update-HookStatusIndicator {
+    try {
+        $p = Get-HookPaths -ScriptDir $ScriptDir
+        $i = Get-HookIndicator -PreState (Get-HookState -Path $p.Pre) -PostState (Get-HookState -Path $p.Post)
+        $hookStatusDot.Fill = switch ($i.Color) {
+            "green" { "LimeGreen" }
+            "amber" { $script:cacheWarningBrush }
+            default { "Gray" }
+        }
+        $tip = "$($i.Text)`nFolder: $($p.UserDir)"
+        if ($script:hookBuildError) {
+            # the last Start Recording could not prepare the scripts
+            $hookStatusDot.Fill = $script:cacheWarningBrush
+            $tip = "Last recording ran WITHOUT the pre/post scripts: $($script:hookBuildError)`n$tip"
+        }
+        $hookStatusDot.ToolTip = $tip
+        $hookFolderButton.ToolTip = $tip
+    } catch {
+        $hookStatusDot.Fill = $script:cacheWarningBrush
+        $hookStatusDot.ToolTip = "Could not read the pre/post recording scripts: $($_.Exception.Message)"
+        $hookFolderButton.ToolTip = $hookStatusDot.ToolTip
+    }
 }
 
 function Update-ObsPasswordStatusIndicator {
@@ -3256,7 +3317,7 @@ function Set-ButtonsEnabled([bool]$enabled, $activeButton = $null) {
     # thread synchronously for up to ~60s (launching OBS), which would
     # also stall $script:pollTimer -- the DispatcherTimer driving an
     # ALREADY-active run's own step transitions -- if clicked mid-capture.
-    foreach ($b in @($previewButton, $startRecordingButton, $resetButton, $cacheActionButton, $copySnippetButton, $obsPasswordButton, $monitorRefreshButton)) {
+    foreach ($b in @($previewButton, $startRecordingButton, $resetButton, $cacheActionButton, $copySnippetButton, $obsPasswordButton, $monitorRefreshButton, $hookFolderButton)) {
         if (-not $enabled -and $b -eq $activeButton) {
             # The button that started the current run stays clickable --
             # it's the one now showing "Stop" (see Set-ButtonRunningVisual)
@@ -3336,6 +3397,7 @@ function Complete-Run([string]$FinalMessage = "=== All steps finished ===", [boo
     # the pollTimer's abort path (see Set-CaptureAbortReason) can share
     # the exact same cleanup instead of a second, easy-to-drift copy.
     $script:pollTimer.Stop()
+    $script:pendingPostHookStep = $null
     $script:runStatus = "Done"
     Set-ButtonRunningVisual $script:activeButton $false
     Set-ButtonsEnabled $true
@@ -3373,6 +3435,9 @@ function Start-NextStep {
     }
 
     $step = $script:currentSteps[$script:currentStepIndex]
+    # T97: a starting pre-record step arms its video's post-record step for
+    # Stop-CurrentRun; a starting post-record step disarms it.
+    $script:pendingPostHookStep = Update-PendingPostHook -Steps @($script:currentSteps) -StartedIndex $script:currentStepIndex -Pending $script:pendingPostHookStep
     Write-Log ">>> $($step.FilePath) $($step.Arguments -join ' ')"
 
     # ProcessStartInfo.ArgumentList exists on paper but comes back null on
@@ -3492,6 +3557,7 @@ function Start-Steps([array]$steps, [bool]$ClearLog = $true, $Button = $null, [s
     $script:currentStepIndex = 0
     $script:activeButton = $Button
     $script:captureAbortReason = $null
+    $script:pendingPostHookStep = $null
     # Stashed so Stop-CurrentRun's own Start-Steps call (for the cleanup
     # sequence) can keep showing the same label instead of resetting to
     # the generic default partway through.
@@ -3537,7 +3603,12 @@ function Stop-CurrentRun {
     # consistent with every other run. Keep showing the same running label
     # on the same button through the cleanup run by passing both through
     # unchanged.
-    Start-Steps (Get-StopCleanupSteps -ScriptDir $ScriptDir) $false $script:activeButton $script:activeRunningLabel
+    # T97: if this video's pre-record script already ran, its post-record
+    # script runs last in the cleanup (captured here, before Start-Steps
+    # resets it).
+    $postHookForStop = $script:pendingPostHookStep
+    if ($postHookForStop) { Write-Log "Post-record script will run after the cleanup (its pre-record script already ran)." }
+    Start-Steps (Get-StopCleanupSteps -ScriptDir $ScriptDir -PostHookStep $postHookForStop) $false $script:activeButton $script:activeRunningLabel
 }
 
 $startEndRadio.Add_Checked({
@@ -4201,7 +4272,17 @@ function Get-CaptureClickResult {
     if (-not $range.Success) {
         return [PSCustomObject]@{ Steps = $null; ErrorMessage = "$($range.ErrorMessage) -- not starting."; ResolvedStart = $null; ResolvedEnd = $null }
     }
-    $steps = Get-CaptureStepsForAxis -Axis $axis -Recording $true -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End
+    # T97: only user scripts with code add steps; with none, nothing is
+    # written and the step list is exactly what it always was. HookLog is
+    # written by the caller AFTER Start-Steps (which clears the log box).
+    # A problem preparing them never blocks the recording silently: the
+    # run gets the plain steps, the log names the problem, the dot turns
+    # amber (Get-CaptureStepsWithHooks).
+    $hookBuild = Get-CaptureStepsWithHooks -Axis $axis -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End -ToolVersion $script:ToolVersion
+    $script:hookBuildError = $hookBuild.Error
+    Update-HookStatusIndicator
+    $hookLog = @($hookBuild.Log)
+    $steps = $hookBuild.Steps
     # ResolvedStart: so a caller wanting "Recenter at start frame" can reuse
     # THIS resolution (a real Maya round trip for Time Slider/All) instead
     # of paying for a second one just to find the same number again.
@@ -4209,7 +4290,7 @@ function Get-CaptureClickResult {
     # OFF clipping estimate -- its click-time prompt needs the exact
     # resolved range, not just the Start, and must not pay for a second
     # Get-ResolvedTimeRange round trip to get it.
-    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start; ResolvedEnd = $range.End }
+    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start; ResolvedEnd = $range.End; HookLog = $hookLog }
 }
 
 $previewButton.Add_Click({
@@ -4369,6 +4450,7 @@ $startRecordingButton.Add_Click({
     Start-Steps $steps $true $startRecordingButton "Stop Recording"
     if ($recenterLogMessage) { Write-Log $recenterLogMessage }
     if ($frameGateLogMessage) { Write-Log $frameGateLogMessage }
+    foreach ($hookLine in @($result.HookLog)) { if ($hookLine) { Write-Log $hookLine } }
 })
 
 $resetButton.Add_Click({
@@ -4419,6 +4501,20 @@ $copySnippetButton.Add_Click({
     $mayaPortSteps = "1. In Maya, open the Script Editor (the icon at the bottom-right of the status line, or Windows > General Editors > Script Editor)`n2. Click the Python tab`n3. Paste the snippet -- already copied to your clipboard`n4. Click Execute All (or press Ctrl+Enter) to run it`n`nMust be re-run every time Maya is restarted -- the port does not persist across sessions."
     $mayaPortImage = Join-Path $ScriptDir "guide_images\maya_port_setup.jpg"
     Show-DarkNotice -Title "Open Maya's Command Port" -Message $mayaPortSteps -ImagePath $mayaPortImage
+})
+
+$hookFolderButton.Add_Click({
+    # Initialize-HookFiles (never overwrites) then Explorer on user_hooks\.
+    # A missing template = the existing dark notice naming the exact path,
+    # nothing opened; an Explorer failure = one log line.
+    $r = Invoke-HookFolderButton -ScriptDir $ScriptDir
+    switch ($r.Status) {
+        "opened" { Write-Log "Opened the pre/post recording folder: $($r.Folder)" }
+        "template_missing" { Show-DarkNotice -Title "Pre-Post Recording" -Message $r.Message }
+        "init_failed" { Write-Log $r.Message; Show-DarkNotice -Title "Pre-Post Recording" -Message $r.Message }
+        default { Write-Log $r.Message }
+    }
+    Update-HookStatusIndicator
 })
 
 $obsPasswordButton.Add_Click({
@@ -4604,6 +4700,17 @@ function Write-StartupSummary([bool]$MayaReachable) {
 $script:mayaReachableAtStartup = Update-PortStatusIndicator
 $script:portCheckTimer.Start()
 Update-ObsPasswordStatusIndicator
+# T97: create user_hooks\ and any missing pre/post script from the shipped
+# template on every launch (never overwrites), so a fresh install shows a
+# gray dot, not a "missing" amber one. A problem is logged, not fatal.
+try {
+    $hookInit = Initialize-HookFiles -ScriptDir $ScriptDir
+    foreach ($t in @($hookInit.MissingTemplates)) { Write-Log "Pre-Post Recording: template missing, script not created: $t" }
+    foreach ($e in @($hookInit.Errors)) { Write-Log "Pre-Post Recording: could not create $e" }
+} catch {
+    Write-Log "Pre-Post Recording: could not create the user_hooks folder: $($_.Exception.Message)"
+}
+Update-HookStatusIndicator
 # Design (2026-09-02): the magnifier always starts at the safe 0% default,
 # never restoring a value left over from an earlier launch -- a forgotten
 # non-zero magnifier should never silently carry into a future session and

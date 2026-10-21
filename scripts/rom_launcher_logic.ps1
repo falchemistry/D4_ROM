@@ -34,6 +34,7 @@ function Get-ToolPathTable {
         "maya_restore_hud.py" = "maya"
         "maya_stop_playback.py" = "maya"
         "send_to_maya.ps1" = "maya"
+        "maya_run_hook.py" = "hooks"
         "maya_obs_capture.ps1" = "capture"
         "taskbar_control.ps1" = "capture"
         "obs_control.ps1" = "obs"
@@ -42,6 +43,7 @@ function Get-ToolPathTable {
         "_frame_range_state.txt" = "state"
         "_playback_state.txt" = "state"
         "_hud_state.json" = "state"
+        "_hook_context.json" = "state"
     }
 }
 
@@ -87,11 +89,29 @@ function Get-CaptureSteps {
         # $Recording is true; "Preview" never touches maya_obs_capture.ps1
         # at all, so a range has nothing to apply to there.
         [Nullable[int]]$StartFrame = $null,
-        [Nullable[int]]$EndFrame = $null
+        [Nullable[int]]$EndFrame = $null,
+        # T97 pre/post recording scripts. A path is only passed for a user
+        # file that has code (see Get-ActiveHookPaths); "" / $null = no
+        # step at all, so the default list stays exactly what it was.
+        # Recording only -- Preview never runs them.
+        [string]$PreHookPath = "",
+        [string]$PostHookPath = "",
+        [string]$HookContextPath = "",
+        # Which video of the run this is (All = 0 then 1), handed to the
+        # user's script as D4_CTX['leg_index'].
+        [int]$LegIndex = 0
     )
 
     if (($StartFrame -eq $null) -ne ($EndFrame -eq $null)) {
         throw "StartFrame and EndFrame must both be given, or neither."
+    }
+
+    $preHookStep = $null
+    $postHookStep = $null
+    if ($Recording -and ($PreHookPath -or $PostHookPath)) {
+        if (-not $HookContextPath) { $HookContextPath = Get-ToolPath -ScriptDir $ScriptDir -Name "_hook_context.json" }
+        if ($PreHookPath) { $preHookStep = New-HookStep -ScriptDir $ScriptDir -Kind "pre" -UserPath $PreHookPath -ContextPath $HookContextPath -LegIndex $LegIndex -LegAxis $Axis }
+        if ($PostHookPath) { $postHookStep = New-HookStep -ScriptDir $ScriptDir -Kind "post" -UserPath $PostHookPath -ContextPath $HookContextPath -LegIndex $LegIndex -LegAxis $Axis }
     }
 
     $panelsScript = if ($Axis -eq "FrontBack") { "maya_camera_panels.py" } else { "maya_camera_panels_LR.py" }
@@ -114,11 +134,16 @@ function Get-CaptureSteps {
         # matches "ping -n 3 127.0.0.1 > nul" in the capture_*.bat files --
         # a short pause before the OBS/playback sequence starts
         $steps += [PSCustomObject]@{ FilePath = "ping"; Arguments = @("-n", "3", "127.0.0.1") }
+        # T97: the user's pre-record script runs right before OBS starts
+        # (panels and keys are ready), the post-record script right after
+        # OBS stops, before the taskbar comes back.
+        if ($preHookStep) { $steps += $preHookStep }
         $obsArgs = @("-ExecutionPolicy", "Bypass", "-File", $obsCapture)
         if ($StartFrame -ne $null) {
             $obsArgs += @("-StartFrame", "$StartFrame", "-EndFrame", "$EndFrame")
         }
         $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = $obsArgs }
+        if ($postHookStep) { $steps += $postHookStep }
         $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $taskbarControl, "-Action", "show") }
     }
 
@@ -144,16 +169,20 @@ function Get-CaptureStepsForAxis {
         [Parameter(Mandatory=$true)][bool]$Recording,
         [Parameter(Mandatory=$true)][string]$ScriptDir,
         [Nullable[int]]$StartFrame = $null,
-        [Nullable[int]]$EndFrame = $null
+        [Nullable[int]]$EndFrame = $null,
+        # T97 hooks, passed through to every leg (All = each runs twice).
+        [string]$PreHookPath = "",
+        [string]$PostHookPath = "",
+        [string]$HookContextPath = ""
     )
 
     if ($Axis -ne "All") {
-        return Get-CaptureSteps -Axis $Axis -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
+        return Get-CaptureSteps -Axis $Axis -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0
     }
 
     $steps = @()
-    $steps += Get-CaptureSteps -Axis "FrontBack" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
-    $steps += Get-CaptureSteps -Axis "LeftRight" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame
+    $steps += Get-CaptureSteps -Axis "FrontBack" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0
+    $steps += Get-CaptureSteps -Axis "LeftRight" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 1
     return $steps
 }
 
@@ -213,8 +242,14 @@ function Get-StopCleanupSteps {
     # specifically so this step can recover it after a kill -- see
     # maya_restore_hud.py, which reads that file and is a safe no-op if it
     # doesn't exist (e.g. Stop clicked with no active capture).
+    #
+    # T97: -PostHookStep is the current video's post-record step when its
+    # pre-record script already started (see Update-PendingPostHook); it
+    # runs last, after OBS has stopped. $null (the default) = the list is
+    # exactly what it always was.
     param(
-        [Parameter(Mandatory=$true)][string]$ScriptDir
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        $PostHookStep = $null
     )
 
     $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
@@ -235,7 +270,359 @@ function Get-StopCleanupSteps {
     # rest of this cleanup sequence, since each step in the queue always
     # runs independently of the previous step's exit code).
     $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $obsControl, "-Action", "stop") }
+    if ($PostHookStep) { $steps += $PostHookStep }
     return $steps
+}
+
+# --- Pre/post recording scripts (T97) -------------------------------------
+# The user's own d4_rom_pre_record.py / d4_rom_post_record.py live in
+# <install root>\user_hooks\ (install root = the parent of scripts\), never
+# in the zip; the zip ships comment-only templates in scripts\hooks\templates
+# that Initialize-HookFiles copies there on first use, never overwriting.
+# scripts\hooks\maya_run_hook.py runs a user file inside Maya.
+
+function Get-HookFileNames {
+    return @("d4_rom_pre_record.py", "d4_rom_post_record.py")
+}
+
+function Get-HookPaths {
+    # Where everything lives. Creates nothing.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+    $installRoot = Split-Path ([IO.Path]::GetFullPath($ScriptDir).TrimEnd('\')) -Parent
+    $userDir = Join-Path $installRoot "user_hooks"
+    # templates\ sits next to the runner, so the resolver table stays the
+    # one place that knows the hooks folder name
+    $templateDir = Join-Path (Split-Path (Get-ToolPath -ScriptDir $ScriptDir -Name "maya_run_hook.py") -Parent) "templates"
+    return [PSCustomObject]@{
+        InstallRoot = $installRoot
+        UserDir = $userDir
+        TemplateDir = $templateDir
+        Pre = Join-Path $userDir "d4_rom_pre_record.py"
+        Post = Join-Path $userDir "d4_rom_post_record.py"
+        PreTemplate = Join-Path $templateDir "d4_rom_pre_record.py"
+        PostTemplate = Join-Path $templateDir "d4_rom_post_record.py"
+    }
+}
+
+function Get-HookState {
+    # "missing" (no file / unreadable), "empty" (only blank lines and lines
+    # whose first non-blank character is '#': nothing runs) or "code".
+    # Same rule as hook_source_has_code in maya_run_hook.py.
+    param(
+        [Parameter(Mandatory=$true)][string]$Path
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "missing" }
+    try {
+        $lines = [IO.File]::ReadAllLines($Path)
+    } catch {
+        return "missing"
+    }
+    foreach ($line in $lines) {
+        $t = $line.Trim()
+        if ($t -and -not $t.StartsWith("#")) { return "code" }
+    }
+    return "empty"
+}
+
+function Get-HookIndicator {
+    # Status dot + tooltip for the Settings row. Amber (a file is missing)
+    # wins over green (at least one has code) wins over gray (both empty:
+    # nothing runs).
+    param(
+        [Parameter(Mandatory=$true)][string]$PreState,
+        [Parameter(Mandatory=$true)][string]$PostState
+    )
+    $describe = @{
+        "missing" = "missing"
+        "empty" = "empty (nothing runs)"
+        "code" = "has code (runs every video)"
+    }
+    $color = "gray"
+    if ($PreState -eq "code" -or $PostState -eq "code") { $color = "green" }
+    if ($PreState -eq "missing" -or $PostState -eq "missing") { $color = "amber" }
+    $text = "Pre-record script: $($describe[$PreState])`nPost-record script: $($describe[$PostState])"
+    if ($color -eq "gray") { $text += "`nBoth are empty, so nothing runs. Click to open the folder and edit them." }
+    elseif ($color -eq "amber") { $text += "`nClick to recreate a missing file and open the folder." }
+    else { $text += "`nClick to open the folder." }
+    return [PSCustomObject]@{ Color = $color; Text = $text }
+}
+
+function Get-ActiveHookPaths {
+    # The user files that will actually run (have code). A missing file is
+    # skipped with one log line; an empty one is skipped silently.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+    $p = Get-HookPaths -ScriptDir $ScriptDir
+    $result = [PSCustomObject]@{ Pre = $null; Post = $null; Log = @() }
+    foreach ($kind in @("Pre", "Post")) {
+        $path = $p.$kind
+        $state = Get-HookState -Path $path
+        if ($state -eq "code") { $result.$kind = $path }
+        elseif ($state -eq "missing") { $result.Log += "$($kind.ToLower())-record script not found, skipped: $path" }
+    }
+    return $result
+}
+
+function Get-HookStepCode {
+    # The one-line Python payload send_to_maya.ps1 -Code sends: execs the
+    # runner in its own dict with the call's arguments as globals.
+    # send_to_maya passes no script arguments, and under -ScriptPath a
+    # wrapper file has no __file__ to find the runner from, so the
+    # arguments travel here. One line, no double quotes (Start-NextStep
+    # wraps whitespace arguments in "..."). Paths are raw strings; a path
+    # with an apostrophe is sent hex-encoded instead (ConvertTo-PyPathLiteral).
+    param(
+        [Parameter(Mandatory=$true)][string]$RunnerPath,
+        [Parameter(Mandatory=$true)][ValidateSet("pre", "post")][string]$Kind,
+        [Parameter(Mandatory=$true)][string]$UserPath,
+        [Parameter(Mandatory=$true)][string]$ContextPath,
+        [int]$LegIndex = 0,
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight")][string]$LegAxis,
+        # Unique per hook step: Maya's command port executes every payload
+        # twice, and maya_run_hook.py runs the user's file only for the
+        # first execution of a given id (claim_run_id).
+        [Parameter(Mandatory=$true)][string]$RunId
+    )
+    foreach ($p in @($RunnerPath, $UserPath, $ContextPath)) {
+        if ($p -match "[`"\r\n]" -or $p.EndsWith("\")) {
+            throw "Pre/post recording script path cannot contain a double quote, a line break or end with '\': $p"
+        }
+    }
+    if ($RunId -notmatch '^[A-Za-z0-9_-]+$') { throw "Hook run id must be letters, digits, '-' or '_': $RunId" }
+    $runner = ConvertTo-PyPathLiteral $RunnerPath
+    $user = ConvertTo-PyPathLiteral $UserPath
+    $context = ConvertTo-PyPathLiteral $ContextPath
+    return "exec(compile(open($runner).read(), $runner, 'exec'), {'__name__': 'd4_rom_hook_runner', 'D4_HOOK_KIND': '$Kind', 'D4_HOOK_USER_PATH': $user, 'D4_HOOK_CONTEXT_PATH': $context, 'D4_HOOK_LEG_INDEX': $LegIndex, 'D4_HOOK_LEG_AXIS': '$LegAxis', 'D4_HOOK_RUN_ID': '$RunId'})"
+}
+
+function ConvertTo-PyPathLiteral {
+    # A Python expression for a path, safe inside the one-line payload: a
+    # readable raw string normally; with an apostrophe (which would end a
+    # raw string, and cannot be backslash-escaped in one) the UTF-8 bytes
+    # are hex-encoded -- bytearray.fromhex works in Python 2 and 3 and
+    # needs no quotes but its own single ones.
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not $Path.Contains("'")) { return "r'$Path'" }
+    $hex = -join ([Text.Encoding]::UTF8.GetBytes($Path) | ForEach-Object { $_.ToString("x2") })
+    return "bytearray.fromhex('$hex').decode('utf-8')"
+}
+
+function New-HookRunId {
+    # kind-leg-<guid>: different for every hook step ever built, so each
+    # video's pre and post call (and every new recording run) gets its own.
+    param(
+        [Parameter(Mandatory=$true)][string]$Kind,
+        [int]$LegIndex = 0
+    )
+    return "$Kind-$LegIndex-" + [guid]::NewGuid().ToString("N")
+}
+
+function New-HookStep {
+    # A queue step that runs one user hook in Maya. HookKind/LegIndex are
+    # extra properties the launcher reads (Update-PendingPostHook); the
+    # step runner only uses FilePath/Arguments. 5 minute timeout: a user
+    # script is expected to be short, unlike a cache build.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [Parameter(Mandatory=$true)][ValidateSet("pre", "post")][string]$Kind,
+        [Parameter(Mandatory=$true)][string]$UserPath,
+        [Parameter(Mandatory=$true)][string]$ContextPath,
+        [int]$LegIndex = 0,
+        [Parameter(Mandatory=$true)][string]$LegAxis
+    )
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $runner = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_run_hook.py"
+    $runId = New-HookRunId -Kind $Kind -LegIndex $LegIndex
+    $code = Get-HookStepCode -RunnerPath $runner -Kind $Kind -UserPath $UserPath -ContextPath $ContextPath -LegIndex $LegIndex -LegAxis $LegAxis -RunId $runId
+    return [PSCustomObject]@{
+        FilePath = "powershell"
+        Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-Code", $code, "-TimeoutMs", "300000")
+        HookKind = $Kind
+        LegIndex = $LegIndex
+        RunId = $runId
+    }
+}
+
+function Get-CaptureStepsWithHooks {
+    # Start Recording's step list with the user's pre/post scripts. Any
+    # error while preparing them (context file, a path the payload cannot
+    # carry, ...) never stops the recording silently: the run gets the
+    # plain steps, Error holds the reason and Log a line naming it.
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")][string]$Axis,
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [Nullable[int]]$StartFrame = $null,
+        [Nullable[int]]$EndFrame = $null,
+        [Parameter(Mandatory=$true)][string]$ToolVersion
+    )
+    $log = @()
+    $err = $null
+    try {
+        $hooks = Get-ActiveHookPaths -ScriptDir $ScriptDir
+        $log += @($hooks.Log)
+        $contextPath = ""
+        if ($hooks.Pre -or $hooks.Post) {
+            $contextPath = Write-HookContext -ScriptDir $ScriptDir -Axis $Axis -StartFrame $StartFrame -EndFrame $EndFrame -ToolVersion $ToolVersion
+        }
+        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $hooks.Pre -PostHookPath $hooks.Post -HookContextPath $contextPath)
+        if ($hooks.Pre) { $log += "Pre-record script runs before each video: $($hooks.Pre)" }
+        if ($hooks.Post) { $log += "Post-record script runs after each video: $($hooks.Post)" }
+    } catch {
+        $err = $_.Exception.Message
+        $log += "Pre-Post Recording: scripts NOT run for this recording -- $err"
+        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame)
+    }
+    return [PSCustomObject]@{ Steps = $steps; Log = $log; Error = $err }
+}
+
+function Update-PendingPostHook {
+    # Which post-record step a Stop click must still run. Called as each
+    # step STARTS: a PRE step arms its own video's POST step (the next POST
+    # after it, if that video has one), a POST step disarms (it is already
+    # running in Maya), anything else keeps the current value. So POST runs
+    # on Stop only when its PRE ran, and never twice.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Steps,
+        [Parameter(Mandatory=$true)][int]$StartedIndex,
+        $Pending = $null
+    )
+    if ($StartedIndex -lt 0 -or $StartedIndex -ge $Steps.Count) { return $Pending }
+    $step = $Steps[$StartedIndex]
+    $kind = if ($step.PSObject.Properties["HookKind"]) { $step.HookKind } else { $null }
+    if ($kind -eq "post") { return $null }
+    if ($kind -ne "pre") { return $Pending }
+    for ($i = $StartedIndex + 1; $i -lt $Steps.Count; $i++) {
+        $s = $Steps[$i]
+        if (-not $s.PSObject.Properties["HookKind"]) { continue }
+        if ($s.HookKind -eq "pre") { break }
+        if ($s.HookKind -eq "post" -and $s.LegIndex -eq $step.LegIndex) { return $s }
+    }
+    return $null
+}
+
+function Initialize-HookFiles {
+    # Creates <install root>\user_hooks\ and copies each template there
+    # whose user file does not exist yet. NEVER overwrites an existing
+    # file. Safe to call every launch and every click. Returns what it
+    # created and which templates were missing; throws only if the folder
+    # itself cannot be created.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+    $p = Get-HookPaths -ScriptDir $ScriptDir
+    $result = [PSCustomObject]@{ UserDir = $p.UserDir; Created = @(); MissingTemplates = @(); Errors = @() }
+    if (-not (Test-Path -LiteralPath $p.UserDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $p.UserDir -Force | Out-Null
+    }
+    foreach ($name in Get-HookFileNames) {
+        $target = Join-Path $p.UserDir $name
+        if (Test-Path -LiteralPath $target) { continue }
+        $template = Join-Path $p.TemplateDir $name
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            $result.MissingTemplates += $template
+            continue
+        }
+        try {
+            # overwrite=$false: a file appearing in between is never replaced
+            [IO.File]::Copy($template, $target, $false)
+            $result.Created += $target
+        } catch {
+            $result.Errors += "${name}: $($_.Exception.Message)"
+        }
+    }
+    return $result
+}
+
+function Open-HookFolder {
+    # Shows the folder in Explorer. Kept as its own function so tests can
+    # replace it and never start Explorer.
+    param(
+        [Parameter(Mandatory=$true)][string]$Folder
+    )
+    Start-Process -FilePath "explorer.exe" -ArgumentList ('"' + $Folder + '"')
+}
+
+function Invoke-HookFolderButton {
+    # The Settings row's button: make sure the files exist, then open the
+    # folder. Returns Status "opened", "template_missing" (Message = notice
+    # text naming the exact template path; nothing is opened) or
+    # "explorer_failed"/"init_failed" (Message = a log line). Never throws.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+    try {
+        $init = Initialize-HookFiles -ScriptDir $ScriptDir
+    } catch {
+        return [PSCustomObject]@{ Status = "init_failed"; Message = "Could not create the pre/post recording folder: $($_.Exception.Message)"; Folder = $null }
+    }
+    if (@($init.Errors).Count) {
+        $msg = "The pre/post recording script could not be created:`n`n" + (@($init.Errors) -join "`n") + "`n`nCheck that the folder is writable and the file is not open elsewhere, then try again."
+        return [PSCustomObject]@{ Status = "init_failed"; Message = $msg; Folder = $init.UserDir }
+    }
+    if (@($init.MissingTemplates).Count) {
+        $msg = "The pre/post recording template is missing, so the script file could not be created:`n`n" + (@($init.MissingTemplates) -join "`n") + "`n`nReinstall the tool (or restore that file) and try again."
+        return [PSCustomObject]@{ Status = "template_missing"; Message = $msg; Folder = $init.UserDir }
+    }
+    try {
+        Open-HookFolder -Folder $init.UserDir
+    } catch {
+        return [PSCustomObject]@{ Status = "explorer_failed"; Message = "Could not open $($init.UserDir) in Explorer: $($_.Exception.Message)"; Folder = $init.UserDir }
+    }
+    return [PSCustomObject]@{ Status = "opened"; Message = $null; Folder = $init.UserDir }
+}
+
+function ConvertTo-AsciiJsonString {
+    # A JSON string literal using only ASCII: every non-ASCII character is
+    # written as \uXXXX, so the file can be written as ASCII without
+    # turning a user's folder name into '?'.
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { return "null" }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int]$ch
+        if ($ch -eq '"') { [void]$sb.Append('\"') }
+        elseif ($ch -eq '\') { [void]$sb.Append('\\') }
+        elseif ($code -lt 0x20 -or $code -gt 0x7E) { [void]$sb.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Write-HookContext {
+    # Writes scripts\state\_hook_context.json (ASCII, no BOM) once before a
+    # recording run; maya_run_hook.py turns it into D4_CTX and adds the
+    # per-call kind, leg_index and leg_axis. Returns the file path.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight", "All")][string]$Axis,
+        [Nullable[int]]$StartFrame = $null,
+        [Nullable[int]]$EndFrame = $null,
+        [Parameter(Mandatory=$true)][string]$ToolVersion
+    )
+    $path = Get-ToolPath -ScriptDir $ScriptDir -Name "_hook_context.json"
+    $stateDir = Split-Path $path -Parent
+    $legCount = if ($Axis -eq "All") { 2 } else { 1 }
+    $sf = if ($StartFrame -eq $null) { "null" } else { "$StartFrame" }
+    $ef = if ($EndFrame -eq $null) { "null" } else { "$EndFrame" }
+    $fullScripts = [IO.Path]::GetFullPath($ScriptDir).TrimEnd('\')
+    $lines = @(
+        "{",
+        "  `"axis`": $(ConvertTo-AsciiJsonString $Axis),",
+        "  `"leg_count`": $legCount,",
+        "  `"start_frame`": $sf,",
+        "  `"end_frame`": $ef,",
+        "  `"tool_version`": $(ConvertTo-AsciiJsonString $ToolVersion),",
+        "  `"scripts_dir`": $(ConvertTo-AsciiJsonString $fullScripts),",
+        "  `"state_dir`": $(ConvertTo-AsciiJsonString $stateDir)",
+        "}"
+    )
+    [IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), (New-Object System.Text.ASCIIEncoding))
+    return $path
 }
 
 function Get-NoteworthyMayaOutput {

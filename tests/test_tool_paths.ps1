@@ -46,12 +46,16 @@ $ExpectedLayout = [ordered]@{
     "maya_restore_hud.py" = "maya"
     "maya_stop_playback.py" = "maya"
     "send_to_maya.ps1" = "maya"
+    "maya_run_hook.py" = "hooks"
     "maya_obs_capture.ps1" = "capture"
     "taskbar_control.ps1" = "capture"
     "obs_control.ps1" = "obs"
     "obs_monitor.ps1" = "obs"
 }
-$StateFiles = @("_fps_state.txt", "_frame_range_state.txt", "_playback_state.txt", "_hud_state.json")
+# The state files maya_obs_capture.ps1 itself writes, plus the launcher's
+# T97 pre/post recording context file.
+$CaptureStateFiles = @("_fps_state.txt", "_frame_range_state.txt", "_playback_state.txt", "_hud_state.json")
+$StateFiles = $CaptureStateFiles + @("_hook_context.json")
 $LegacyBats = @("run_front_back.bat", "run_left_right.bat", "capture_front_back.bat", "capture_left_right.bat")
 
 function Get-ExpectedPath([string]$root, [string]$name) {
@@ -298,7 +302,7 @@ Check "maya_obs_capture.ps1 writes every state file into scripts\state through t
     if ($text -match '\$ScriptDir\\_') { throw "a state file is still built from `$ScriptDir directly" }
     if ($text -notmatch '(?m)^\$StateDir\s*=\s*Get-ToolStateDir\s+-ScriptDir\s+\$ScriptDir\s*$') { throw "no `$StateDir = Get-ToolStateDir line" }
     if ($text -notmatch '(?m)^\.\s+\(Join-Path\s+\$ScriptDir\s+"rom_launcher_logic\.ps1"\)\s*$') { throw "does not dot-source the logic file from `$ScriptDir" }
-    foreach ($n in $StateFiles) {
+    foreach ($n in $CaptureStateFiles) {
         if ($text -notmatch ('\$StateDir\\' + [regex]::Escape($n))) { throw "$n is not written under `$StateDir" }
     }
 }

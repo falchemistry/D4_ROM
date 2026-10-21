@@ -18,6 +18,9 @@
 #                                   independent WebSocket password. A
 #                                   placeholder template is written instead
 #                                   (see below), with clear instructions.
+#   user_hooks/                 -- the user's OWN pre/post recording scripts
+#                                   (T97); the zip ships only the comment-only
+#                                   templates in scripts/hooks/templates/
 #   legacy/ (the old run_*.bat/capture_*.bat files)
 #                                -- superseded by rom_launcher.bat /
 #                                   ROM_Launcher.exe, which replaced them
@@ -40,6 +43,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 try {
+    # A user's own pre/post scripts (T97) are never deleted by a rebuild:
+    # if this dist folder holds them, refuse instead of wiping it.
+    if (Test-Path -LiteralPath (Join-Path $DistDir "user_hooks")) {
+        throw "refusing to rebuild: $(Join-Path $DistDir 'user_hooks') exists and holds someone's own pre/post recording scripts -- move that folder out of $DistDir (or pick another -DistDir) and run again"
+    }
     if (Test-Path $DistDir) {
         Remove-Item $DistDir -Recurse -Force
     }
@@ -65,6 +73,27 @@ try {
         } | Copy-Item -Destination (Join-Path $DistDir "scripts\$sub")
     }
 
+    # Pre/post recording scripts (T97): ship the tool-owned runner and the
+    # two comment-only templates. The user's real scripts live in
+    # <install root>\user_hooks\, created on first use and never part of
+    # the zip; a template that has code in it (a dev's test edit leaking
+    # into every user's install) fails the build.
+    $hooksSrc = Join-Path $PSScriptRoot "scripts\hooks"
+    $hooksDst = Join-Path $DistDir "scripts\hooks"
+    New-Item -ItemType Directory -Path (Join-Path $hooksDst "templates") -Force | Out-Null
+    Copy-Item (Join-Path $hooksSrc "maya_run_hook.py") $hooksDst
+    foreach ($hookName in @("d4_rom_pre_record.py", "d4_rom_post_record.py")) {
+        $tpl = Join-Path $hooksSrc "templates\$hookName"
+        if (-not (Test-Path -LiteralPath $tpl -PathType Leaf)) { throw "hook template missing: scripts\hooks\templates\$hookName" }
+        foreach ($line in [IO.File]::ReadAllLines($tpl)) {
+            $t = $line.Trim()
+            if ($t -and -not $t.StartsWith("#")) {
+                throw "hook template scripts\hooks\templates\$hookName must be comments only (found code: '$t') -- the zip must ship it empty"
+            }
+        }
+        Copy-Item $tpl (Join-Path $hooksDst "templates")
+    }
+
     # Real screenshots (OBS WebSocket Server Settings, this tool's own
     # Settings/Capture tabs) shown inline in the OBS password prompt and
     # the Guide window -- end users need these just as much as the
@@ -82,6 +111,11 @@ Set under OBS > Tools > WebSocket Server Settings ON THIS MACHINE, then
 paste that password here. Every machine's OBS has its own independent
 WebSocket password -- do not reuse one copied from elsewhere.
 "@ | Set-Content -Path (Join-Path $DistDir "scripts\obs_config.txt") -Encoding UTF8
+
+    # Last line of defence (T97): a user's own pre/post scripts must never
+    # reach the zip, whichever copy above might have picked them up.
+    $leakedHooks = @(Get-ChildItem -LiteralPath $DistDir -Recurse -Directory -Force | Where-Object { $_.Name -eq "user_hooks" })
+    if ($leakedHooks.Count) { throw "user_hooks folder found in the dist ($($leakedHooks[0].FullName)) -- user scripts must never ship" }
 
     Write-Output "BUILD SUCCEEDED"
     Write-Output "Distributed to: $DistDir"

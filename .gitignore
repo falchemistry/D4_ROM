@@ -10,6 +10,10 @@ scripts/obs_config.txt
 # getting added and each was getting missed here one at a time.
 scripts/_*.txt
 scripts/state/
+
+# The user's own pre/post recording scripts (T97), created on first use from
+# scripts/hooks/templates/ -- personal, never committed or shipped.
+user_hooks/
 d4_anim_sample/_*.txt
 d4_anim_sample/_*.png
 
