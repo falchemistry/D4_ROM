@@ -61,7 +61,7 @@ if ($Action -eq "set" -and -not $MonitorId) {
 
 Add-Type -AssemblyName System.Drawing
 
-$ScriptDir = $PSScriptRoot
+$ScriptDir = Split-Path $PSScriptRoot -Parent
 $resultPath = Join-Path $ScriptDir "..\d4_anim_sample\_obs_monitor_result.txt"
 $resultDir = Split-Path $resultPath -Parent
 if (-not (Test-Path $resultDir)) {

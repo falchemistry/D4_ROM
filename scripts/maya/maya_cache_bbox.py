@@ -28,7 +28,7 @@ import maya.cmds as cmds
 # send_to_maya.ps1) always given this file's real path, even though plain
 # exec() doesn't set __file__ in the namespace.
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
+CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')
 
 
 def find_animation_reference():

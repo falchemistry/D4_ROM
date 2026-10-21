@@ -22,7 +22,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = $PSScriptRoot
+$ScriptDir = Split-Path $PSScriptRoot -Parent
+. (Join-Path $ScriptDir "rom_launcher_logic.ps1")
+$StateDir = Get-ToolStateDir -ScriptDir $ScriptDir
 Add-Type -AssemblyName System.Drawing
 
 if (($StartFrame -eq $null) -ne ($EndFrame -eq $null)) {
@@ -92,27 +94,27 @@ function Send-MayaCode($code) {
 function Get-MayaPlaybackState() {
     $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 7001)
     $stream = $client.GetStream()
-    $code = "import maya.cmds as cmds`nwith open(r'$ScriptDir\_playback_state.txt','w') as f:`n    f.write(str(cmds.play(q=True, state=True)))`n"
+    $code = "import maya.cmds as cmds`nwith open(r'$StateDir\_playback_state.txt','w') as f:`n    f.write(str(cmds.play(q=True, state=True)))`n"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($code)
     $stream.Write($bytes, 0, $bytes.Length)
     Start-Sleep -Milliseconds 300
     $stream.Close()
     $client.Close()
     Start-Sleep -Milliseconds 200
-    return (Get-Content "$ScriptDir\_playback_state.txt" -Raw).Trim()
+    return (Get-Content "$StateDir\_playback_state.txt" -Raw).Trim()
 }
 
 function Get-MayaFrameRange() {
     $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 7001)
     $stream = $client.GetStream()
-    $code = "import maya.cmds as cmds`nwith open(r'$ScriptDir\_frame_range_state.txt','w') as f:`n    f.write(str(cmds.playbackOptions(q=True, minTime=True)) + ',' + str(cmds.playbackOptions(q=True, maxTime=True)))`n"
+    $code = "import maya.cmds as cmds`nwith open(r'$StateDir\_frame_range_state.txt','w') as f:`n    f.write(str(cmds.playbackOptions(q=True, minTime=True)) + ',' + str(cmds.playbackOptions(q=True, maxTime=True)))`n"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($code)
     $stream.Write($bytes, 0, $bytes.Length)
     Start-Sleep -Milliseconds 300
     $stream.Close()
     $client.Close()
     Start-Sleep -Milliseconds 200
-    $parts = (Get-Content "$ScriptDir\_frame_range_state.txt" -Raw).Trim().Split(",")
+    $parts = (Get-Content "$StateDir\_frame_range_state.txt" -Raw).Trim().Split(",")
     return [PSCustomObject]@{ MinTime = [double]$parts[0]; MaxTime = [double]$parts[1] }
 }
 
@@ -168,7 +170,7 @@ function Get-MayaHudState() {
     # script's own `finally` run at all.
     $panels = Get-CapturePanelNames
     $panelsPy = (($panels | ForEach-Object { "'$($_ -replace "'", "\'")'" }) -join ", ")
-    $statePath = "$ScriptDir\_hud_state.json"
+    $statePath = "$StateDir\_hud_state.json"
     # r'...' raw-string form, same convention as Get-MayaFrameRange/
     # Get-MayaPlaybackState above -- avoids any backslash-escaping games
     # with a plain Windows path.
@@ -234,7 +236,7 @@ function Get-CaptureHudState($originalState) {
 }
 
 function Clear-MayaHudStateFile() {
-    $statePath = "$ScriptDir\_hud_state.json"
+    $statePath = "$StateDir\_hud_state.json"
     if (Test-Path $statePath) { Remove-Item $statePath -Force }
 }
 
@@ -246,14 +248,14 @@ function Get-MayaFps() {
     # guaranteed to share one time unit.
     $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 7001)
     $stream = $client.GetStream()
-    $code = "import maya.mel as mel`nwith open(r'$ScriptDir\_fps_state.txt','w') as f:`n    f.write(str(mel.eval('currentTimeUnitToFPS()')))`n"
+    $code = "import maya.mel as mel`nwith open(r'$StateDir\_fps_state.txt','w') as f:`n    f.write(str(mel.eval('currentTimeUnitToFPS()')))`n"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($code)
     $stream.Write($bytes, 0, $bytes.Length)
     Start-Sleep -Milliseconds 300
     $stream.Close()
     $client.Close()
     Start-Sleep -Milliseconds 200
-    return [double](Get-Content "$ScriptDir\_fps_state.txt" -Raw).Trim()
+    return [double](Get-Content "$StateDir\_fps_state.txt" -Raw).Trim()
 }
 
 function Get-PlaybackPollIntervalSeconds($frameCount) {

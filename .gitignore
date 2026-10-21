@@ -9,6 +9,7 @@ scripts/obs_config.txt
 # progress, and every ad-hoc diagnostic dump), since new ones keep
 # getting added and each was getting missed here one at a time.
 scripts/_*.txt
+scripts/state/
 d4_anim_sample/_*.txt
 d4_anim_sample/_*.png
 

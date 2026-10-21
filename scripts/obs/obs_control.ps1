@@ -1,5 +1,5 @@
 # Controls OBS Studio recording via its WebSocket API (v5 protocol).
-# Reads connection info from obs_config.txt (same folder).
+# Reads connection info from obs_config.txt (in scripts\, one folder up).
 #
 # Usage:
 #   powershell -File obs_control.ps1 -Action start
@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$configPath = Join-Path $PSScriptRoot "obs_config.txt"
+$configPath = Join-Path (Split-Path $PSScriptRoot -Parent) "obs_config.txt"
 $configText = Get-Content $configPath -Raw
 $host_ = ([regex]::Match($configText, 'host:\s*(\S+)')).Groups[1].Value
 $port = ([regex]::Match($configText, 'port:\s*(\S+)')).Groups[1].Value

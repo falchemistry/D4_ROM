@@ -36,7 +36,7 @@ import maya.cmds as cmds
 # __file__ is never defined in bridge-executed code (see maya_vscode_bridge
 # memory) -- same co_filename trick every other script in this project uses.
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
+CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')
 
 # cam_transform -> which local translate letter is the tracked/horizontal
 # screen axis for that camera (front/back track world X, left/right track

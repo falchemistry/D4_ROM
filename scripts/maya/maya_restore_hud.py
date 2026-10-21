@@ -27,7 +27,7 @@ from maya import cmds
 # workaround already used by maya_camera_panels.py/_LR.py's own SCRIPT_DIR
 # for this exact reason.
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
-STATE_PATH = os.path.join(SCRIPT_DIR, '_hud_state.json')
+STATE_PATH = os.path.join(SCRIPT_DIR, '..', 'state', '_hud_state.json')
 
 if os.path.exists(STATE_PATH):
     with open(STATE_PATH) as f:

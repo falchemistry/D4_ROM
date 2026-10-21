@@ -49,8 +49,8 @@ import traceback
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-FB_KEYER_PATH = os.path.join(REPO_ROOT, "scripts", "maya_key_from_cache.py")
-LR_KEYER_PATH = os.path.join(REPO_ROOT, "scripts", "maya_key_from_cache_LR.py")
+FB_KEYER_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_key_from_cache.py")
+LR_KEYER_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_key_from_cache_LR.py")
 CACHE_PATH = os.path.join(REPO_ROOT, "d4_anim_sample", "barM_rom_anim__c1af6ac5752e.json")
 
 PANEL_WIDTH = 960.0  # this project's currently configured second-monitor
@@ -116,7 +116,7 @@ Z_CENTER = _cache["z_center"]
 Z_WIDTH = _cache["z_width"]
 
 EDGE_OVERFLOW_PCT = load_constant(FB_KEYER_PATH, "EDGE_OVERFLOW_PCT")
-MARGIN_SAFETY = load_constant(os.path.join(REPO_ROOT, "scripts", "maya_camera_panels.py"), "MARGIN_SAFETY")
+MARGIN_SAFETY = load_constant(os.path.join(REPO_ROOT, "scripts", "maya", "maya_camera_panels.py"), "MARGIN_SAFETY")
 
 _passed = 0
 _failures = []

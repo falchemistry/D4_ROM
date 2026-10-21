@@ -29,7 +29,7 @@ import maya.cmds as cmds
 # the co_filename trick is needed instead of __file__.
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
 SCRIPTS_DIR = SCRIPT_DIR
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
+CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')
 
 
 def find_animation_reference():

@@ -1104,8 +1104,8 @@ function Get-CacheStatus {
     # None, or an exception's text). send_to_maya.ps1's blocking read is
     # still what we rely on here: it guarantees this process does not
     # exit until Maya has actually finished writing that file.
-    $checkScript = Join-Path $ScriptDir "maya_check_cache.py"
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
+    $checkScript = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_check_cache.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
     $resultPath = Join-Path $ScriptDir "..\d4_anim_sample\_cache_check_result.txt"
     Remove-Item $resultPath -ErrorAction SilentlyContinue
 
@@ -1137,8 +1137,8 @@ function Get-TimeSliderRange {
     # is called (not cached) -- deliberately, so a Range Slider the artist
     # adjusts between selecting "Time Slider" and clicking Start Recording
     # is picked up correctly rather than using a stale snapshot.
-    $queryScript = Join-Path $ScriptDir "maya_get_time_slider.py"
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
+    $queryScript = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_get_time_slider.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
     $resultPath = Join-Path $ScriptDir "..\d4_anim_sample\_time_slider_result.txt"
     Remove-Item $resultPath -ErrorAction SilentlyContinue
 
@@ -1169,8 +1169,8 @@ function Get-AnimationRange {
     # Slider's current minTime/maxTime. Used by the "All" Time Range option
     # so it captures the true full animation regardless of whatever the
     # Range Slider happens to be scrubbed to right now.
-    $queryScript = Join-Path $ScriptDir "maya_get_animation_range.py"
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
+    $queryScript = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_get_animation_range.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
     $resultPath = Join-Path $ScriptDir "..\d4_anim_sample\_animation_range_result.txt"
     Remove-Item $resultPath -ErrorAction SilentlyContinue
 
@@ -1692,7 +1692,7 @@ function Get-ObsMonitorList([switch]$EnsureRunning) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell"
     $ensureArg = if ($EnsureRunning) { " -EnsureRunning" } else { "" }
-    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Join-Path $ScriptDir 'obs_monitor.ps1')`" -Action list$ensureArg"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Get-ToolPath -ScriptDir $ScriptDir -Name 'obs_monitor.ps1')`" -Action list$ensureArg"
     $psi.RedirectStandardOutput = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -1717,7 +1717,7 @@ function Set-ObsMonitorSelection([string]$MonitorId) {
     # the first verification comes back black.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell"
-    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Join-Path $ScriptDir 'obs_monitor.ps1')`" -Action set -MonitorId `"$MonitorId`""
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Get-ToolPath -ScriptDir $ScriptDir -Name 'obs_monitor.ps1')`" -Action set -MonitorId `"$MonitorId`""
     $psi.RedirectStandardOutput = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -1900,8 +1900,8 @@ $script:pendingZoomPush = $false
 $script:liveApplyProcess = $null
 
 function Send-CameraLiveScript([string]$ScriptName) {
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
-    $target = Join-Path $ScriptDir $ScriptName
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $target = Get-ToolPath -ScriptDir $ScriptDir -Name $ScriptName
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell"
     $psi.Arguments = "-ExecutionPolicy Bypass -File `"$sendToMaya`" -ScriptPath `"$target`""
@@ -3322,7 +3322,7 @@ function Show-AllTaskbars {
     # taskbar is a no-op.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell"
-    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Join-Path $ScriptDir 'taskbar_control.ps1')`" -Action show"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$(Get-ToolPath -ScriptDir $ScriptDir -Name 'taskbar_control.ps1')`" -Action show"
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $proc = New-Object System.Diagnostics.Process

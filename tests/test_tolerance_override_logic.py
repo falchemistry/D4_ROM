@@ -33,8 +33,8 @@ import traceback
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-FB_PANELS_PATH = os.path.join(REPO_ROOT, "scripts", "maya_camera_panels.py")
-LR_PANELS_PATH = os.path.join(REPO_ROOT, "scripts", "maya_camera_panels_LR.py")
+FB_PANELS_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_camera_panels.py")
+LR_PANELS_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_camera_panels_LR.py")
 
 
 def load_constant(py_path, const_name):

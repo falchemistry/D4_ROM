@@ -29,7 +29,7 @@ import sys
 import maya.cmds as cmds
 
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
+CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')
 
 CAMERA_SHAPES = ['d4_rom_frontShape', 'd4_rom_backShape', 'd4_rom_leftShape', 'd4_rom_rightShape']
 

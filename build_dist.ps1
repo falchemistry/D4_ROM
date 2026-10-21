@@ -5,9 +5,9 @@
 # Deliberately excluded, and why:
 #   tests/, exe_src/            -- dev-only, no end user needs these
 #   d4_anim_sample/             -- this machine's own cache data, not source
-#   scripts/maya_debug_inspect.py -- scratch file, overwritten for one-off
+#   scripts/maya/maya_debug_inspect.py -- scratch file, overwritten for one-off
 #                                     diagnostics, not part of the real tool
-#   scripts/_frame_range_state.txt, _playback_state.txt
+#   scripts/state/ (_frame_range_state.txt, _playback_state.txt, ...)
 #                                -- transient runtime state from THIS
 #                                   machine's own captures, not source
 #   scripts/obs_config.txt      -- contains this machine's REAL OBS
@@ -18,7 +18,7 @@
 #                                   independent WebSocket password. A
 #                                   placeholder template is written instead
 #                                   (see below), with clear instructions.
-#   the old run_*.bat/capture_*.bat files
+#   legacy/ (the old run_*.bat/capture_*.bat files)
 #                                -- superseded by rom_launcher.bat /
 #                                   ROM_Launcher.exe, which replaced them
 #
@@ -55,6 +55,15 @@ try {
     Get-ChildItem (Join-Path $PSScriptRoot "scripts") -File | Where-Object {
         $excludedFromScripts -notcontains $_.Name
     } | Copy-Item -Destination (Join-Path $DistDir "scripts")
+
+    # Category folders (T99). scripts\state\ is never shipped: it only holds
+    # this machine's transient run state and the tool creates it on demand.
+    foreach ($sub in @("maya", "capture", "obs")) {
+        New-Item -ItemType Directory -Path (Join-Path $DistDir "scripts\$sub") | Out-Null
+        Get-ChildItem (Join-Path $PSScriptRoot "scripts\$sub") -File | Where-Object {
+            $excludedFromScripts -notcontains $_.Name
+        } | Copy-Item -Destination (Join-Path $DistDir "scripts\$sub")
+    }
 
     # Real screenshots (OBS WebSocket Server Settings, this tool's own
     # Settings/Capture tabs) shown inline in the OBS password prompt and

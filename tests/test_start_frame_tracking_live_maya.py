@@ -33,7 +33,7 @@ send this file with the bridge (send_to_maya.ps1 / send_and_wait.ps1,
 -Marker ALL_STEPS_DONE). Optional configuration: put a dict named CFG in the
 namespace the file is exec'd in (keys: scripts_dir, scratch_dir,
 result_path, cases (list of case names), golden_dir, golden_mode
-'record' or 'compare'). Defaults: the repo's scripts folder, a scratch
+'record' or 'compare'). Defaults: the repo's scripts\maya folder, a scratch
 folder under the system temp dir.
 
 SAFETY: the product scripts are COPIED into the scratch folder with their
@@ -60,7 +60,7 @@ import maya.cmds as cmds
 CFG = globals().get('CFG') or {}
 TEST_FILE = sys._getframe().f_code.co_filename
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(TEST_FILE)))
-SCRIPTS_DIR = CFG.get('scripts_dir') or os.path.join(REPO_ROOT, 'scripts')
+SCRIPTS_DIR = CFG.get('scripts_dir') or os.path.join(REPO_ROOT, 'scripts', 'maya')
 SCRATCH = CFG.get('scratch_dir') or os.path.join(tempfile.gettempdir(), 'd4_rom_start_frame_test')
 RESULT = CFG.get('result_path') or os.path.join(SCRATCH, 'result.txt')
 CASES = CFG.get('cases')
@@ -74,7 +74,7 @@ COPIES = os.path.join(SCRATCH, 'scripts_copy')
 PRODUCT_SCRIPTS = ['maya_camera_panels.py', 'maya_camera_panels_LR.py', 'maya_key_from_cache.py',
                    'maya_key_from_cache_LR.py', 'maya_camera_live_nudge.py', 'maya_camera_live_zoom.py',
                    'maya_clean_reset.py']
-CACHE_DIR_LINE = "CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')"
+CACHE_DIR_LINE = "CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')"
 DEBUG_OPEN = "open(r'D:" + chr(92) + "__backup" + chr(92) + "claude" + chr(92) + "maya_debug.txt', 'w')"
 
 _tally = {'pass': 0, 'fail': 0}

@@ -18,7 +18,7 @@ import sys
 import maya.cmds as cmds
 
 SCRIPT_DIR = os.path.dirname(sys._getframe().f_code.co_filename)
-CACHE_DIR = os.path.join(SCRIPT_DIR, '..', 'd4_anim_sample')
+CACHE_DIR = os.path.join(SCRIPT_DIR, '..', '..', 'd4_anim_sample')
 RESULT_PATH = os.path.join(CACHE_DIR, '_animation_range_result.txt')
 
 if not os.path.isdir(CACHE_DIR):

@@ -10,6 +10,72 @@
 # capture_front_back.bat, capture_left_right.bat) -- the launcher should
 # behave identically to double-clicking those, just from a UI instead.
 
+# --- Tool file locations (T99) ---------------------------------------------
+# The ONE place that knows which category folder under scripts\ each tool
+# file lives in. "" = scripts\ itself. Every caller passes the scripts\ root
+# as -ScriptDir. maya_obs_capture.ps1 (a separate child process) dot-sources
+# this file for the same lookup.
+function Get-ToolPathTable {
+    return @{
+        "rom_launcher.ps1" = ""
+        "rom_launcher_logic.ps1" = ""
+        "maya_cache_bbox.py" = "maya"
+        "maya_camera_live_nudge.py" = "maya"
+        "maya_camera_live_zoom.py" = "maya"
+        "maya_camera_panels.py" = "maya"
+        "maya_camera_panels_LR.py" = "maya"
+        "maya_check_cache.py" = "maya"
+        "maya_clean_reset.py" = "maya"
+        "maya_debug_inspect.py" = "maya"
+        "maya_get_animation_range.py" = "maya"
+        "maya_get_time_slider.py" = "maya"
+        "maya_key_from_cache.py" = "maya"
+        "maya_key_from_cache_LR.py" = "maya"
+        "maya_restore_hud.py" = "maya"
+        "maya_stop_playback.py" = "maya"
+        "send_to_maya.ps1" = "maya"
+        "maya_obs_capture.ps1" = "capture"
+        "taskbar_control.ps1" = "capture"
+        "obs_control.ps1" = "obs"
+        "obs_monitor.ps1" = "obs"
+        "_fps_state.txt" = "state"
+        "_frame_range_state.txt" = "state"
+        "_playback_state.txt" = "state"
+        "_hud_state.json" = "state"
+    }
+}
+
+function Get-ToolStateDir {
+    # scripts\state\ holds the transient files each capture rewrites. A
+    # fresh dist has no such folder, so it is created on first use.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir
+    )
+    $dir = Join-Path $ScriptDir "state"
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return $dir
+}
+
+function Get-ToolPath {
+    # Full path of a tool file by its file name. Throws on a name the table
+    # does not know, so a missed path shows up loudly instead of pointing at
+    # a file that is not there.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+    $table = Get-ToolPathTable
+    if (-not $table.ContainsKey($Name)) {
+        throw "Get-ToolPath: unknown tool file '$Name'"
+    }
+    $sub = $table[$Name]
+    if ($sub -eq "state") { return Join-Path (Get-ToolStateDir -ScriptDir $ScriptDir) $Name }
+    if ($sub) { return Join-Path (Join-Path $ScriptDir $sub) $Name }
+    return Join-Path $ScriptDir $Name
+}
+
 function Get-CaptureSteps {
     param(
         [Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight")]
@@ -31,9 +97,9 @@ function Get-CaptureSteps {
     $panelsScript = if ($Axis -eq "FrontBack") { "maya_camera_panels.py" } else { "maya_camera_panels_LR.py" }
     $keyScript = if ($Axis -eq "FrontBack") { "maya_key_from_cache.py" } else { "maya_key_from_cache_LR.py" }
 
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
-    $taskbarControl = Join-Path $ScriptDir "taskbar_control.ps1"
-    $obsCapture = Join-Path $ScriptDir "maya_obs_capture.ps1"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $taskbarControl = Get-ToolPath -ScriptDir $ScriptDir -Name "taskbar_control.ps1"
+    $obsCapture = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_obs_capture.ps1"
 
     $steps = @()
 
@@ -41,8 +107,8 @@ function Get-CaptureSteps {
         $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $taskbarControl, "-Action", "hide") }
     }
 
-    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", (Join-Path $ScriptDir $panelsScript)) }
-    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", (Join-Path $ScriptDir $keyScript)) }
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", (Get-ToolPath -ScriptDir $ScriptDir -Name $panelsScript)) }
+    $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", (Get-ToolPath -ScriptDir $ScriptDir -Name $keyScript)) }
 
     if ($Recording) {
         # matches "ping -n 3 127.0.0.1 > nul" in the capture_*.bat files --
@@ -115,8 +181,8 @@ function Get-CleanResetStep {
         [Parameter(Mandatory=$true)][string]$ScriptDir
     )
 
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
-    $cleanReset = Join-Path $ScriptDir "maya_clean_reset.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $cleanReset = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_clean_reset.py"
 
     # comma operator, not just @(...): PowerShell unwraps a single-element
     # array back to a scalar when a function returns it via `return`,
@@ -151,11 +217,11 @@ function Get-StopCleanupSteps {
         [Parameter(Mandatory=$true)][string]$ScriptDir
     )
 
-    $sendToMaya = Join-Path $ScriptDir "send_to_maya.ps1"
-    $stopPlayback = Join-Path $ScriptDir "maya_stop_playback.py"
-    $restoreHud = Join-Path $ScriptDir "maya_restore_hud.py"
-    $taskbarControl = Join-Path $ScriptDir "taskbar_control.ps1"
-    $obsControl = Join-Path $ScriptDir "obs_control.ps1"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $stopPlayback = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_stop_playback.py"
+    $restoreHud = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_restore_hud.py"
+    $taskbarControl = Get-ToolPath -ScriptDir $ScriptDir -Name "taskbar_control.ps1"
+    $obsControl = Get-ToolPath -ScriptDir $ScriptDir -Name "obs_control.ps1"
 
     $steps = @()
     $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $sendToMaya, "-ScriptPath", $stopPlayback) }

@@ -1,6 +1,6 @@
 r"""
 Whole-module regression test for the Offset wiring of BOTH keyers
-(scripts/maya_key_from_cache.py = Front/Back, scripts/maya_key_from_cache_LR.py
+(scripts/maya/maya_key_from_cache.py = Front/Back, scripts/maya/maya_key_from_cache_LR.py
 = Left/Right) -- T72 item 6 ("Offset follows the visible frame").
 
 Why this exists: tests/test_edge_guard_curve_logic.py extracts compute_edge_
@@ -23,7 +23,7 @@ CLAUDE.md at the D:\__backup\claude root):
 Exits 0 if all checks pass, 1 otherwise. Takes a few seconds.
 
 Method: each keyer source is compiled with a file name inside a temporary
-directory, so its own `CACHE_DIR = <script dir>/../d4_anim_sample` resolves
+directory, so its own `CACHE_DIR = <script dir>/../../d4_anim_sample` resolves
 to a temp d4_anim_sample holding SYNTHETIC cache + state files (nothing from
 the repo's d4_anim_sample or the user's files is read). The one hard-coded
 debug-file write at the end of each keyer is repointed to the temp dir, so no
@@ -46,8 +46,8 @@ import types
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-FB_PATH = os.path.join(REPO_ROOT, "scripts", "maya_key_from_cache.py")
-LR_PATH = os.path.join(REPO_ROOT, "scripts", "maya_key_from_cache_LR.py")
+FB_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_key_from_cache.py")
+LR_PATH = os.path.join(REPO_ROOT, "scripts", "maya", "maya_key_from_cache_LR.py")
 
 EDGE = 0.02      # EDGE_OVERFLOW_PCT of the keyers / maya_camera_panels.py
 SAFE = 1.02      # MARGIN_SAFETY
@@ -56,7 +56,7 @@ ANIM_REF = "synthetic_rom_anim.ma"
 
 _TMP = tempfile.mkdtemp(prefix="d4_key_module_offset_")
 _STATE = os.path.join(_TMP, "d4_anim_sample")
-_SCRIPTS = os.path.join(_TMP, "scripts")
+_SCRIPTS = os.path.join(_TMP, "scripts", "maya")
 os.makedirs(_STATE)
 os.makedirs(_SCRIPTS)
 _DEBUG_OUT = os.path.join(_TMP, "maya_debug.txt")
