@@ -2662,17 +2662,21 @@ function Set-RealBarmCacheState {
     $script:cachedFrameArrays = $null
 }
 
-Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom20/offset20 replica table (T=0/2/5/10/15) on the real barM cache" {
+Check "Get-ToleranceReadoutEstimate zoom20/offset20 table (T=0/2/5/10/15) on the real barM cache -- the gate follows the visible frame (T72 item 6)" {
     Set-RealBarmCacheState
     $zoomSlider.Value = 20
     $script:lastValidOffsetX = 20
-    # replica: keys / frames-over-T / worst-overflow, from d4_rom_final_proposals.md sec.4
+    # keys / frames-over-T / worst-overflow. T72 item 6 (2026-10-20) replaced the approved proposal's replica numbers for
+    # a non-zero Offset (d4_rom_final_proposals.md sec.4: 480/395/298/111/70 keys): that table came from the old walk whose
+    # gate sat one Offset away from the visible frame. These values come from the independent visible-space walk
+    # (tests/test_edge_guard_curve_logic.py, _visible_oracle). The Offset-0 replica (480/395/298/111/70 keys) is asserted in the
+    # check right after the zoom0/offset20 row below ("zoom20/offset0 replica"); Offset 0 is the old walk, so those key counts are unchanged.
     $expected = @{
-        0  = @{ Keys = 480; OverT = 44.6; Worst = 20.7 }
-        2  = @{ Keys = 395; OverT = 35.7; Worst = 17.9 }
-        5  = @{ Keys = 298; OverT = 16.5; Worst = 15.7 }
-        10 = @{ Keys = 111; OverT = 11.4; Worst = 12.1 }
-        15 = @{ Keys = 70;  OverT = 10.4; Worst = 17.1 }
+        0  = @{ Keys = 482; OverT = 23.1; Worst = 18.6 }
+        2  = @{ Keys = 426; OverT = 14.0; Worst = 15.8 }
+        5  = @{ Keys = 308; OverT = 3.0;  Worst = 13.6 }
+        10 = @{ Keys = 114; OverT = 0.0;  Worst = 10.0 }
+        15 = @{ Keys = 84;  OverT = 0.0;  Worst = 15.0 }
     }
     foreach ($t in $expected.Keys) {
         $result = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct ([double]$t)
@@ -2685,17 +2689,18 @@ Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom20/of
     $script:lastValidOffsetX = 0
 }
 
-Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom0/offset20 replica row (T=0/2/5/10/15) on the real barM cache" {
+Check "Get-ToleranceReadoutEstimate zoom0/offset20 row (T=0/2/5/10/15) on the real barM cache -- the gate follows the visible frame (T72 item 6)" {
     Set-RealBarmCacheState
     $zoomSlider.Value = 0
     $script:lastValidOffsetX = 20
-    # replica: d4_rom_final_proposals.md sec.4 trade-off table, second row
+    # T72 item 6: replaces the old replica row (97/70/30/14/8 keys, worst 2.1/4.1/7.1/12.1/17.1 from the
+    # proposal's trade-off table): with the gate in the visible frame the worst overflow is exactly the tolerance.
     $expected = @{
-        0  = @{ Keys = 97; OverT = 11.8; Worst = 2.1 }
-        2  = @{ Keys = 70; OverT = 11.1; Worst = 4.1 }
-        5  = @{ Keys = 30; OverT = 7.0;  Worst = 7.1 }
-        10 = @{ Keys = 14; OverT = 2.5;  Worst = 12.1 }
-        15 = @{ Keys = 8;  OverT = 2.3;  Worst = 17.1 }
+        0  = @{ Keys = 103; OverT = 0.0; Worst = 0.0 }
+        2  = @{ Keys = 86;  OverT = 0.0; Worst = 2.0 }
+        5  = @{ Keys = 50;  OverT = 0.0; Worst = 5.0 }
+        10 = @{ Keys = 16;  OverT = 0.0; Worst = 10.0 }
+        15 = @{ Keys = 11;  OverT = 0.0; Worst = 15.0 }
     }
     foreach ($t in $expected.Keys) {
         $result = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct ([double]$t)
@@ -2707,6 +2712,32 @@ Check "Get-ToleranceReadoutEstimate reproduces the approved proposal's zoom0/off
     $script:lastValidOffsetX = 0
 }
 
+Check "Get-ToleranceReadoutEstimate zoom20/offset0 replica (T=0/2/5/10/15) on the real barM cache -- keys 480/395/298/111/70 are the approved proposal's numbers, unchanged by T72 item 6" {
+    Set-RealBarmCacheState
+    $zoomSlider.Value = 20
+    $script:lastValidOffsetX = 0
+    # Offset 0 == the old walk exactly (offset_shift 0.0 is byte-for-byte the old curve), so the approved proposal's KEY counts
+    # (d4_rom_final_proposals.md sec.4: 480/395/298/111/70) still hold. Its over-tolerance / worst-overflow columns
+    # (44.6/35.7/16.5/11.4/10.4 and 20.7/17.9/15.7/12.1/17.1) belong to zoom 20 / OFFSET 20 px (the old test's configuration), not
+    # to Offset 0: the pre-T72 (git HEAD) function returns exactly those columns at Offset 20 and 23.1/14.0/3.0/0.0/0.0 and
+    # 18.6/15.8/13.6/10.0/15.0 at Offset 0, the same as the current function (checked 2026-10-21 by running both).
+    $expected = @{
+        0  = @{ Keys = 480; OverT = 23.1; Worst = 18.6 }
+        2  = @{ Keys = 395; OverT = 14.0; Worst = 15.8 }
+        5  = @{ Keys = 298; OverT = 3.0;  Worst = 13.6 }
+        10 = @{ Keys = 111; OverT = 0.0;  Worst = 10.0 }
+        15 = @{ Keys = 70;  OverT = 0.0;  Worst = 15.0 }
+    }
+    foreach ($t in $expected.Keys) {
+        $result = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct ([double]$t)
+        $exp = $expected[$t]
+        if ($result.Keys -ne $exp.Keys) { throw "zoom20/offset0 T=$t%: expected $($exp.Keys) keys, got $($result.Keys)" }
+        if ([Math]::Abs($result.PercentOverTolerance - $exp.OverT) -gt 0.1) { throw "zoom20/offset0 T=$t%: expected $($exp.OverT)% over tolerance, got $($result.PercentOverTolerance)" }
+        if ([Math]::Abs($result.WorstOverflowPct - $exp.Worst) -gt 0.1) { throw "zoom20/offset0 T=$t%: expected $($exp.Worst)% worst overflow, got $($result.WorstOverflowPct)" }
+    }
+    $zoomSlider.Value = 0
+}
+
 Check "Get-ToleranceReadoutEstimate Auto matches Get-FrameGateEffectiveOverflowPct's own zoom-only formula (regression: readout's Auto path is not a second, diverging formula)" {
     Set-RealBarmCacheState
     $zoomSlider.Value = 20
@@ -2714,6 +2745,80 @@ Check "Get-ToleranceReadoutEstimate Auto matches Get-FrameGateEffectiveOverflowP
     $autoResult = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct $zoomSlider.Value -OffsetXPx $script:lastValidOffsetX -ManualTolerancePct $null
     if ($autoResult.Keys -ne 480) { throw "Auto at zoom20/offset0 should match the T=0 replica exactly (Auto's own formula clamps to 0 here), got $($autoResult.Keys) keys" }
     $zoomSlider.Value = 0
+}
+
+Check "T72 Option B: Get-ToleranceReadoutEstimate seeds the guard walk at the measured range's Start (real barM cache, zoom 0, offset 0, Auto): FB 70/90/32/30/25/17 keys, none over, worst 2.0 at Start 0/150/300/600/1000/2000" {
+    Set-RealBarmCacheState
+    $zoomSlider.Value = 0
+    $script:lastValidOffsetX = 0
+    # keys expected from an independent Python walk seeded at the cached centre of the Start frame (frames are 0..3240, index = frame)
+    foreach ($e in @(@(0, 70), @(150, 90), @(300, 32), @(600, 30), @(1000, 25), @(2000, 17))) {
+        $r = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct 0 -OffsetXPx 0 -ManualTolerancePct $null -MeasureStartIndex ([int]$e[0]) -MeasureEndIndex 3240
+        if ($r.Keys -ne $e[1]) { throw "Start $($e[0]): expected $($e[1]) keys, got $($r.Keys)" }
+        if ($r.PercentOverTolerance -gt 0.05) { throw "Start $($e[0]): expected none over tolerance, got $($r.PercentOverTolerance)%" }
+        if ([Math]::Abs($r.WorstOverflowPct - 2.0) -gt 0.05) { throw "Start $($e[0]): expected worst 2.0%, got $($r.WorstOverflowPct)" }
+    }
+    $whole = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct 0 -OffsetXPx 0 -ManualTolerancePct $null
+    if ($whole.Keys -ne 70) { throw "no range = the whole take, seeded at 0: expected 70 keys, got $($whole.Keys)" }
+    # Left/Right (z, frame sized from the x widths like the keyer's panels): 4 keys whole take, 2 (seed + end) from every later Start
+    foreach ($e in @(@(0, 4), @(150, 2), @(300, 2), @(600, 2), @(1000, 2), @(2000, 2))) {
+        $r = Get-ToleranceReadoutEstimate -Axis "LeftRight" -ZoomPct 0 -OffsetXPx 0 -ManualTolerancePct $null -MeasureStartIndex ([int]$e[0]) -MeasureEndIndex 3240
+        if ($r.Keys -ne $e[1]) { throw "LR Start $($e[0]): expected $($e[1]) keys, got $($r.Keys)" }
+        if ($r.PercentOverTolerance -gt 0.05) { throw "LR Start $($e[0]): expected none over tolerance, got $($r.PercentOverTolerance)%" }
+    }
+    $off = Get-ToleranceReadoutEstimate -Axis "FrontBack" -ZoomPct 0 -OffsetXPx 50 -ManualTolerancePct $null -MeasureStartIndex 300 -MeasureEndIndex 3240
+    # T72 item 6: the gate follows the visible frame, so a +50 px Offset no longer pushes the worst overflow to 7.21% (it stays the 2.0% tolerance)
+    if ($off.Keys -ne 50 -or [Math]::Abs($off.WorstOverflowPct - 2.0) -gt 0.05 -or $off.PercentOverTolerance -gt 0.05) { throw "Start 300 with a +50 px offset: expected 50 keys, worst 2.0%, none over, got $($off.Keys) / $($off.WorstOverflowPct) / $($off.PercentOverTolerance)" }
+}
+
+Check "T72 item 6: the guard gate follows the VISIBLE frame -- Get-ToleranceReadoutEstimate equals the shared parity table with the Python walk (real barM cache, FB and LR, zoom 0 / 7, Offset +-10/+-50/+-100, Start none/300/1000)" {
+    Set-RealBarmCacheState
+    $script:lastValidOffsetX = 0
+    # Axis, zoom %, typed Tolerance % (null = Auto), Offset px, measured Start (null = whole take), keys, % over tolerance, worst % of the frame width.
+    # The same rows are asserted against the shipped Python walk in tests/test_edge_guard_curve_logic.py (ESTIMATE_PARITY_TABLE),
+    # generated there from an independent visible-space oracle.
+    $rows = @(
+        @('FrontBack', 0, $null, 0, $null, 70, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, 0, 300, 32, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, 50, 300, 50, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, -50, 300, 51, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, 100, 1000, 49, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, -100, 1000, 75, 0.0000, 2.0000),
+        @('FrontBack', 0, $null, 10, 0, 81, 0.0000, 2.0000),
+        @('FrontBack', 7, 1.0, 50, 300, 105, 0.0000, 1.0000),
+        @('FrontBack', 7, 1.0, -50, 300, 147, 0.0000, 1.0000),
+        @('FrontBack', 7, 1.0, 100, 1000, 75, 0.0446, 4.7401),
+        @('FrontBack', 7, 1.0, -100, 300, 173, 0.0000, 1.0000),
+        @('FrontBack', 7, 1.0, -10, 300, 111, 0.0000, 1.0000),
+        @('FrontBack', 7, $null, -50, 300, 190, 0.7140, 1.7061),
+        @('LeftRight', 0, $null, 50, 300, 2, 0.0000, 1.4858),
+        @('LeftRight', 0, $null, -100, 1000, 2, 0.0000, 0.0000),
+        @('LeftRight', 7, 1.0, 50, 300, 6, 0.0000, 1.0000),
+        @('LeftRight', 7, 1.0, -100, 1000, 2, 0.0000, 0.9123)
+    )
+    foreach ($r in $rows) {
+        $ms = $r[4]
+        $res = Get-ToleranceReadoutEstimate -Axis $r[0] -ZoomPct ([double]$r[1]) -OffsetXPx ([double]$r[3]) -ManualTolerancePct $r[2] -MeasureStartIndex $ms -MeasureEndIndex $null
+        $tag = "$($r[0]) zoom $($r[1]) tol $($r[2]) offset $($r[3]) start $($r[4])"
+        if ($res.Keys -ne $r[5]) { throw "${tag}: expected $($r[5]) keys, got $($res.Keys)" }
+        if ([Math]::Abs($res.PercentOverTolerance - $r[6]) -gt 0.002) { throw "${tag}: expected $($r[6])% over tolerance, got $($res.PercentOverTolerance)" }
+        if ([Math]::Abs($res.WorstOverflowPct - $r[7]) -gt 0.002) { throw "${tag}: expected worst $($r[7])%, got $($res.WorstOverflowPct)" }
+    }
+}
+
+Check "T72 item 6: Get-EdgeGuardCurveEstimateCore hand-checked -- the walk starts at the visible camera (centre minus Offset) and no post-shift is applied, both signs" {
+    $c = [double[]]@(0, 0, 0, 8, 8, -8, -8)
+    $w = [double[]]@(10, 10, 10, 10, 10, 10, 10)
+    # half ortho 10, overflow 1 (gate half-width 11), pose half-width 5. +4: camera starts at -4, gate [-15, 7]: index 3 right edge 13 -> cam 2,
+    # index 5 left edge -13 < -9 -> cam -2; keys 0,3,5 + end(6) = 4, every nudge parks the edge at the limit: worst = 1 / 20 = 5.0%, none over.
+    $p = Get-EdgeGuardCurveEstimateCore -CenterX $c -WidthX $w -HalfOrtho 10 -Overflow 1 -OffsetShift 4 -StartIndex 0 -EndIndex 6
+    if ($p.Keys -ne 4 -or [Math]::Abs($p.WorstOverflowPct - 5.0) -gt 1e-9 -or $p.PercentOverTolerance -ne 0) { throw "+4: expected 4 keys / 0% / worst 5.0, got $($p.Keys) / $($p.PercentOverTolerance) / $($p.WorstOverflowPct)" }
+    # -4: camera starts at +4, gate [-7, 15]: index 3 (13) fits, no nudge; index 5 left edge -13 < -7 -> cam -2; keys 0,5 + end = 3.
+    $n = Get-EdgeGuardCurveEstimateCore -CenterX $c -WidthX $w -HalfOrtho 10 -Overflow 1 -OffsetShift -4 -StartIndex 0 -EndIndex 6
+    if ($n.Keys -ne 3 -or [Math]::Abs($n.WorstOverflowPct - 5.0) -gt 1e-9 -or $n.PercentOverTolerance -ne 0) { throw "-4: expected 3 keys / 0% / worst 5.0, got $($n.Keys) / $($n.PercentOverTolerance) / $($n.WorstOverflowPct)" }
+    # Offset 0 is the old walk: seed 0, gate [-11, 11]: index 3 right edge 13 -> cam 2, index 5 -> cam -2: 4 keys.
+    $z = Get-EdgeGuardCurveEstimateCore -CenterX $c -WidthX $w -HalfOrtho 10 -Overflow 1 -OffsetShift 0 -StartIndex 0 -EndIndex 6
+    if ($z.Keys -ne 4) { throw "0: expected 4 keys, got $($z.Keys)" }
 }
 
 Check "Get-ToleranceReadoutEstimate: All axis picks the worse-worst-overflow pair with its OWN P (not a per-frame mix), on a small hand-derived fixture" {
@@ -3203,11 +3308,14 @@ function Set-T48Bar($tolPct, $worstPct, [bool]$gateOn = $true, [double]$zoom = 0
 
 # Range fixture: 6 frames, every pose 200 wide (max_w 200 -> frame 212.5,
 # halfOrtho 106.25, with the 0..1000 rect from Reset-FrameGateTestState).
-# Centres [0,0,0,30,30,30]. Gate ON, T = 2 % (cushion 4.25): the whole-take
+# Centres [0,0,0,30,30,30]. Gate ON, T = 2 % (cushion 4.25): All / 0-5 -> the
 # guard keys at 0 (anchor), 3 (cam -> 19.5) and 5 (end); frames 3-5 then sit
 # exactly 4.25 past the frame edge = worst 2.0 %, frames 0-2 never pass it.
-# A guard RESTARTED at frame 3 (cam 30) would show worst 0 over 3-5 -- the
-# fixture tells the two apart. Gate OFF (camera parked at the range's Start):
+# T72 Option B (2026-10-14): the keyer SEEDS its walk at the capture's Start
+# frame, so a range starting at 3 restarts the guard there (cam 30, centred):
+# 3-5 -> keys 3 (seed) and 5 (end), nothing passes the edge = worst 0. (Before
+# T72 the walk was always seeded at frame 0 and 3-5 read worst 2.0.)
+# Gate OFF (camera parked at the range's Start):
 # All / 0-5 -> parked at 0, frames 3-5 are 23.75 past = 11.18 %; 3-5 -> parked
 # at 30, nothing clips.
 $script:t48RangeCachePath = Join-Path $env:TEMP "rom_launcher_test_t48_range_cache.json"
@@ -3420,7 +3528,7 @@ Check "Tolerance cell: the wheel over the diagram / the cap steps the number lik
     if ($script:t48FocusCalls -ne 1) { throw "a click on the box itself is the box's own (caret/selection)" }
 }
 
-Check "time range (gate ON): Estimated / worst / bar are measured over the chosen range on the WHOLE-take guard curve (never restarted at Start); recomputed on radio and Start/End changes" {
+Check "time range (gate ON): Estimated / worst / bar are measured over the chosen range on a guard walk SEEDED at the range Start (T72 Option B); recomputed on radio and Start/End changes" {
     Reset-T48State; Reset-T48RangeState; Set-T48RangeCache
     $script:lastValidTolerancePct = 2.0; $toleranceValueBox.Text = "2"; Commit-ToleranceValueBox
     Update-ToleranceReadout
@@ -3430,14 +3538,14 @@ Check "time range (gate ON): Estimated / worst / bar are measured over the chose
     $startEndRadio.IsChecked = $true                  # recompute on the radio, no explicit call
     if ((Get-T48Readout) -ne "1 keys, worst 0" -or $script:lastEstimateWorstPct -ne 0) { throw "0-2: '$($toleranceReadoutText.Text)' worst $($script:lastEstimateWorstPct)" }
     $startFrameBox.Text = "3"; $endFrameBox.Text = "5"   # recompute on TextChanged
-    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "3-5 must keep the whole-take curve (worst 2.0, not a restarted 0): '$($toleranceReadoutText.Text)'" }
+    if ((Get-T48Readout) -ne "2 keys, worst 0") { throw "3-5: the walk is seeded at Start (T72), keys 3 + 5, worst 0 (not the frame-0-seeded 2.0): '$($toleranceReadoutText.Text)'" }
     $endFrameBox.Text = "1"
     if ($toleranceReadoutText.Text -ne "Estimated: -- (Start is after End)" -or $null -ne $script:lastEstimateWorstPct) { throw "reversed: '$($toleranceReadoutText.Text)'" }
     if ((Get-T48Shapes "slack-R").Count + (Get-T48Shapes "over-R").Count -ne 0) { throw "unknown range: no worst marker on the bar" }
-    $endFrameBox.Text = "3"                           # 3-3: the Start frame alone is recentred (apply_recenter_override), so 0
-    if ((Get-T48Readout) -ne "1 keys, worst 0") { throw "3-3: the recording's Start frame is the true-centre key, got '$($toleranceReadoutText.Text)'" }
+    $endFrameBox.Text = "3"                           # 3-3: the Start frame alone is the seed (centred), so 0
+    if ((Get-T48Readout) -ne "1 keys, worst 0") { throw "3-3: the recording's Start frame is the walk's seed key, got '$($toleranceReadoutText.Text)'" }
     $endFrameBox.Text = "5"; $startFrameBox.Text = "4"
-    if ((Get-T48Readout) -ne "1 keys, worst 2") { throw "4-5: '$($toleranceReadoutText.Text)'" }
+    if ((Get-T48Readout) -ne "2 keys, worst 0") { throw "4-5: seed 4 + end 5, nothing passes the edge: '$($toleranceReadoutText.Text)'" }
     if ("$($tolVisualHost.ToolTip)".IndexOf("over frames 4-5") -lt 0) { throw "tooltip names the measured frames" }
     $allFramesRadio.IsChecked = $true
     if ((Get-T48Readout) -ne "3 keys, worst 2") { throw "back to All: '$($toleranceReadoutText.Text)'" }
@@ -3452,11 +3560,11 @@ Check "time range: Time Slider = the last range a Preview / Start Recording clic
     $resolved = Get-ResolvedTimeRange
     if (-not $resolved.Success) { throw "resolution should succeed" }
     Update-ToleranceReadout
-    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "Time Slider 3-5: '$($toleranceReadoutText.Text)'" }
+    if ((Get-T48Readout) -ne "2 keys, worst 0") { throw "Time Slider 3-5: '$($toleranceReadoutText.Text)'" }
     function Get-TimeSliderRange { return [PSCustomObject]@{ Success = $false; Start = $null; End = $null; ErrorMessage = "No response from Maya." } }
     $null = Get-ResolvedTimeRange
     Update-ToleranceReadout
-    if ((Get-T48Readout) -ne "2 keys, worst 2") { throw "a failed later read keeps the last known range" }
+    if ((Get-T48Readout) -ne "2 keys, worst 0") { throw "a failed later read keeps the last known range" }
     $allFramesRadio.IsChecked = $true
 }
 

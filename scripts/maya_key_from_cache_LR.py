@@ -85,10 +85,8 @@ def get_frame_gate_enabled():
 
 
 # Manual pixel-space nudge -- see maya_camera_panels.py's get_pixel_offset()
-# for the full explanation. Only needed here so apply_recenter_override can
-# apply the SAME offset instead of discarding it (BUG FIXED 2026-09-08, see
-# maya_key_from_cache.py's copy of apply_recenter_override for the full
-# writeup -- identical bug here, tracked axis 'z' instead of 'x').
+# for the full explanation. Only needed here so the keyed curve can carry the
+# SAME offset (offset_shift in key_edge_guard).
 OFFSET_X_PX = 0.0
 OFFSET_Y_PX = 0.0
 
@@ -119,48 +117,6 @@ def get_world_per_px():
         return float(content)
     except (IOError, OSError, ValueError):
         return None
-
-
-def apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, world_per_px):
-    """See maya_key_from_cache.py for the full explanation: guarantees the
-    frame Preview/Start Recording shows is actually correctly centered on
-    BOTH axes, since key_edge_guard's own curve only guarantees "stays
-    on-screen," not "centered". BUG FIXED 2026-09-08: also applies the
-    manual pixel offset, which this override used to silently discard --
-    see maya_key_from_cache.py's copy for the full writeup.
-
-    BUG FIXED 2026-09-08 (second fix, same day): pins the curve back to its
-    own pre-override value exactly 1 frame before and 1 frame after
-    recenter_frame, with linear tangents through all three points, turning
-    the correction into a single-frame notch instead of a wide bulge or a
-    slow "draggy" drift -- see maya_key_from_cache.py's copy for the full
-    writeup and the real-scene evidence (a first attempt using linear
-    tangents on just the inserted keyframe only partially worked -- 26
-    units of overshoot down to 20.6, not 0 -- because it left the curve
-    still gradually blending toward a different value across the whole
-    gap to its real neighbors; the notch anchors fix that completely,
-    confirmed at 0.00000 overshoot across the entire animation)."""
-    attr = cam_transform + '.translate' + axis.upper()
-
-    anchor_before, anchor_after = recenter_frame - 1, recenter_frame + 1
-    value_before = cmds.getAttr(attr, time=anchor_before)
-    value_after = cmds.getAttr(attr, time=anchor_after)
-
-    cmds.currentTime(recenter_frame)
-    cmds.select(clear=True)
-    bbox = get_target_bbox()
-    if axis == 'x':
-        true_center = (bbox[0] + bbox[3]) / 2.0
-    else:
-        true_center = (bbox[2] + bbox[5]) / 2.0
-    if world_per_px is not None:
-        true_center -= offset_x_px * world_per_px
-
-    cmds.setKeyframe(attr, time=anchor_before, value=value_before)
-    cmds.setKeyframe(attr, time=recenter_frame, value=true_center)
-    cmds.setKeyframe(attr, time=anchor_after, value=value_after)
-    for t in (anchor_before, recenter_frame, anchor_after):
-        cmds.keyTangent(attr, time=(t, t), inTangentType='linear', outTangentType='linear')
 
 
 CACHE_PATH = cache_path_for(find_animation_reference())
@@ -265,7 +221,76 @@ def key_dead_zone(cam_transform, axis, cache, dead_zone_pct, current_ref, cached
     return keyed_count
 
 
-def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08, offset_shift=0.0):
+def find_start_index(frames, start_frame):
+    """Pure (no cmds). Index of the first cached frame >= start_frame -- the
+    frame the capture starts on. None (no range known) or a start before the
+    cache means index 0 (today's behaviour); a start past the last cached
+    frame clamps to the last index."""
+    if start_frame is None:
+        return 0
+    for i, f in enumerate(frames):
+        if f >= start_frame:
+            return i
+    return len(frames) - 1
+
+
+START_WINDOW_FRAMES = 30   # live frames measured after the start frame (T72 D1 fix)
+
+
+def seed_series_at_start(centers, half_widths, start_index, live_samples, min_samples=5, floor_frac=0.02, spread_frac=0.25):
+    """Pure (no cmds). T72 Option B: the edge-guard walk is SEEDED at the
+    capture's start frame instead of at the first cached frame. Returns the
+    (centers, half_widths) slices from start_index to the end.
+
+    live_samples is a list of (centre, width) LIVE bbox measurements of the
+    consecutive cached frames start_index, start_index+1, ... (the keyer
+    measures START_WINDOW_FRAMES + 1 of them). Those frames take the LIVE
+    centre and half width, so index 0 of the result IS the live subject
+    centre at the start frame (the seed) and the first corrections are
+    decided on what the character really does.
+
+    The cached series after the measured window is shifted by the median of
+    (live - cached) over the window ONLY when that difference is a consistent
+    (rigid) shift: at least min_samples samples, |median| at least floor_frac
+    of the live width, and every sample within spread_frac*|median| of the
+    median. Otherwise it stays unshifted. Reason (defect D1, found on the rogM
+    ROM scene): where the live character differs from the cache non-uniformly
+    (one limb missing in the live scene, so only one bbox edge matches), the
+    one-frame difference at the start frame is not valid for the rest of the
+    take; shifting the whole walk by it put up to 5.4% of the frame width
+    outside the tolerance. The guard parks the bbox edge exactly AT the
+    tolerance, so any shift the live scene does not share shows up one for
+    one as overflow. A rigid shift (the cache really is displaced by a
+    constant) is still followed, so the camera does not snap back to the
+    displaced cached path one frame later.
+
+    start_index <= 0 returns both lists unchanged (the size-scale reference
+    IS the live measurement at the first frame); start_index > 0 without
+    samples returns the unshifted slices."""
+    if start_index <= 0:
+        return list(centers), list(half_widths)
+    cs = list(centers[start_index:])
+    hs = list(half_widths[start_index:])
+    k = min(len(live_samples or []), len(cs))
+    if k == 0:
+        return cs, hs
+    diffs = [live_samples[j][0] - cs[j] for j in range(k)]
+    d = 0.0
+    if k >= min_samples:
+        ordered = sorted(diffs)
+        mid = len(ordered) // 2
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+        spread = max(abs(x - median) for x in diffs)
+        if abs(median) >= floor_frac * live_samples[0][1] and spread <= spread_frac * abs(median):
+            d = median
+    cs = [c + d for c in cs]
+    for j in range(k):
+        cs[j] = live_samples[j][0]
+        hs[j] = live_samples[j][1] / 2.0
+    return cs, hs
+
+
+def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, overflow_pct=0.08, offset_shift=0.0, start_frame=None):
     """See maya_key_from_cache.py's copy of this function for the full
     design note (2026-09-02, reverted back to nudge from a brief
     full-recenter experiment -- the recenter made the camera visibly drift
@@ -276,7 +301,7 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     BUG FIXED 2026-09-08: offset_shift (see maya_key_from_cache.py's copy
     for the full writeup) -- this function used to have zero knowledge of
     the manual pixel offset at all, so the whole curve ignored it outside
-    the one recenter-frame override.
+    the (since removed) one-frame recenter override.
 
     G + B (2026-09-28, see maya_key_from_cache.py's copy of this function
     and of compute_edge_guard_curve below for the full derivation and
@@ -284,16 +309,44 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     x): the 2026-09-08 fix above turned out not to actually hold under
     correction (algebraically, cam_pos_new = edge +/- half_ortho +/-
     overflow has no surviving cam_pos term, so any correction erases
-    whatever offset was baked into frame 0). [G] fixes this for real by
-    building the curve completely offset-free and subtracting offset_shift
-    from EVERY keyed value uniformly. [B] holds (skips correcting) any
+    whatever offset was baked into frame 0). [G] (as of 2026-09-28;
+    superseded by T72 item 6, 2026-10-20) built the curve completely
+    offset-free and subtracted offset_shift from EVERY keyed value
+    uniformly. CURRENT behaviour: this function passes offset_shift INTO
+    compute_edge_guard_curve, which seeds the walk at centers[0] -
+    offset_shift and decides every nudge against that visible camera, so
+    the values are written as they are and nothing is subtracted here (the
+    Offset sets the START position; after a nudge it may fade). [B] holds (skips correcting) any
     frame whose pose cannot fit within the tolerance regardless of camera
-    position, instead of chasing it for zero actual benefit."""
+    position, instead of chasing it for zero actual benefit.
+
+    T72 Option B (2026-10-14): start_frame re-seeds the walk at the
+    capture's start frame from the LIVE subject there (centre and width of
+    the start frame and the START_WINDOW_FRAMES after it, see
+    seed_series_at_start); only start..end is keyed (the one-frame recenter
+    notch is gone). See maya_key_from_cache.py's copy of this function for the full
+    writeup and the measured before/after (identical here, z axis)."""
     frames = cache['frames']
     cached_centers = cache[axis + '_center']
     cached_widths = cache[axis + '_width']
     subject_center = [current_ref + (v - cached_ref) * scale for v in cached_centers]
     subject_half_width = [(w * scale) / 2.0 for w in cached_widths]
+
+    start_index = find_start_index(frames, start_frame)
+    live_samples = None
+    if start_index > 0:
+        # Live measurement of the capture's start frame and the next
+        # START_WINDOW_FRAMES frames (the walk's seed and its first stretch).
+        live_samples = []
+        for i in range(start_index, min(len(frames), start_index + START_WINDOW_FRAMES + 1)):
+            cmds.currentTime(frames[i])
+            cmds.select(clear=True)
+            bbox = get_target_bbox()
+            if axis == 'x':
+                live_samples.append(((bbox[0] + bbox[3]) / 2.0, bbox[3] - bbox[0]))
+            else:
+                live_samples.append(((bbox[2] + bbox[5]) / 2.0, bbox[5] - bbox[2]))
+    centers, half_widths = seed_series_at_start(subject_center, subject_half_width, start_index, live_samples)
 
     attr = cam_transform + '.translate' + axis.upper()
     if cmds.keyframe(attr, query=True, keyframeCount=True):
@@ -304,24 +357,29 @@ def key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, o
     half_ortho = ortho_width / 2.0
     overflow = overflow_pct * ortho_width
 
-    curve = compute_edge_guard_curve(subject_center, subject_half_width, half_ortho, overflow)
-    for i, value in curve:
-        cmds.setKeyframe(attr, time=frames[i], value=value - offset_shift)
+    # T72 item 6: the walk runs in the frame the artist SEES (seeded at the centre minus the
+    # Offset, gate = that camera's frame edge +/- tolerance), so its values are written as they are.
+    curve = compute_edge_guard_curve(centers, half_widths, half_ortho, overflow, offset_shift)
+    for j, value in curve:
+        cmds.setKeyframe(attr, time=frames[start_index + j], value=value)
 
     return len(curve)
 
 
-def compute_edge_guard_curve(centers, half_widths, half_ortho, overflow):
+def compute_edge_guard_curve(centers, half_widths, half_ortho, overflow, offset_shift=0.0):
     """See maya_key_from_cache.py's copy of this function for the full
     docstring, derivation, and evidence (identical here) -- pure, cmds-free
-    replica of key_edge_guard's own tracking loop, offset-free by design
-    [G], with a hold when a pose cannot fit within the tolerance regardless
-    of camera position [B]."""
+    replica of key_edge_guard's own tracking loop, with a hold when a pose
+    cannot fit within the tolerance regardless of camera position [B].
+    T72 item 6 (2026-10-20): the walk is seeded at centers[0] - offset_shift
+    and compares every pose with that VISIBLE camera, so the returned values
+    are written as they are (no post-subtraction); offset_shift=0.0 is
+    byte-for-byte the old curve."""
     n = len(centers)
     if n == 0:
         return []
-    curve = [(0, centers[0])]
-    cam_pos = centers[0]
+    cam_pos = centers[0] - offset_shift
+    curve = [(0, cam_pos)]
     last_keyed_index = 0
     for i in range(1, n):
         if half_widths[i] > half_ortho + overflow:
@@ -413,16 +471,12 @@ try:
         print('%s axis size scale: %.4f (current width / cached width at ref frame)' % (axis, scale))
 
         if MODE == 'edge_guard':
-            keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct, offset_shift)
+            keyed = key_edge_guard(cam_transform, axis, cache, current_ref, cached_ref, scale, effective_overflow_pct, offset_shift, recenter_frame)
         elif MODE == 'dead_zone':
             keyed = key_dead_zone(cam_transform, axis, cache, DEAD_ZONE_PCT, current_ref, cached_ref, scale)
         else:
             keyed = key_from_cache(cam_transform, axis, cache, THRESHOLD_PCT, current_ref, cached_ref, scale)
-        print('%s (%s): %d keyframes from %d cached samples' % (view_name, cam_transform, keyed, len(cache['frames'])))
-
-        if recenter_frame is not None:
-            apply_recenter_override(cam_transform, axis, recenter_frame, offset_x_px, world_per_px)
-            print('%s (%s): overrode frame %s with a true live-centered keyframe' % (view_name, cam_transform, recenter_frame))
+        print('%s (%s): %d keyframes from %d cached samples (start frame %s)' % (view_name, cam_transform, keyed, len(cache['frames']), recenter_frame))
 finally:
     cmds.currentTime(original_time)
     cmds.refresh(suspend=False)

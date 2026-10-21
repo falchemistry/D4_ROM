@@ -28,7 +28,7 @@ $ScriptDir = $PSScriptRoot
 # count) -- shown in the window title so a user/screenshot/bug report can
 # say which build they're on, and so a stale d4_rom_dist copy is
 # distinguishable from the current source at a glance.
-$script:ToolVersion = "1.0.0"
+$script:ToolVersion = "1.0.1"
 
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -2200,13 +2200,16 @@ function Get-EdgeGuardCurveEstimateCore {
     # Pure math, no file I/O, no WPF -- PowerShell port of compute_edge_
     # guard_curve (maya_key_from_cache.py/_LR.py), the G+B tracking
     # algorithm, for the ON-mode live readout (2026-09-29, Part 3 step 3).
-    # [G] offset-free curve, offset applied as a uniform post-shift via
-    # OffsetShift (subtracted from every held cam_pos before measuring
-    # overflow -- matches the real keyer's own "value - offset_shift"
-    # write, and the proposal's own evidence table, which IS offset-
-    # dependent for frames-over-tolerance/worst-overflow even though the
-    # tolerance itself is zoom-only). [B] hold instead of correct when a
-    # pose cannot fit within Overflow regardless of camera position.
+    # T72 item 6 (2026-10-20): the gate follows the frame the artist SEES.
+    # The walk is seeded at the cached centre minus OffsetShift and every
+    # decision compares the pose with THAT visible camera -- exactly like
+    # compute_edge_guard_curve(..., offset_shift) in maya_key_from_cache.py
+    # /_LR.py, whose values the keyer writes as they are. Nothing is
+    # subtracted afterwards any more (the old [G] form built the walk
+    # offset-free and post-shifted it, so the real gate sat one Offset
+    # away from the visible frame). OffsetShift 0 is the old walk.
+    # [B] hold instead of correct when a pose cannot fit within Overflow
+    # regardless of camera position. The tolerance itself stays zoom-only.
     # Single pass: tracks cam_pos exactly like the real loop, storing it at
     # every frame (piecewise-constant between corrections, same semantics
     # as key_edge_guard's own loop) so the frames-over-tolerance/worst-
@@ -2221,18 +2224,17 @@ function Get-EdgeGuardCurveEstimateCore {
         [Parameter(Mandatory=$true)][double]$OffsetShift,
         [Parameter(Mandatory=$true)][int]$StartIndex,
         [Parameter(Mandatory=$true)][int]$EndIndex,
-        # task48 rebuild (time range): the curve is ALWAYS simulated over
-        # StartIndex..EndIndex (the whole cache, exactly like the keyer, which
-        # never restarts at the capture range), but keys / frames over
-        # tolerance / worst are MEASURED only over MeasureStart..MeasureEnd --
-        # the frames the chosen Time Range records. Omitted = the whole
-        # simulated span (the pre-rebuild behaviour, byte-identical). The first
-        # measured frame is the recording's Start, where apply_recenter_override
-        # puts a true-centre key (single-frame notch, maya_key_from_cache.py),
-        # so it is measured at the cached centre there; at index 0 that is the
-        # curve's own anchor anyway. Keys = the guard keys whose frame lies in
-        # the measured span (the recenter's own pinning keys are not counted,
-        # same as before).
+        # task48 rebuild (time range), T72 Option B (2026-10-14): keys / frames
+        # over tolerance / worst are MEASURED over MeasureStart..MeasureEnd --
+        # the frames the chosen Time Range records. The walk is SEEDED at the
+        # first measured frame (the recording's Start) at the cached centre
+        # there and simulated from it to EndIndex, exactly like the keyer
+        # (maya_key_from_cache.py key_edge_guard: seed_series_at_start, the
+        # walk starts at the capture's start frame from the live centre; the
+        # old apply_recenter_override notch is gone). Frames before the seed
+        # are not simulated. Omitted = the whole span seeded at StartIndex
+        # (the pre-rebuild behaviour, byte-identical). Keys = the guard keys
+        # (the seed included) whose frame lies in the measured span.
         [Nullable[int]]$MeasureStartIndex = $null,
         [Nullable[int]]$MeasureEndIndex = $null
     )
@@ -2242,15 +2244,16 @@ function Get-EdgeGuardCurveEstimateCore {
     $measureEnd = if ($null -ne $MeasureEndIndex) { [Math]::Min($EndIndex, [int]$MeasureEndIndex) } else { $EndIndex }
     if ($measureEnd -lt $measureStart) { return [PSCustomObject]@{ Keys = 0; PercentOverTolerance = 0.0; WorstOverflowPct = 0.0 } }
 
-    $camPos = $CenterX[$StartIndex]
+    $seedIndex = $measureStart
+    $camPos = $CenterX[$seedIndex] - $OffsetShift
     $keys = 1
-    $lastKeyedIndex = $StartIndex
+    $lastKeyedIndex = $seedIndex
     $keyedIndices = New-Object 'System.Collections.Generic.List[int]'
-    $keyedIndices.Add($StartIndex)
-    [double[]]$camPosAt = New-Object 'double[]' $total
+    $keyedIndices.Add($seedIndex)
+    [double[]]$camPosAt = New-Object 'double[]' ($EndIndex - $seedIndex + 1)
     $camPosAt[0] = $camPos
 
-    for ($i = $StartIndex + 1; $i -le $EndIndex; $i++) {
+    for ($i = $seedIndex + 1; $i -le $EndIndex; $i++) {
         $halfW = $WidthX[$i] / 2.0
         if ($halfW -le ($HalfOrtho + $Overflow)) {
             $leftEdge = $CenterX[$i] - $halfW
@@ -2271,10 +2274,10 @@ function Get-EdgeGuardCurveEstimateCore {
             # else: within tolerance already, cam_pos unchanged, no new key.
         }
         # else: [B] hold -- pose cannot fit even at full tolerance.
-        $camPosAt[$i - $StartIndex] = $camPos
+        $camPosAt[$i - $seedIndex] = $camPos
     }
     if ($lastKeyedIndex -ne $EndIndex) { $keys++; $keyedIndices.Add($EndIndex) }
-    if ($measureStart -ne $StartIndex -or $measureEnd -ne $EndIndex) {
+    if ($measureEnd -ne $EndIndex) {
         $keys = 0
         foreach ($k in $keyedIndices) { if ($k -ge $measureStart -and $k -le $measureEnd) { $keys++ } }
     }
@@ -2285,9 +2288,9 @@ function Get-EdgeGuardCurveEstimateCore {
     $total = $measureEnd - $measureStart + 1
     for ($i = $measureStart; $i -le $measureEnd; $i++) {
         $halfW2 = $WidthX[$i] / 2.0
-        $heldCamPos = if ($i -eq $measureStart) { $CenterX[$i] } else { $camPosAt[$i - $StartIndex] }
-        $shiftedCamPos = $heldCamPos - $OffsetShift
-        $ov = [Math]::Max(($shiftedCamPos - $HalfOrtho) - ($CenterX[$i] - $halfW2), ($CenterX[$i] + $halfW2) - ($shiftedCamPos + $HalfOrtho))
+        $heldCamPos = $camPosAt[$i - $seedIndex]
+        # the walk already runs in the visible frame (T72 item 6): no post-shift
+        $ov = [Math]::Max(($heldCamPos - $HalfOrtho) - ($CenterX[$i] - $halfW2), ($CenterX[$i] + $halfW2) - ($heldCamPos + $HalfOrtho))
         # "Over tolerance" means the raw overflow (beyond the plain HalfOrtho
         # edge) EXCEEDS the tolerance cushion itself (Overflow, already in
         # the SAME raw world units as $ov) -- NOT "any overflow at all".
@@ -2320,9 +2323,10 @@ function Get-ToleranceReadoutEstimate {
     # frame width" readout (2026-09-29, Part 3 step 3, Q6: recommended and
     # included). ON-mode only -- this simulates the G+B guard itself, which
     # only runs while Frame gate is ON; callers branch on the checkbox the
-    # same way Update-FrameGateGlow already does. The guard is always
-    # simulated over the WHOLE cached take (the keyer builds its curve that
-    # way, whatever the capture range); task48 rebuild: the numbers are
+    # same way Update-FrameGateGlow already does. The guard is simulated
+    # from the capture's start frame to the end of the cached take (T72
+    # Option B: the keyer seeds its walk at the start frame, see
+    # Get-EdgeGuardCurveEstimateCore); task48 rebuild: the numbers are
     # MEASURED over -MeasureStartIndex..-MeasureEndIndex, the cached frames
     # the chosen Time Range records (Get-EstimateRange). Omitted = the whole
     # take, as before.
