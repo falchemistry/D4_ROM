@@ -28,6 +28,7 @@ function Get-ToolPathTable {
         "maya_clean_reset.py" = "maya"
         "maya_debug_inspect.py" = "maya"
         "maya_get_animation_range.py" = "maya"
+        "maya_get_scene_name.py" = "maya"
         "maya_get_time_slider.py" = "maya"
         "maya_key_from_cache.py" = "maya"
         "maya_key_from_cache_LR.py" = "maya"
@@ -44,6 +45,7 @@ function Get-ToolPathTable {
         "_playback_state.txt" = "state"
         "_hud_state.json" = "state"
         "_hook_context.json" = "state"
+        "_last_video.txt" = "state"
     }
 }
 
@@ -99,12 +101,17 @@ function Get-CaptureSteps {
         [string]$HookContextPath = "",
         # Which video of the run this is (All = 0 then 1), handed to the
         # user's script as D4_CTX['leg_index'].
-        [int]$LegIndex = 0
+        [int]$LegIndex = 0,
+        # T87 video file name prefix (the Prefix box). Sanitized here again
+        # (Get-SafePrefix is idempotent); an empty result adds nothing, so
+        # the step list stays exactly what it was. Recording only.
+        [string]$NamePrefix = ""
     )
 
     if (($StartFrame -eq $null) -ne ($EndFrame -eq $null)) {
         throw "StartFrame and EndFrame must both be given, or neither."
     }
+    $safePrefix = Get-SafePrefix -Prefix $NamePrefix
 
     $preHookStep = $null
     $postHookStep = $null
@@ -142,6 +149,12 @@ function Get-CaptureSteps {
         if ($StartFrame -ne $null) {
             $obsArgs += @("-StartFrame", "$StartFrame", "-EndFrame", "$EndFrame")
         }
+        # T87: the capture script renames this leg's video right after OBS
+        # stops. A safe prefix has no whitespace, quote or leading '-', so
+        # it needs no quoting and is never read as a switch.
+        if ($safePrefix) {
+            $obsArgs += @("-NamePrefix", $safePrefix, "-LegAxis", $Axis)
+        }
         $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = $obsArgs }
         if ($postHookStep) { $steps += $postHookStep }
         $steps += [PSCustomObject]@{ FilePath = "powershell"; Arguments = @("-ExecutionPolicy", "Bypass", "-File", $taskbarControl, "-Action", "show") }
@@ -173,16 +186,19 @@ function Get-CaptureStepsForAxis {
         # T97 hooks, passed through to every leg (All = each runs twice).
         [string]$PreHookPath = "",
         [string]$PostHookPath = "",
-        [string]$HookContextPath = ""
+        [string]$HookContextPath = "",
+        # T87: one prefix for every leg (read once at the click); each leg
+        # adds its own suffix (_front_back / _left_right).
+        [string]$NamePrefix = ""
     )
 
     if ($Axis -ne "All") {
-        return Get-CaptureSteps -Axis $Axis -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0
+        return Get-CaptureSteps -Axis $Axis -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0 -NamePrefix $NamePrefix
     }
 
     $steps = @()
-    $steps += Get-CaptureSteps -Axis "FrontBack" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0
-    $steps += Get-CaptureSteps -Axis "LeftRight" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 1
+    $steps += Get-CaptureSteps -Axis "FrontBack" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 0 -NamePrefix $NamePrefix
+    $steps += Get-CaptureSteps -Axis "LeftRight" -Recording $Recording -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $PreHookPath -PostHookPath $PostHookPath -HookContextPath $HookContextPath -LegIndex 1 -NamePrefix $NamePrefix
     return $steps
 }
 
@@ -456,7 +472,9 @@ function Get-CaptureStepsWithHooks {
         [Parameter(Mandatory=$true)][string]$ScriptDir,
         [Nullable[int]]$StartFrame = $null,
         [Nullable[int]]$EndFrame = $null,
-        [Parameter(Mandatory=$true)][string]$ToolVersion
+        [Parameter(Mandatory=$true)][string]$ToolVersion,
+        # T87 video name prefix, passed to every leg ("" = OBS's own names)
+        [string]$NamePrefix = ""
     )
     $log = @()
     $err = $null
@@ -467,13 +485,13 @@ function Get-CaptureStepsWithHooks {
         if ($hooks.Pre -or $hooks.Post) {
             $contextPath = Write-HookContext -ScriptDir $ScriptDir -Axis $Axis -StartFrame $StartFrame -EndFrame $EndFrame -ToolVersion $ToolVersion
         }
-        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $hooks.Pre -PostHookPath $hooks.Post -HookContextPath $contextPath)
+        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -PreHookPath $hooks.Pre -PostHookPath $hooks.Post -HookContextPath $contextPath -NamePrefix $NamePrefix)
         if ($hooks.Pre) { $log += "Pre-record script runs before each video: $($hooks.Pre)" }
         if ($hooks.Post) { $log += "Post-record script runs after each video: $($hooks.Post)" }
     } catch {
         $err = $_.Exception.Message
         $log += "Pre-Post Recording: scripts NOT run for this recording -- $err"
-        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame)
+        $steps = @(Get-CaptureStepsForAxis -Axis $Axis -Recording $true -ScriptDir $ScriptDir -StartFrame $StartFrame -EndFrame $EndFrame -NamePrefix $NamePrefix)
     }
     return [PSCustomObject]@{ Steps = $steps; Log = $log; Error = $err }
 }
@@ -1291,4 +1309,444 @@ function Get-ToleranceTooltipText {
         $text += " Very small values (0-2%): the camera follows the character's edges closely and nudges more often (on a real take at zoom 0: about 0.7 keys per second at 0%, 0.5 at 2%, 0.1 at 10%). It only gets busy and hugs the limit when the character is wider than the frame (zoomed in). Larger values keep the camera calmer but let the character be cut at the edges by up to that amount. A red outlined part in the bar means the animation goes past the allowed margin."
     }
     return ($text + " Mouse wheel here steps the number like over the box (Shift 10, Ctrl 0.1).")
+}
+
+# --- Prefix box and video names (T87) --------------------------------------
+# The Prefix box (Settings tab, label "ROM video prefix") names the videos
+# {prefix}_front_back_HH_mm.<ext> and {prefix}_left_right_HH_mm.<ext> (local
+# rename time, e.g. barM_x_front_back_14_32.mp4). The launcher fills the box from the open Maya
+# scene name (Get-PrefixFillDecision), reads it ONCE at the Start Recording
+# click (Get-SafePrefix) and passes it to maya_obs_capture.ps1, which renames
+# each leg's video right after OBS stops (Get-ObsRecordOutputPath,
+# Rename-RecordedVideo) and writes the final path to scripts\state\
+# _last_video.txt for the post-record script (D4_CTX['video_path']).
+# An empty prefix keeps OBS's own names and today's step list byte for byte.
+
+function Get-SafePrefix {
+    # The prefix as it may appear in a Windows file name. Rules (user
+    # answers, form_t87): surrounding whitespace is dropped; \ / : * ? " < >
+    # | , control characters and whitespace become '_'; trailing dots are
+    # dropped (Windows strips them); a leading '-' becomes '_' (so the value
+    # can never be read as a switch on the capture script's command line); a
+    # reserved device name before the first dot (CON, PRN, AUX, NUL, COM1-9,
+    # LPT1-9) gets a '_' appended. Text with nothing meaningful left (empty,
+    # whitespace only, only unsafe characters and dots) = "" = no prefix.
+    # NO length cap: the path-length guard is Get-UniqueVideoPath's job.
+    # Idempotent: Get-SafePrefix (Get-SafePrefix x) -ceq Get-SafePrefix x.
+    param([AllowNull()][AllowEmptyString()][string]$Prefix)
+    # T87 LOW-1: invisible format characters (zero-width space/joiners, LRM/RLM,
+    # bidi embeddings/overrides, word joiner, BOM) are dropped first, so a
+    # prefix made only of them is an empty prefix. Built from char codes to
+    # keep this file ASCII.
+    if ($Prefix) {
+        $fmt = "[" + [char]0x200B + "-" + [char]0x200F + [char]0x202A + "-" + [char]0x202E + [char]0x2060 + [char]0xFEFF + "]"
+        $Prefix = [regex]::Replace($Prefix, $fmt, "")
+    }
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return "" }
+    $unsafe = '\/:*?"<>|'
+    $sb = New-Object System.Text.StringBuilder
+    $meaningful = $false
+    foreach ($ch in $Prefix.Trim().ToCharArray()) {
+        if ($unsafe.IndexOf($ch) -ge 0 -or [char]::IsControl($ch) -or [char]::IsWhiteSpace($ch)) {
+            [void]$sb.Append('_')
+        } else {
+            [void]$sb.Append($ch)
+            if ($ch -ne '.') { $meaningful = $true }
+        }
+    }
+    if (-not $meaningful) { return "" }
+    $s = $sb.ToString().TrimEnd('.')
+    if (-not $s) { return "" }
+    if ($s.StartsWith("-")) { $s = "_" + $s.Substring(1) }
+    $dot = $s.IndexOf('.')
+    $base = if ($dot -ge 0) { $s.Substring(0, $dot) } else { $s }
+    if ($base -match '^(?i:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])$') {
+        $s = $base + "_" + $s.Substring($base.Length)
+    }
+    return $s
+}
+
+function Get-LegSuffix {
+    # The part of the video name that says which leg it is.
+    param([Parameter(Mandatory=$true)][ValidateSet("FrontBack", "LeftRight")][string]$LegAxis)
+    if ($LegAxis -eq "FrontBack") { return "front_back" }
+    return "left_right"
+}
+
+function Get-VideoRenameTime {
+    # T87 clock seam: the local time a video is renamed at (tests replace it).
+    return (Get-Date)
+}
+
+function Get-VideoNameStamp {
+    # The time stamp at the end of a renamed video name: local 24 h HH_mm
+    # (user choice 2026-10-26: {prefix}_front_back_14_32.<ext>).
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    return $Now.ToString("HH'_'mm", [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-FittedPrefix {
+    # $Prefix cut to at most $MaxLength characters, still safe: never splits
+    # a surrogate pair, never ends in a dot, never leaves a reserved name
+    # (Get-SafePrefix runs again; if its fix-up makes it longer, cut more).
+    # "" when nothing fits.
+    param([AllowEmptyString()][string]$Prefix, [int]$MaxLength)
+    if ($MaxLength -lt 1 -or -not $Prefix) { return "" }
+    if ($Prefix.Length -le $MaxLength) { return $Prefix }
+    $len = $MaxLength
+    while ($len -gt 0) {
+        $cut = $Prefix.Substring(0, $len)
+        if ([char]::IsHighSurrogate($cut[$cut.Length - 1])) { $len--; continue }
+        $s = Get-SafePrefix -Prefix $cut
+        if ($s.Length -le $MaxLength) { return $s }
+        $len--
+    }
+    return ""
+}
+
+function Get-UniqueVideoPath {
+    # The first free target in $Directory: {prefix}_{leg}<ext>, then
+    # {prefix}_{leg}_2<ext>, _3 ... (an existing file is never a target).
+    # Path-length guard: the whole path stays <= $MaxPathLength (255, under
+    # Windows' 260 MAX_PATH); a prefix that does not fit is shortened just
+    # enough (Truncated = $true). Returns Path/Prefix/Truncated/Error;
+    # Path = $null with Error set when no name fits. Never throws for a
+    # missing folder or a long name (an unknown -LegAxis does throw).
+    param(
+        [Parameter(Mandatory=$true)][string]$Directory,
+        [AllowEmptyString()][string]$Prefix,
+        [Parameter(Mandatory=$true)][string]$LegAxis,
+        [AllowEmptyString()][string]$Extension = "",
+        [int]$MaxPathLength = 255,
+        [int]$MaxAttempts = 999,
+        # T87: HH_mm stamp after the leg suffix ("" = none):
+        # {prefix}_{leg}_HH_mm<ext>; same-minute clashes get _2, _3 after it
+        [AllowEmptyString()][string]$Stamp = "",
+        # an existing file that counts as free (the video being renamed, so a
+        # source already carrying the target name is left in place)
+        [AllowEmptyString()][string]$IgnorePath = ""
+    )
+    $leg = Get-LegSuffix -LegAxis $LegAxis
+    $safe = Get-SafePrefix -Prefix $Prefix
+    if (-not $safe) { return [PSCustomObject]@{ Path = $null; Prefix = ""; Truncated = $false; Error = "the prefix is empty" } }
+    $dir = $Directory.TrimEnd('\')
+    for ($n = 1; $n -le $MaxAttempts; $n++) {
+        $tail = "_" + $leg + $(if ($Stamp) { "_$Stamp" } else { "" }) + $(if ($n -gt 1) { "_$n" } else { "" }) + $Extension
+        $room = $MaxPathLength - ($dir.Length + 1 + $tail.Length)
+        $p = Get-FittedPrefix -Prefix $safe -MaxLength $room
+        if (-not $p) {
+            return [PSCustomObject]@{ Path = $null; Prefix = ""; Truncated = $false; Error = "the folder path is too long for a $MaxPathLength-character video path: $dir" }
+        }
+        $candidate = $dir + "\" + $p + $tail
+        $isSelf = $IgnorePath -and [string]::Equals($candidate, $IgnorePath, [StringComparison]::OrdinalIgnoreCase)
+        if ($isSelf -or -not (Test-Path -LiteralPath $candidate)) {
+            return [PSCustomObject]@{ Path = $candidate; Prefix = $p; Truncated = ($p -cne $safe); Error = $null }
+        }
+    }
+    return [PSCustomObject]@{ Path = $null; Prefix = ""; Truncated = $false; Error = "no free name after $MaxAttempts tries ($safe" + "_" + "$leg" + "_N$Extension)" }
+}
+
+function Rename-RecordedVideo {
+    # Renames one finished video to {prefix}_{leg}_HH_mm<ext> (ext = what OBS
+    # wrote, HH_mm = local rename time), the next free _2/_3 if taken, never overwriting anything
+    # ([IO.File]::Move throws when the target exists, then the next suffix is
+    # tried). While OBS still holds the file (sharing violation / access
+    # denied) the move is retried $RetryCount times, $RetryDelayMs apart
+    # ($OnRetry, if given, is called with the retry number: a test seam).
+    # NEVER throws: any failure is a WARNING line and the original video is
+    # kept, so the post-record script, HUD and taskbar restore still run.
+    # Returns Status renamed|kept|skipped, Path (the video's final path; ""
+    # when OBS reported none), Log (lines; problems start with WARNING).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$SourcePath,
+        [AllowNull()][AllowEmptyString()][string]$Prefix,
+        [AllowNull()][AllowEmptyString()][string]$LegAxis,
+        [int]$MaxPathLength = 255,
+        [int]$RetryCount = 20,
+        [int]$RetryDelayMs = 500,
+        [scriptblock]$OnRetry = $null,
+        # T87: rename time for the _HH_mm stamp ($null = Get-VideoRenameTime, the clock seam)
+        $Now = $null
+    )
+    $log = New-Object System.Collections.Generic.List[string]
+    # T87 LOW-3: one path form everywhere (OBS may report forward slashes)
+    $src = if ($SourcePath) { $SourcePath.Replace("/", "\") } else { "" }
+    try {
+        $safe = Get-SafePrefix -Prefix $Prefix
+        if (-not $safe) {
+            return [PSCustomObject]@{ Status = "skipped"; Path = $src; Log = @($log) }
+        }
+        if ([string]::IsNullOrWhiteSpace($src)) {
+            $log.Add("WARNING: OBS did not report the video file path -- the video keeps OBS's own name.")
+            return [PSCustomObject]@{ Status = "kept"; Path = ""; Log = @($log) }
+        }
+        if ($LegAxis -ne "FrontBack" -and $LegAxis -ne "LeftRight") {
+            $log.Add("WARNING: unknown leg '$LegAxis' -- the video keeps OBS's own name: $src")
+            return [PSCustomObject]@{ Status = "kept"; Path = $src; Log = @($log) }
+        }
+        if (-not [IO.File]::Exists($src)) {
+            $log.Add("WARNING: the recorded video was not found, nothing renamed: $src")
+            return [PSCustomObject]@{ Status = "kept"; Path = $src; Log = @($log) }
+        }
+        $src = [IO.Path]::GetFullPath($src)
+        $dir = [IO.Path]::GetDirectoryName($src)
+        $ext = [IO.Path]::GetExtension($src)
+        if ($null -eq $Now) { $Now = Get-VideoRenameTime }
+        $stamp = Get-VideoNameStamp -Now ([DateTime]$Now)
+        $lockRetries = 0
+        $collisions = 0
+        $truncNoted = $false
+        while ($true) {
+            $target = Get-UniqueVideoPath -Directory $dir -Prefix $safe -LegAxis $LegAxis -Extension $ext -MaxPathLength $MaxPathLength -Stamp $stamp -IgnorePath $src
+            if (-not $target.Path) {
+                $log.Add("WARNING: could not build a new name ($($target.Error)) -- the video keeps OBS's own name: $src")
+                return [PSCustomObject]@{ Status = "kept"; Path = $src; Log = @($log) }
+            }
+            if ($target.Truncated -and -not $truncNoted) {
+                $log.Add("Prefix shortened to $($target.Prefix.Length) characters to stay within the Windows path limit ($MaxPathLength).")
+                $truncNoted = $true
+            }
+            if ([string]::Equals($target.Path, $src, [StringComparison]::OrdinalIgnoreCase)) {
+                # T87 LOW-2: it already carries the target name -- leave it in place
+                $log.Add("Video already named $([IO.Path]::GetFileName($src)) -- left as it is.")
+                return [PSCustomObject]@{ Status = "renamed"; Path = $src; Log = @($log) }
+            }
+            try {
+                [IO.File]::Move($src, $target.Path)
+                $log.Add("Video renamed: $([IO.Path]::GetFileName($src)) -> $([IO.Path]::GetFileName($target.Path))")
+                return [PSCustomObject]@{ Status = "renamed"; Path = $target.Path; Log = @($log) }
+            } catch {
+                $ex = $_.Exception
+                while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }
+                $code = $ex.HResult -band 0xFFFF
+                if ((Test-Path -LiteralPath $target.Path) -or $code -eq 80 -or $code -eq 183) {
+                    # someone took that name in between: try the next suffix
+                    $collisions++
+                    if ($collisions -gt 999) { throw }
+                    continue
+                }
+                if (($code -eq 32 -or $code -eq 33 -or $code -eq 5) -and $lockRetries -lt $RetryCount) {
+                    $lockRetries++
+                    if ($OnRetry) { & $OnRetry $lockRetries }
+                    Start-Sleep -Milliseconds $RetryDelayMs
+                    continue
+                }
+                $log.Add("WARNING: could not rename the video after $($lockRetries + 1) tries ($($ex.Message.Trim())) -- it keeps OBS's own name: $src")
+                return [PSCustomObject]@{ Status = "kept"; Path = $src; Log = @($log) }
+            }
+        }
+    } catch {
+        $log.Add("WARNING: renaming the video failed ($($_.Exception.Message)) -- it keeps OBS's own name: $src")
+        return [PSCustomObject]@{ Status = "kept"; Path = $src; Log = @($log) }
+    }
+}
+
+function Write-LastVideoPath {
+    # scripts\state\_last_video.txt: the final path of the video the capture
+    # script just finished (UTF-8, no BOM, one line; "" = none known), read
+    # by maya_run_hook.py as D4_CTX['video_path'] for the post-record script.
+    # Overwritten per leg and cleared when a capture starts, so a Stop click
+    # (capture killed) never hands the post script the previous video.
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptDir,
+        [AllowNull()][AllowEmptyString()][string]$Path
+    )
+    $file = Get-ToolPath -ScriptDir $ScriptDir -Name "_last_video.txt"
+    # T87 LOW-3: backslashes, the same form as a renamed path
+    $text = if ($Path) { $Path.Replace("/", "\") + "`n" } else { "" }
+    [IO.File]::WriteAllText($file, $text, (New-Object System.Text.UTF8Encoding($false)))
+    return $file
+}
+
+function Get-ObsRecordOutputPath {
+    # Where OBS saved the video, from the OBS WebSocket v5 messages seen
+    # after a StopRecord request (op 7 = request response, op 5 = event).
+    # Layered: (1) the StopRecord response's responseData.outputPath; (2) a
+    # RecordStateChanged event with outputState OBS_WEBSOCKET_OUTPUT_STOPPED
+    # and its outputPath; (3) nothing: Path "" and Source "none" (the caller
+    # keeps OBS's name; it never guesses from the record folder).
+    param(
+        [AllowNull()][AllowEmptyCollection()][array]$Messages = @(),
+        [AllowEmptyString()][string]$RequestId = ""
+    )
+    foreach ($m in @($Messages)) {
+        if ($null -eq $m -or $m.op -ne 7 -or $m.d.requestId -ne $RequestId) { continue }
+        $p = $m.d.responseData.outputPath
+        if ($p -is [string] -and $p.Trim()) { return [PSCustomObject]@{ Path = $p; Source = "response" } }
+    }
+    foreach ($m in @($Messages)) {
+        if ($null -eq $m -or $m.op -ne 5 -or $m.d.eventType -ne "RecordStateChanged") { continue }
+        if ($m.d.eventData.outputState -ne "OBS_WEBSOCKET_OUTPUT_STOPPED") { continue }
+        $p = $m.d.eventData.outputPath
+        if ($p -is [string] -and $p.Trim()) { return [PSCustomObject]@{ Path = $p; Source = "event" } }
+    }
+    return [PSCustomObject]@{ Path = ""; Source = "none" }
+}
+
+function Format-ObsMessageSummary {
+    # One short line describing the OBS messages seen around StopRecord, for
+    # the log (the live reply shape has not been observed yet: the QA probe
+    # reads this line).
+    param([AllowNull()][AllowEmptyCollection()][array]$Messages = @())
+    $parts = @()
+    foreach ($m in @($Messages)) {
+        if ($null -eq $m) { continue }
+        if ($m.op -eq 7) {
+            $parts += "reply $($m.d.requestType) result=$($m.d.requestStatus.result) outputPath=$($m.d.responseData.outputPath)"
+        } elseif ($m.op -eq 5) {
+            $parts += "event $($m.d.eventType)($($m.d.eventData.outputState)) outputPath=$($m.d.eventData.outputPath)"
+        } else {
+            $parts += "op$($m.op)"
+        }
+    }
+    if (-not $parts.Count) { return "(no messages)" }
+    return ($parts -join " | ")
+}
+
+function ConvertFrom-SceneNameOutput {
+    # Parses maya_get_scene_name.py's result file:
+    #   SCENE_NAME <name>          (file name without folder and extension)
+    #   SCENE_UNTITLED             (never saved: nothing to fill)
+    #   SCENE_NAME_ERROR <message>
+    # Anything else (empty = no reply / timeout) is Status "Unknown". The
+    # name is returned raw (spaces kept); Get-SafePrefix runs at the click.
+    param([AllowNull()][AllowEmptyString()][string]$Output)
+    $line = @(([string]$Output) -split "`n" | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -match '^SCENE_(NAME|UNTITLED)' }) | Select-Object -First 1
+    if (-not $line) { return [PSCustomObject]@{ Status = "Unknown"; Name = ""; ErrorMessage = "No response from Maya." } }
+    if ($line -match '^SCENE_NAME_ERROR\s*(.*)$') { return [PSCustomObject]@{ Status = "Error"; Name = ""; ErrorMessage = $Matches[1].Trim() } }
+    if ($line -match '^SCENE_UNTITLED') { return [PSCustomObject]@{ Status = "Untitled"; Name = ""; ErrorMessage = $null } }
+    if ($line -match '^SCENE_NAME (.*)$') {
+        $n = $Matches[1]
+        if ([string]::IsNullOrWhiteSpace($n)) { return [PSCustomObject]@{ Status = "Untitled"; Name = ""; ErrorMessage = $null } }
+        return [PSCustomObject]@{ Status = "Named"; Name = $n; ErrorMessage = $null }
+    }
+    return [PSCustomObject]@{ Status = "Unknown"; Name = ""; ErrorMessage = "Unrecognized response: $line" }
+}
+
+function Get-PrefixFillDecision {
+    # What the Prefix box should show after a scene-name lookup. Rules
+    # (user answers): an empty (or whitespace-only) box is filled; typed
+    # text is never touched; STALE RULE: text still equal (case-sensitive)
+    # to the last auto-filled value counts as unedited and follows the scene;
+    # -FromButton (the 'use the Maya scene name' button) replaces any text.
+    # No scene name (untitled / no reply) changes nothing, button included.
+    # Returns Text, LastAutoFill, Changed, Reason (filled | refreshed |
+    # unchanged | button | kept_user_text | no_scene).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CurrentText,
+        [AllowNull()][AllowEmptyString()][string]$LastAutoFill,
+        [AllowNull()][AllowEmptyString()][string]$SceneName,
+        [bool]$FromButton = $false
+    )
+    $cur = [string]$CurrentText
+    $last = [string]$LastAutoFill
+    if ([string]::IsNullOrWhiteSpace($SceneName)) {
+        return [PSCustomObject]@{ Text = $cur; LastAutoFill = $last; Changed = $false; Reason = "no_scene" }
+    }
+    if ($FromButton) {
+        return [PSCustomObject]@{ Text = $SceneName; LastAutoFill = $SceneName; Changed = ($cur -cne $SceneName); Reason = "button" }
+    }
+    if ([string]::IsNullOrWhiteSpace($cur)) {
+        return [PSCustomObject]@{ Text = $SceneName; LastAutoFill = $SceneName; Changed = $true; Reason = "filled" }
+    }
+    if ($last -and $cur -ceq $last) {
+        $changed = ($cur -cne $SceneName)
+        return [PSCustomObject]@{ Text = $SceneName; LastAutoFill = $SceneName; Changed = $changed; Reason = $(if ($changed) { "refreshed" } else { "unchanged" }) }
+    }
+    return [PSCustomObject]@{ Text = $cur; LastAutoFill = $last; Changed = $false; Reason = "kept_user_text" }
+}
+
+function Test-PrefixFillNeeded {
+    # Whether asking Maya for the scene name can change the box at all: the
+    # button always; otherwise only an empty box or one still showing the
+    # last auto-filled value (Get-PrefixFillDecision keeps typed text
+    # whatever the scene). Saves the Maya round trip on every click once
+    # the user has typed a prefix.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CurrentText,
+        [AllowNull()][AllowEmptyString()][string]$LastAutoFill,
+        [bool]$FromButton = $false
+    )
+    if ($FromButton) { return $true }
+    if ([string]::IsNullOrWhiteSpace($CurrentText)) { return $true }
+    return ([bool]$LastAutoFill -and ($CurrentText -ceq $LastAutoFill))
+}
+
+function Get-PrefixSceneApplyResult {
+    # The ONE place that turns a scene-name lookup (ConvertFrom-SceneNameOutput
+    # result) into the new box text + log line; used by the synchronous click
+    # path (Update-PrefixFromScene) and the async connect/launch path
+    # (Update-PrefixFillAsync) alike, so both follow Get-PrefixFillDecision
+    # (stale rule, typed text never touched, button replaces). LogLine is ""
+    # when nothing worth a line happened.
+    param(
+        $Scene,
+        [AllowNull()][AllowEmptyString()][string]$CurrentText,
+        [AllowNull()][AllowEmptyString()][string]$LastAutoFill,
+        [bool]$FromButton = $false,
+        [AllowNull()][AllowEmptyString()][string]$Trigger = ""
+    )
+    $cur = [string]$CurrentText
+    $last = [string]$LastAutoFill
+    $when = if ($Trigger) { " ($Trigger)" } else { "" }
+    $status = if ($Scene) { [string]$Scene.Status } else { "Unknown" }
+    if ($status -eq "Untitled") {
+        return [PSCustomObject]@{ Text = $cur; LastAutoFill = $last; Changed = $false; LogLine = "Prefix$when`: the Maya scene is untitled (never saved) -- nothing to fill in." }
+    }
+    if ($status -ne "Named") {
+        $msg = if ($Scene -and $Scene.ErrorMessage) { $Scene.ErrorMessage } else { "No response from Maya." }
+        return [PSCustomObject]@{ Text = $cur; LastAutoFill = $last; Changed = $false; LogLine = "Prefix$when`: could not read the Maya scene name ($msg) -- the box is unchanged." }
+    }
+    $d = Get-PrefixFillDecision -CurrentText $cur -LastAutoFill $last -SceneName $Scene.Name -FromButton $FromButton
+    $line = ""
+    switch ($d.Reason) {
+        "filled" { $line = "Prefix$when filled from the Maya scene name: $($d.Text)" }
+        "refreshed" { $line = "Prefix$when updated to the new Maya scene name: $($d.Text)" }
+        "button" { $line = "Prefix set to the Maya scene name: $($d.Text)" }
+    }
+    return [PSCustomObject]@{ Text = $d.Text; LastAutoFill = $d.LastAutoFill; Changed = $d.Changed; LogLine = $line }
+}
+
+function Get-BusyBarGeometry {
+    # The top busy bar (look C, form_t87_bar): a segment 30% of the bar wide
+    # moving back and forth between X = 0 and X = Travel (bar width minus
+    # segment). Fraction = position within one sweep, clamped to 0..1 (the
+    # launcher animates it with AutoReverse; offscreen renders freeze it).
+    param([double]$BarWidth, [double]$Fraction = 0)
+    if ($BarWidth -le 0) { return [PSCustomObject]@{ SegmentWidth = 0; Travel = 0; X = 0 } }
+    $seg = [Math]::Round($BarWidth * 0.3)
+    $travel = $BarWidth - $seg
+    $f = [Math]::Max(0.0, [Math]::Min(1.0, $Fraction))
+    return [PSCustomObject]@{ SegmentWidth = $seg; Travel = $travel; X = ($travel * $f) }
+}
+
+function Get-PrefixAsyncStartDecision {
+    # Whether the async (connect / launch) scene-name fill may start now:
+    # never a second one while one runs, never during a run (the port is busy
+    # with the run's steps and its click already filled the box), never when
+    # the answer cannot change the box (typed text; Test-PrefixFillNeeded).
+    param([bool]$Busy, [bool]$RunActive, [AllowNull()][AllowEmptyString()][string]$CurrentText, [AllowNull()][AllowEmptyString()][string]$LastAutoFill)
+    if ($Busy) { return [PSCustomObject]@{ Start = $false; Reason = "busy" } }
+    if ($RunActive) { return [PSCustomObject]@{ Start = $false; Reason = "run_active" } }
+    if (-not (Test-PrefixFillNeeded -CurrentText $CurrentText -LastAutoFill $LastAutoFill)) { return [PSCustomObject]@{ Start = $false; Reason = "not_needed" } }
+    return [PSCustomObject]@{ Start = $true; Reason = "start" }
+}
+
+function Get-PrefixAsyncPollDecision {
+    # One tick of the async fill: "discard" (a run started meanwhile: do not
+    # touch the box), "complete" (the process exited: read its result),
+    # "timeout" (still running at the limit: kill it), else "wait".
+    param([bool]$HasExited, [double]$ElapsedMs, [double]$TimeoutMs, [bool]$RunActive)
+    if ($RunActive) { return "discard" }
+    if ($HasExited) { return "complete" }
+    if ($ElapsedMs -ge $TimeoutMs) { return "timeout" }
+    return "wait"
+}
+
+function Test-PrefixConnectFillDue {
+    # The 5 s port tick fills the box on the FIRST connect only: Maya's port
+    # going from unreachable to reachable. $null = not known yet (the launch
+    # itself is handled once, after the window is shown).
+    param($WasReachable, [bool]$IsReachable)
+    return (($WasReachable -is [bool]) -and (-not $WasReachable) -and $IsReachable)
 }

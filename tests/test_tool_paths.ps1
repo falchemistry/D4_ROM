@@ -40,6 +40,7 @@ $ExpectedLayout = [ordered]@{
     "maya_clean_reset.py" = "maya"
     "maya_debug_inspect.py" = "maya"
     "maya_get_animation_range.py" = "maya"
+    "maya_get_scene_name.py" = "maya"
     "maya_get_time_slider.py" = "maya"
     "maya_key_from_cache.py" = "maya"
     "maya_key_from_cache_LR.py" = "maya"
@@ -53,9 +54,11 @@ $ExpectedLayout = [ordered]@{
     "obs_monitor.ps1" = "obs"
 }
 # The state files maya_obs_capture.ps1 itself writes, plus the launcher's
-# T97 pre/post recording context file.
+# T97 pre/post recording context file and the T87 last-video file (written
+# by the capture script through Get-ToolPath / Write-LastVideoPath, read by
+# the hook runner as D4_CTX['video_path']).
 $CaptureStateFiles = @("_fps_state.txt", "_frame_range_state.txt", "_playback_state.txt", "_hud_state.json")
-$StateFiles = $CaptureStateFiles + @("_hook_context.json")
+$StateFiles = $CaptureStateFiles + @("_hook_context.json", "_last_video.txt")
 $LegacyBats = @("run_front_back.bat", "run_left_right.bat", "capture_front_back.bat", "capture_left_right.bat")
 
 function Get-ExpectedPath([string]$root, [string]$name) {

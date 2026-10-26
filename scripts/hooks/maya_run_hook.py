@@ -20,7 +20,8 @@ script runs exactly once per call (see claim_run_id).
 What it does:
   * reads the context file the launcher wrote before the run and builds the
     D4_CTX dict (run-level keys from the file + kind/leg_index/leg_axis of
-    this call);
+    this call; for POST also video_path, the video just recorded, read from
+    state\_last_video.txt -- '' when unknown, see read_last_video_path);
   * execs the user's file in a FRESH dict (nothing leaks between calls,
     nothing of this runner is visible to the user's code);
   * prints D4_HOOK_OK <kind> or D4_HOOK_ERROR <kind>: <traceback> to the
@@ -99,12 +100,45 @@ def build_context(context_path, kind, leg_index, leg_axis):
         if not isinstance(data, dict):
             raise ValueError("context file is not a JSON object")
         for key, value in data.items():
-            if key in ("kind", "leg_index", "leg_axis"):
+            if key in ("kind", "leg_index", "leg_axis", "video_path"):
                 continue
             ctx[key] = value
     except Exception as exc:
         ctx["context_error"] = "%s: %s" % (type(exc).__name__, exc)
+    if kind == "post":
+        ctx["video_path"] = read_last_video_path(ctx.get("state_dir"), context_path)
     return ctx
+
+
+LAST_VIDEO_FILE = "_last_video.txt"
+
+
+def read_last_video_path(state_dir, context_path):
+    """T87: the video the capture script just finished, for POST only.
+    maya_obs_capture.ps1 writes <scripts>\\state\\_last_video.txt (UTF-8,
+    one line, renamed path or OBS's own name) after each leg and clears it
+    when a capture starts, so a Stop click gives ''. The state folder comes
+    from the context file, else the context file's own folder (it lives in
+    the same state folder). '' whenever nothing usable is there."""
+    import os
+    folder = state_dir if isinstance(state_dir, (type(u""), str)) and state_dir else os.path.dirname(context_path or "")
+    path = os.path.join(folder, LAST_VIDEO_FILE)
+    try:
+        if not os.path.isfile(path):
+            return u""
+        import io
+        with io.open(path, "rb") as f:
+            data = f.read()
+        # T87 LOW-5: the capture script writes UTF-8; anything else is not a
+        # path we wrote, so no system-encoding fallback (that would hand the
+        # post script mojibake) -- just '
+        lines = data.decode("utf-8-sig").splitlines()
+    except Exception:
+        return u""
+    for line in lines:
+        if line.strip():
+            return line.strip()
+    return u""
 
 
 def short_error_text(exc, user_path, tb):

@@ -711,6 +711,14 @@ Check "Axis: All queues both legs (Front/Back then Left/Right) with the same Sta
     # Front/Back steps + Left/Right steps concatenated -- two independent
     # OBS capture steps = two videos. Uses Start/End (typed numbers, no
     # Maya round trip), same technique as the Start/End test above.
+    # Hermetic against this machine's REAL user_hooks\ (T97 test hygiene,
+    # done in T87): Get-CaptureClickResult adds a pre/post step per leg for
+    # any user script with code, so on a machine whose own
+    # d4_rom_pre_record.py / d4_rom_post_record.py hold code this counted 16
+    # steps instead of 12. This case counts the PLAIN legs, so the user
+    # scripts are stubbed away here (the hook steps have their own suite:
+    # tests\test_prepost_hooks.ps1). The real files are never read or touched.
+    function Get-ActiveHookPaths { param([string]$ScriptDir) return [PSCustomObject]@{ Pre = $null; Post = $null; Log = @() } }
     $leftRightRadio = $window.FindName("LeftRightRadio")
     $startEndRadio.IsChecked = $true
     $startFrameBox.Text = "10"
@@ -3790,6 +3798,152 @@ $script:lastCachePath = $null
 $script:cachedFrameArrays = $null
 $frameGateCheckBox.IsChecked = $true
 Write-FrameGateEnabled -Enabled $true
+
+# ---------------------------------------------------------------- T87 phase 2: top busy bar + async scene-name fill
+# Hermetic: Start-SceneNameProcess is replaced by a fake process object (no
+# powershell / send_to_maya / Maya), Get-SceneNameResultPath points at a temp
+# file the test writes, Get-PrefixAsyncElapsedMs returns a test clock, and
+# Update-PrefixFillAsync (the timer's tick) is called directly.
+$script:t87ResultPath = Join-Path $env:TEMP ("t87_scene_result_" + [guid]::NewGuid().ToString("N").Substring(0, 8) + ".txt")
+function New-T87FakeProcess {
+    $p = [PSCustomObject]@{ HasExited = $false; Killed = $false; Disposed = $false }
+    $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Killed = $true; $this.HasExited = $true }
+    $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
+    return $p
+}
+function Reset-T87Async {
+    if ($script:prefixAsync) { Stop-PrefixFillAsync -Silent }
+    $prefixBox.Text = ""
+    $script:prefixLastAutoFill = ""
+    $logBox.Clear()
+    Remove-Item $script:t87ResultPath -ErrorAction SilentlyContinue
+}
+
+Check "T87: Show-PrefixBusy / Hide-PrefixBusy show and hide the top bar (never left visible)" {
+    $bar = $window.FindName("TopBusyBar")
+    if ($bar.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "bar not collapsed at start" }
+    Show-PrefixBusy
+    if ($bar.Visibility -ne [System.Windows.Visibility]::Visible) { throw "Show-PrefixBusy did not show it" }
+    Hide-PrefixBusy
+    if ($bar.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "Hide-PrefixBusy did not hide it" }
+    Hide-PrefixBusy
+    if ($bar.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "a second hide changed it" }
+}
+
+Check "T87: async fill -- one process, bar while waiting, completion fills the box, bar hidden, one log line" {
+    Reset-T87Async
+    $script:t87Starts = 0
+    function Get-SceneNameResultPath { return $script:t87ResultPath }
+    function Start-SceneNameProcess { param([int]$TimeoutMs) $script:t87Starts++; $script:t87Proc = New-T87FakeProcess; return $script:t87Proc }
+    function Get-PrefixAsyncElapsedMs { return 200 }
+    try {
+        if (-not (Start-PrefixFillAsync -Trigger "Maya connected")) { throw "did not start" }
+        if ($window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Visible) { throw "bar not shown while waiting" }
+        if (Start-PrefixFillAsync -Trigger "Maya connected") { throw "a second fill started while one runs" }
+        if ($script:t87Starts -ne 1) { throw "$($script:t87Starts) processes started" }
+        Update-PrefixFillAsync
+        if (-not $script:prefixAsync) { throw "finished before the process exited" }
+        [IO.File]::WriteAllText($script:t87ResultPath, "SCENE_NAME scene_a`n")
+        $script:t87Proc.HasExited = $true
+        Update-PrefixFillAsync
+        if ($prefixBox.Text -cne "scene_a") { throw "box '$($prefixBox.Text)'" }
+        if ($script:prefixLastAutoFill -cne "scene_a") { throw "last auto fill '$($script:prefixLastAutoFill)'" }
+        if ($script:prefixAsync) { throw "state not cleared" }
+        if ($window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "bar still visible" }
+        if ($prefixHint.Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "hint still visible over the text" }
+        $lines = @($logBox.Text -split "`n" | Where-Object { $_ -like "Prefix*" })
+        if ($lines.Count -ne 1 -or $lines[0] -notlike "*scene_a*") { throw "log: $($logBox.Text)" }
+        if (-not $script:t87Proc.Disposed) { throw "process not disposed" }
+    } finally { Reset-T87Async }
+}
+
+Check "T87: async fill time-out -> process killed, bar hidden, box unchanged, ONE log line" {
+    Reset-T87Async
+    function Get-SceneNameResultPath { return $script:t87ResultPath }
+    function Start-SceneNameProcess { param([int]$TimeoutMs) $script:t87Proc = New-T87FakeProcess; return $script:t87Proc }
+    $script:t87Clock = 100
+    function Get-PrefixAsyncElapsedMs { return $script:t87Clock }
+    try {
+        Start-PrefixFillAsync -Trigger "Maya already open" | Out-Null
+        Update-PrefixFillAsync
+        $script:t87Clock = 60000
+        Update-PrefixFillAsync
+        if (-not $script:t87Proc.Killed) { throw "process not killed" }
+        if ($script:prefixAsync) { throw "state not cleared" }
+        if ($window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "bar stuck visible" }
+        if ($prefixBox.Text -ne "") { throw "box changed to '$($prefixBox.Text)'" }
+        $lines = @($logBox.Text -split "`n" | Where-Object { $_ -like "Prefix*" })
+        if ($lines.Count -ne 1 -or $lines[0] -notlike "*did not answer*") { throw "log: $($logBox.Text)" }
+        Update-PrefixFillAsync
+        if (@($logBox.Text -split "`n" | Where-Object { $_ -like "Prefix*" }).Count -ne 1) { throw "a later tick logged again" }
+    } finally { Reset-T87Async }
+}
+
+Check "T87: async completion never touches text typed while it was running; stale value is refreshed" {
+    Reset-T87Async
+    function Get-SceneNameResultPath { return $script:t87ResultPath }
+    function Start-SceneNameProcess { param([int]$TimeoutMs) $script:t87Proc = New-T87FakeProcess; return $script:t87Proc }
+    function Get-PrefixAsyncElapsedMs { return 300 }
+    try {
+        Start-PrefixFillAsync -Trigger "Maya connected" | Out-Null
+        $prefixBox.Text = "my_take"
+        [IO.File]::WriteAllText($script:t87ResultPath, "SCENE_NAME scene_a`n")
+        $script:t87Proc.HasExited = $true
+        Update-PrefixFillAsync
+        if ($prefixBox.Text -cne "my_take") { throw "typed text replaced by '$($prefixBox.Text)'" }
+        if ($window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "bar stuck" }
+        # stale rule: an unedited auto-filled value follows the next scene
+        $prefixBox.Text = "scene_a"; $script:prefixLastAutoFill = "scene_a"
+        Start-PrefixFillAsync -Trigger "Maya connected" | Out-Null
+        [IO.File]::WriteAllText($script:t87ResultPath, "SCENE_NAME scene_b`n")
+        $script:t87Proc.HasExited = $true
+        Update-PrefixFillAsync
+        if ($prefixBox.Text -cne "scene_b") { throw "stale value not refreshed: '$($prefixBox.Text)'" }
+    } finally { Reset-T87Async }
+}
+
+Check "T87: async fill is skipped during a run and discarded if a run starts meanwhile (bar hidden)" {
+    Reset-T87Async
+    function Get-SceneNameResultPath { return $script:t87ResultPath }
+    $script:t87Starts = 0
+    function Start-SceneNameProcess { param([int]$TimeoutMs) $script:t87Starts++; $script:t87Proc = New-T87FakeProcess; return $script:t87Proc }
+    function Get-PrefixAsyncElapsedMs { return 300 }
+    $saved = $script:currentProcess
+    try {
+        $script:currentProcess = [PSCustomObject]@{ HasExited = $false }
+        if (Start-PrefixFillAsync -Trigger "Maya connected") { throw "started during a run" }
+        if ($script:t87Starts -ne 0) { throw "a process was started during a run" }
+        $script:currentProcess = $null
+        Start-PrefixFillAsync -Trigger "Maya connected" | Out-Null
+        $script:currentProcess = [PSCustomObject]@{ HasExited = $false }
+        [IO.File]::WriteAllText($script:t87ResultPath, "SCENE_NAME scene_a`n")
+        $script:t87Proc.HasExited = $true
+        Update-PrefixFillAsync
+        if ($prefixBox.Text -ne "") { throw "applied during a run: '$($prefixBox.Text)'" }
+        if ($script:prefixAsync -or $window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "not cleaned up" }
+    } finally {
+        $script:currentProcess = $saved
+        Reset-T87Async
+    }
+}
+
+Check "T87: a sync click fill cancels an in-flight async fill first (no two processes writing one result file)" {
+    Reset-T87Async
+    function Get-SceneNameResultPath { return $script:t87ResultPath }
+    function Start-SceneNameProcess { param([int]$TimeoutMs) $script:t87Proc = New-T87FakeProcess; return $script:t87Proc }
+    function Get-PrefixAsyncElapsedMs { return 300 }
+    function Get-MayaSceneName { param([int]$TimeoutMs) return [PSCustomObject]@{ Status = "Named"; Name = "scene_sync"; ErrorMessage = $null } }
+    try {
+        Start-PrefixFillAsync -Trigger "Maya connected" | Out-Null
+        $first = $script:t87Proc
+        $line = Update-PrefixFromScene -Trigger "Start Recording"
+        if (-not $first.Killed) { throw "in-flight async fill not cancelled" }
+        if ($script:prefixAsync) { throw "async state left" }
+        if ($prefixBox.Text -cne "scene_sync") { throw "sync fill result '$($prefixBox.Text)'" }
+        if ($window.FindName("TopBusyBar").Visibility -ne [System.Windows.Visibility]::Collapsed) { throw "bar stuck" }
+    } finally { Reset-T87Async }
+}
+Remove-Item $script:t87ResultPath -ErrorAction SilentlyContinue
 
 Write-Output "$passed passed, $($failures.Count) failed"
 foreach ($f in $failures) { Write-Output "FAIL: $f" }

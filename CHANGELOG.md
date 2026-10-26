@@ -1,3 +1,13 @@
+## 1.2.0 - 2026-10-26
+
+- Added: ROM video prefix box (last row of Settings, with a 'use scene name' button) filled from the Maya scene name on Preview, Start Recording, first connect and launch; never overwrites text you typed, follows a scene change while you have not edited it.
+- Added: after each video the file is renamed {prefix}_front_back_HH_mm / {prefix}_left_right_HH_mm (local time; _2, _3 if the name exists, never overwritten; empty prefix = no rename, as before; Stop keeps OBS's own name; any rename problem only warns and keeps the original).
+- Added: the post script gets the final path in D4_CTX['video_path'].
+- Added: a back-and-forth progress bar across the top of the window while the scene name is read on connect/launch (background fill, 3 s time-out).
+- Fixed: a video already carrying the final name is kept, invisible Unicode characters are ignored in the prefix, video path is always written with backslashes, an unreadable last-video file gives an empty path.
+- Added tests: prefix naming (67 checks), rename-step tests with a fake OBS WebSocket, integration cases.
+- Known limit: the OBS Stop reply was verified in one real recording only.
+
 ## 1.1.0 - 2026-10-21
 
 - Added: Pre-Post Recording - two scripts, d4_rom_pre_record.py and d4_rom_post_record.py, in the new user_hooks folder (created on first start from empty templates, never overwritten) run inside Maya before and after each video (axis All = two videos); a failing pre script aborts the recording, a failing post script only warns, Stop runs post if pre ran.

@@ -445,7 +445,98 @@ def t_m18_cap_keeps_recent_ids():
     assert len(getattr(_sys, "_d4_rom_hook_run_ids")) <= cap, "registry grew past the cap"
 
 
+def _t87_ctx_for(kind, ctx_path, user_name):
+    """Runs a user file that dumps D4_CTX and returns the dict."""
+    user = os.path.join(TMP, user_name)
+    out_path = os.path.join(TMP, user_name + ".json")
+    write(user, "import json\nwith open(%r, 'w') as f:\n    json.dump(D4_CTX, f)\n" % out_path)
+    raised, printed = run_payload(TMP, kind, user, ctx_path)
+    assert raised is None, "unexpected raise: %s" % raised
+    with io.open(out_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _t87_write_last_video(folder, text):
+    with io.open(os.path.join(folder, "_last_video.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def t_t87_video_path_post_only():
+    video = u"D:\\rec\\\u30c6\u30b9\u30c8_front_back.mp4"
+    _t87_write_last_video(TMP, video + u"\n")
+    try:
+        post = _t87_ctx_for("post", CTX_PATH, "t87_post.py")
+        assert post.get("video_path") == video, post
+        pre = _t87_ctx_for("pre", CTX_PATH, "t87_pre.py")
+        assert "video_path" not in pre, pre
+    finally:
+        os.remove(os.path.join(TMP, "_last_video.txt"))
+
+
+def t_t87_video_path_empty_when_unavailable():
+    empty_state = tempfile.mkdtemp(prefix="t87_state_", dir=TMP)
+    ctx_path = os.path.join(empty_state, "_hook_context.json")
+    write(ctx_path, json.dumps({"axis": "FrontBack", "state_dir": empty_state}))
+    post = _t87_ctx_for("post", ctx_path, "t87_post_missing.py")
+    assert post.get("video_path") == "", post
+    _t87_write_last_video(empty_state, u"   \n")
+    post = _t87_ctx_for("post", ctx_path, "t87_post_blank.py")
+    assert post.get("video_path") == "", post
+
+
+def t_t87_video_path_context_file_cannot_inject():
+    state = tempfile.mkdtemp(prefix="t87_inject_", dir=TMP)
+    ctx_path = os.path.join(state, "_hook_context.json")
+    write(ctx_path, json.dumps({"axis": "FrontBack", "state_dir": state, "video_path": "C:\\bogus.mp4"}))
+    pre = _t87_ctx_for("pre", ctx_path, "t87_pre_inject.py")
+    assert "video_path" not in pre, pre
+    _t87_write_last_video(state, u"C:\\real\\take_left_right.mkv")
+    post = _t87_ctx_for("post", ctx_path, "t87_post_inject.py")
+    assert post.get("video_path") == "C:\\real\\take_left_right.mkv", post
+
+
+def t_t87_video_path_falls_back_to_context_folder():
+    state = tempfile.mkdtemp(prefix="t87_fallback_", dir=TMP)
+    ctx_path = os.path.join(state, "_hook_context.json")  # never written: context_error
+    _t87_write_last_video(state, u"C:\\v\\take_front_back.mp4")
+    post = _t87_ctx_for("post", ctx_path, "t87_post_fallback.py")
+    assert "context_error" in post, post
+    assert post.get("video_path") == "C:\\v\\take_front_back.mp4", post
+
+
+def t_t87_video_path_undecodable_is_empty():
+    state = tempfile.mkdtemp(prefix="t87_bad_", dir=TMP)
+    ctx_path = os.path.join(state, "_hook_context.json")
+    write(ctx_path, json.dumps({"axis": "FrontBack", "state_dir": state}))
+    with io.open(os.path.join(state, "_last_video.txt"), "wb") as f:
+        f.write(b"D:\\rec\\\xe9t\xe9.mp4\n")  # Windows-1252 bytes, not UTF-8
+    import locale
+    saved = locale.getpreferredencoding
+    # a machine whose system code page is Windows-1252 would decode this as
+    # mojibake through read_text_file's fallback; the video path must not
+    locale.getpreferredencoding = lambda *a, **k: "cp1252"
+    try:
+        post = _t87_ctx_for("post", ctx_path, "t87_post_bad.py")
+    finally:
+        locale.getpreferredencoding = saved
+    assert post.get("video_path") == "", post
+
+
+def t_t87_post_template_documents_video_path():
+    with io.open(os.path.join(TEMPLATE_DIR, "d4_rom_post_record.py"), "r", encoding="ascii") as f:
+        text = f.read()
+    assert "video_path" in text, "post template does not mention video_path"
+    with io.open(os.path.join(TEMPLATE_DIR, "d4_rom_pre_record.py"), "r", encoding="ascii") as f:
+        assert "video_path" not in f.read(), "pre template must not offer video_path"
+
+
 for _name, _fn in [
+    ("T87: video_path in D4_CTX for POST only", t_t87_video_path_post_only),
+    ("T87: video_path is '' when the file is missing or blank", t_t87_video_path_empty_when_unavailable),
+    ("T87: the context file cannot inject video_path", t_t87_video_path_context_file_cannot_inject),
+    ("T87: video_path found next to a missing context file", t_t87_video_path_falls_back_to_context_folder),
+    ("T87: post template documents video_path, pre does not", t_t87_post_template_documents_video_path),
+    ("T87 LOW-5: undecodable _last_video.txt gives video_path ''", t_t87_video_path_undecodable_is_empty),
     ("runner file exists, ASCII, no BOM", t_runner_exists),
     ("loading without D4_HOOK_KIND only defines functions", t_load_without_kind_runs_nothing),
     ("comment/blank-only rule", t_has_code_rule),

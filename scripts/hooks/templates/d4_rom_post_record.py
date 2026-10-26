@@ -14,7 +14,10 @@
 #                   or All), leg_axis (this video's axis), leg_index
 #                   (0 or 1), leg_count (1 or 2), start_frame, end_frame
 #                   (None when recording all frames), tool_version,
-#                   scripts_dir, state_dir
+#                   scripts_dir, state_dir, video_path (full path of the
+#                   video just recorded, after the ROM video prefix rename,
+#                   e.g. ..._front_back_14_32.mp4; '' when
+#                   OBS did not report it or after a Stop click)
 #
 # An error here is only a WARNING: it is written to the log and the run
 # carries on (the next video and the final reset still happen).

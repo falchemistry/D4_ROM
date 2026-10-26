@@ -15,10 +15,24 @@
 # the ORIGINAL range is queried first and restored after the capture
 # finishes (success or failure), so a quick sample capture never silently
 # leaves a subsequent full-range capture recording a narrowed clip.
+#
+# T87: -NamePrefix (the launcher's Prefix box, already sanitized) and
+# -LegAxis (FrontBack/LeftRight) rename this leg's video to
+# {prefix}_front_back_HH_mm.<ext> / {prefix}_left_right_HH_mm.<ext> right
+# after OBS stops (HH_mm = local rename time, e.g. barM_x_front_back_14_32.mp4;
+# next free _2, _3 ... if taken; never overwrites). The path comes
+# from OBS's StopRecord reply, else its RecordStateChanged STOPPED event,
+# else the video keeps OBS's own name with one WARNING. A rename problem is
+# only a WARNING. Without -NamePrefix nothing is renamed (OBS's names, as
+# before). Either way the final path (or "" if OBS reported none) goes to
+# scripts\state\_last_video.txt for the post-record script.
+#   powershell -File maya_obs_capture.ps1 -NamePrefix barM_v2 -LegAxis FrontBack
 
 param(
     [Nullable[int]]$StartFrame = $null,
-    [Nullable[int]]$EndFrame = $null
+    [Nullable[int]]$EndFrame = $null,
+    [string]$NamePrefix = "",
+    [string]$LegAxis = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -317,6 +331,30 @@ function Receive-WsMessage($ws) {
     return $text | ConvertFrom-Json
 }
 
+function Receive-WsMessageTimed($ws, [int]$TimeoutMs) {
+    # Receive-WsMessage with a deadline (T87: waiting for the
+    # RecordStateChanged event after StopRecord). $null on timeout or a
+    # closed socket -- a cancelled receive aborts the socket, which is fine:
+    # this is only used as the last read before closing it.
+    if ($TimeoutMs -le 0) { return $null }
+    $buffer = New-Object byte[] 65536
+    $segment = [System.ArraySegment[byte]]::new($buffer)
+    $all = New-Object System.IO.MemoryStream
+    $cts = New-Object System.Threading.CancellationTokenSource($TimeoutMs)
+    try {
+        do {
+            $result = $ws.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
+            $all.Write($buffer, 0, $result.Count)
+        } while (-not $result.EndOfMessage)
+    } catch {
+        return $null
+    } finally {
+        $cts.Dispose()
+    }
+    $text = [System.Text.Encoding]::UTF8.GetString($all.ToArray())
+    try { return ($text | ConvertFrom-Json) } catch { return $null }
+}
+
 function Get-AuthString($password, $salt, $challenge) {
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     $secret = [Convert]::ToBase64String($sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($password + $salt)))
@@ -531,32 +569,99 @@ function Repair-MonitorCaptureSourceBinding() {
     }
 }
 
-function Invoke-ObsRecordAction($action) {
+function Invoke-ObsRecordAction($action, [int]$WaitForOutputPathMs = 0) {
+    # T87: returns what OBS said (Messages = every message read on this
+    # connection, OutputPath/Source from Get-ObsRecordOutputPath) instead of
+    # discarding it. For StopRecord with -WaitForOutputPathMs > 0 and no
+    # outputPath in the reply, keeps reading up to that long for the
+    # RecordStateChanged STOPPED event (OBS WebSocket v5 documents
+    # outputPath in both; the live reply shape is logged for the QA probe).
     $ws = Connect-ObsWebSocket
     $requestType = if ($action -eq "start") { "StartRecord" } else { "StopRecord" }
     $requestId = [Guid]::NewGuid().ToString()
     Send-WsMessage $ws @{ op = 6; d = @{ requestType = $requestType; requestId = $requestId } }
 
+    $seen = New-Object System.Collections.ArrayList
     $response = $null
-    for ($i = 0; $i -lt 10; $i++) {
-        $msg = Receive-WsMessage $ws
-        if ($msg.op -eq 7 -and $msg.d.requestId -eq $requestId) { $response = $msg; break }
+    $found = $null
+    try {
+        for ($i = 0; $i -lt 10; $i++) {
+            $msg = Receive-WsMessage $ws
+            [void]$seen.Add($msg)
+            if ($msg.op -eq 7 -and $msg.d.requestId -eq $requestId) { $response = $msg; break }
+        }
+        if ($response -and $response.d.requestStatus.result -and $requestType -eq "StopRecord") {
+            $found = Get-ObsRecordOutputPath -Messages @($seen) -RequestId $requestId
+            if (-not $found.Path -and $WaitForOutputPathMs -gt 0) {
+                Write-Host "OBS StopRecord reply has no outputPath -- waiting up to $([Math]::Round($WaitForOutputPathMs / 1000.0, 1)) s for the RecordStateChanged event..."
+                $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitForOutputPathMs)
+                while (-not $found.Path) {
+                    $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+                    if ($left -le 0) { break }
+                    $evt = Receive-WsMessageTimed $ws $left
+                    if ($null -eq $evt) { break }
+                    [void]$seen.Add($evt)
+                    $found = Get-ObsRecordOutputPath -Messages @($seen) -RequestId $requestId
+                }
+            }
+            Write-Host "OBS messages after StopRecord: $(Format-ObsMessageSummary -Messages @($seen))"
+        }
+    } finally {
+        try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).Wait(2000) | Out-Null } catch {}
     }
-    try { $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).Wait() } catch {}
 
     if (-not $response -or -not $response.d.requestStatus.result) {
         throw "OBS $requestType failed: $($response | ConvertTo-Json -Depth 5)"
     }
     Write-Host "OBS $requestType succeeded."
+    if (-not $found) { $found = [PSCustomObject]@{ Path = ""; Source = "none" } }
+    return [PSCustomObject]@{ RequestType = $requestType; OutputPath = $found.Path; Source = $found.Source; Messages = @($seen) }
+}
+
+function Complete-RecordedVideo($stopInfo) {
+    # T87, after OBS stopped (and after the HUD/range/taskbar restore):
+    # rename this leg's video when a prefix was given, then record the
+    # final path for the post-record script. Never throws -- a problem here
+    # is a WARNING and the post-record script, the next leg and the final
+    # reset still run.
+    try {
+        $videoPath = if ($stopInfo) { [string]$stopInfo.OutputPath } else { "" }
+        if ($videoPath) { Write-Host "OBS saved the video as: $videoPath (from the $($stopInfo.Source))" }
+        if ($SafeNamePrefix) {
+            if (-not $videoPath) {
+                Write-Host "WARNING: OBS did not report the video file path (StopRecord reply and RecordStateChanged event) -- the video keeps OBS's own name."
+            } else {
+                $rename = Rename-RecordedVideo -SourcePath $videoPath -Prefix $SafeNamePrefix -LegAxis $LegAxis
+                foreach ($line in @($rename.Log)) { Write-Host $line }
+                $videoPath = $rename.Path
+            }
+        }
+        Write-LastVideoPath -ScriptDir $ScriptDir -Path $videoPath | Out-Null
+    } catch {
+        Write-Host "WARNING: could not finish the video name step: $($_.Exception.Message)"
+    }
 }
 
 # --- Capture sequence ------------------------------------------------------
 # Taskbar is hidden for the duration and always restored in `finally`, even
 # if something throws (OBS unreachable, Maya error, etc.) -- never leave the
 # user's taskbar missing after a failed run.
+# T87: the prefix is sanitized once more here (idempotent), and a bad leg
+# name only disables the rename (a WARNING), never the recording.
+$SafeNamePrefix = Get-SafePrefix -Prefix $NamePrefix
+if ($SafeNamePrefix -and $LegAxis -ne "FrontBack" -and $LegAxis -ne "LeftRight") {
+    Write-Host "WARNING: -NamePrefix given without a valid -LegAxis ('$LegAxis') -- the video keeps OBS's own name."
+    $SafeNamePrefix = ""
+}
+if ($SafeNamePrefix) { Write-Host "Video name for this leg: $SafeNamePrefix`_$(Get-LegSuffix -LegAxis $LegAxis)_HH_mm.<ext>" }
+# Cleared before anything else, so a capture that is killed (Stop click)
+# never leaves the previous video's path for the post-record script.
+try { Write-LastVideoPath -ScriptDir $ScriptDir -Path "" | Out-Null } catch { Write-Host "WARNING: could not clear _last_video.txt: $($_.Exception.Message)" }
+
 Hide-Taskbar
 $originalRange = $null
 $originalHud = $null
+$stopInfo = $null
 try {
     Ensure-ObsRunning
     Repair-MonitorCaptureSourceBinding
@@ -597,7 +702,7 @@ try {
     Write-Host "  HUD forced on for the capture panel(s): $($TargetHudItems -join ', ')"
 
     Write-Host "Starting OBS recording..."
-    Invoke-ObsRecordAction "start"
+    Invoke-ObsRecordAction "start" | Out-Null
 
     Write-Host "Starting Maya playback..."
     Send-MayaCode "import maya.cmds as cmds`ncmds.play(forward=True)`n"
@@ -611,7 +716,10 @@ try {
     }
 
     Write-Host "Playback ended. Stopping OBS recording..."
-    Invoke-ObsRecordAction "stop"
+    # T87: wait for the STOPPED event only when a rename needs the path (an
+    # empty prefix keeps today's timing: the reply alone is used).
+    $waitMs = if ($SafeNamePrefix) { 10000 } else { 0 }
+    $stopInfo = Invoke-ObsRecordAction "stop" -WaitForOutputPathMs $waitMs
 
     Write-Host "Capture complete."
 } finally {
@@ -625,4 +733,8 @@ try {
         Clear-MayaHudStateFile
     }
     Show-Taskbar
+    # T87: only after a successful StopRecord; after the restores above so
+    # the artist's HUD/range come back first even if OBS still holds the
+    # file for a few seconds (the rename retries ~10 s).
+    if ($stopInfo -ne $null) { Complete-RecordedVideo $stopInfo }
 }

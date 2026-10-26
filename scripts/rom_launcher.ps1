@@ -28,7 +28,7 @@ $ScriptDir = $PSScriptRoot
 # count) -- shown in the window title so a user/screenshot/bug report can
 # say which build they're on, and so a stale d4_rom_dist copy is
 # distinguishable from the current source at a glance.
-$script:ToolVersion = "1.1.0"
+$script:ToolVersion = "1.2.0"
 
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -328,6 +328,26 @@ $script:ToolVersion = "1.1.0"
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
+        <!-- T87 top busy bar (look C, user pick form_t87_bar): 3 px across
+             the very top of the window, visible on every tab, shown only
+             while the async scene-name fill runs (Show-PrefixBusy /
+             Hide-PrefixBusy). An OVERLAY of the root grid (RowSpan 2,
+             ZIndex on top, the -5 margin cancels the root's 5 px margin),
+             so it changes no layout and the window height stays the same.
+             Same track/fill colours as the ProgressBar style above; the
+             custom ProgressBar template has no indeterminate animation, so
+             the segment is a Rectangle moved back and forth by a
+             Storyboard on its TranslateTransform.X (AutoReverse, Forever). -->
+        <Border x:Name="TopBusyBar" Grid.Row="0" Grid.RowSpan="2" Panel.ZIndex="100" VerticalAlignment="Top" Height="3" Margin="-5,-5,-5,0"
+                Background="#FF1C1C1C" ClipToBounds="True" IsHitTestVisible="False" Visibility="Collapsed"
+                AutomationProperties.Name="Reading the Maya scene name">
+            <Rectangle x:Name="TopBusyBarSegment" Fill="#FFD0D0D0" HorizontalAlignment="Left" Width="0">
+                <Rectangle.RenderTransform>
+                    <TranslateTransform X="0"/>
+                </Rectangle.RenderTransform>
+            </Rectangle>
+        </Border>
+
         <!-- Tab bar: two plain Buttons toggling which panel below is
              Visible, rather than a native TabControl. This reuses the
              already dark-styled Button (and the same Visibility-toggle
@@ -399,7 +419,11 @@ $script:ToolVersion = "1.1.0"
              Each is a one-time-per-machine or rarely-touched setup
              concern, so they're grouped under their own tab rather than
              sharing space with the per-run Capture controls. -->
-        <StackPanel x:Name="SettingsPanel" Visibility="Collapsed">
+        <!-- Grid.IsSharedSizeScope (T87): the Prefix row's label column
+             shares SharedSizeGroup "SettingsLabel" with the Recording
+             Monitor row, so the Prefix box starts exactly where the
+             monitor ComboBox does, even when the monitor label wraps. -->
+        <StackPanel x:Name="SettingsPanel" Visibility="Collapsed" Grid.IsSharedSizeScope="True">
             <!-- Every row is the same Grid shape: a status dot (uniform
                  size/position across all three rows, so they visually line
                  up in a clean column) plus label on the left in a
@@ -560,7 +584,7 @@ $script:ToolVersion = "1.1.0"
                  1920x1080 @ 0,0 (Primary Monitor)") and need the room. -->
             <Grid Margin="0,0,0,10">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="SettingsLabel"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
@@ -599,6 +623,37 @@ $script:ToolVersion = "1.1.0"
                               Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3" Fill="Transparent"/>
                         <Polygon Points="7.60,1.57 10.15,1.54 8.85,3.80"
                                  Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                    </Canvas>
+                </Button>
+            </Grid>
+
+            <!-- T87 Prefix row (look V3, user pick form_t87_decide): the
+                 start of the video file names. Label column shared with the
+                 Monitor row above (no status dot: the 16 px left margin is
+                 the dot's 10 px + 6 px gap). WPF has no placeholder, so
+                 PrefixHint is an overlay TextBlock, shown only while the box
+                 is empty (Update-PrefixHint). The button sits in the
+                 Refresh-button slot and replaces the text with the open
+                 Maya scene name on demand. -->
+            <Grid Margin="0,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="SettingsLabel"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" x:Name="PrefixLabel" Text="ROM video prefix" Foreground="#FFA0A0A0" VerticalAlignment="Center" Margin="16,0,10,0"/>
+                <Grid Grid.Column="1">
+                    <TextBox x:Name="PrefixBox" Height="32" VerticalContentAlignment="Center" Padding="6,3"
+                             ToolTip="Start of the video file names: PREFIX_front_back_HH_mm / PREFIX_left_right_HH_mm (HH_mm = the time the video is renamed). Filled from the open Maya scene name when empty; type to override. Empty keeps OBS's own names."/>
+                    <TextBlock x:Name="PrefixHint" Text="auto from the Maya scene name" IsHitTestVisible="False" Foreground="#FF808080" FontStyle="Italic"
+                               VerticalAlignment="Center" Margin="9,0,0,0" Visibility="Visible"/>
+                </Grid>
+                <Button Grid.Column="2" x:Name="PrefixFromSceneButton" Width="36" Height="32" Padding="0" Margin="6,0,0,0" AutomationProperties.Name="Use the Maya scene name"
+                        ToolTip="Fill the box from the open Maya scene name now.">
+                    <!-- page with a folded corner: the Maya scene file -->
+                    <Canvas Width="14" Height="14">
+                        <Path Data="M 3,1.5 L 8.5,1.5 L 11.5,4.5 L 11.5,12.5 L 3,12.5 Z M 8.5,1.5 L 8.5,4.5 L 11.5,4.5"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3" Fill="Transparent" StrokeLineJoin="Round"/>
                     </Canvas>
                 </Button>
             </Grid>
@@ -923,6 +978,12 @@ $monitorStatusDot = $window.FindName("MonitorStatusDot")
 $monitorStatusLabel = $window.FindName("MonitorStatusLabel")
 $monitorComboBox = $window.FindName("MonitorComboBox")
 $monitorRefreshButton = $window.FindName("MonitorRefreshButton")
+$prefixLabel = $window.FindName("PrefixLabel")
+$prefixBox = $window.FindName("PrefixBox")
+$prefixHint = $window.FindName("PrefixHint")
+$prefixFromSceneButton = $window.FindName("PrefixFromSceneButton")
+$topBusyBar = $window.FindName("TopBusyBar")
+$topBusyBarSegment = $window.FindName("TopBusyBarSegment")
 $frontBackRadio = $window.FindName("FrontBackRadio")
 $allAxisRadio = $window.FindName("AllAxisRadio")
 $timeSliderRadio = $window.FindName("TimeSliderRadio")
@@ -1115,7 +1176,22 @@ function Update-PortStatusIndicator {
 
 $script:portCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:portCheckTimer.Interval = [TimeSpan]::FromSeconds(5)
-$script:portCheckTimer.Add_Tick({ Update-PortStatusIndicator | Out-Null; Update-HookStatusIndicator })
+$script:portCheckTimer.Add_Tick({ Invoke-PortCheckTick })
+
+function Invoke-PortCheckTick {
+    # The 5 s tick: port dot + hook dot as before, plus (T87) the Prefix
+    # fill on FIRST connect -- Maya's port going unreachable -> reachable
+    # (Test-PrefixConnectFillDue). Never while a run is active (its click
+    # already filled the box, and the port is busy with the run's steps).
+    $reachable = Update-PortStatusIndicator
+    Update-HookStatusIndicator
+    $due = Test-PrefixConnectFillDue -WasReachable $script:lastPortReachable -IsReachable $reachable
+    $script:lastPortReachable = $reachable
+    if ($due -and $script:currentProcess -eq $null) {
+        # async: the window keeps responding and the top bar animates
+        Start-PrefixFillAsync -Trigger "Maya connected" | Out-Null
+    }
+}
 
 # Same warning amber as MayaSkinningCheck's SEVERITY_COLORS["warning"]
 # (akStyle.py, rgb(239, 192, 84)) -- "no cache yet" is informational (the
@@ -1226,6 +1302,242 @@ function Get-AnimationRange {
         return ConvertFrom-AnimationRangeOutput -Output ""
     }
     return ConvertFrom-AnimationRangeOutput -Output (Get-Content $resultPath -Raw)
+}
+
+# --- Prefix box (T87) -------------------------------------------------------
+# The Prefix box (Settings tab, last row, label "ROM video prefix") names the
+# videos {prefix}_front_back_HH_mm.<ext> / {prefix}_left_right_HH_mm.<ext>
+# (local rename time, e.g. barM_x_front_back_14_32.mp4). It is filled from
+# the open Maya scene name only when that is allowed by
+# Get-PrefixFillDecision (rom_launcher_logic.ps1: empty box, or still the
+# last auto-filled value = the stale rule; the button always): on Preview,
+# on Start Recording (after its requirements gate, before the steps are
+# built), on the first connect to Maya's port, and once after launch when
+# Maya is already up. Read ONCE per Start Recording click
+# (Get-RecordingNamePrefix), so both legs of "All" share it.
+
+function Get-MayaSceneName {
+    # Same synchronous, bounded, file-based-result pattern as
+    # Get-AnimationRange, querying maya_get_scene_name.py. Read-only on the
+    # Maya side; safe under the command port's double execution (the
+    # script overwrites one line). TimeoutMs is short (1500) because the
+    # first-connect fill runs on the UI thread.
+    param([int]$TimeoutMs = 1500)
+    $queryScript = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_get_scene_name.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $resultPath = Get-SceneNameResultPath
+    Remove-Item $resultPath -ErrorAction SilentlyContinue
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$sendToMaya`" -ScriptPath `"$queryScript`" -TimeoutMs $TimeoutMs"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.Start() | Out-Null
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit($TimeoutMs + 4000) | Out-Null
+    Write-NoteworthyMayaOutput "Scene name check" $stdout
+
+    if (-not (Test-Path -LiteralPath $resultPath)) {
+        return ConvertFrom-SceneNameOutput -Output ""
+    }
+    # UTF-8 explicitly: a non-ASCII scene name must not come back as '?'
+    return ConvertFrom-SceneNameOutput -Output ([IO.File]::ReadAllText($resultPath, (New-Object System.Text.UTF8Encoding($false))))
+}
+
+function Get-SceneNameResultPath {
+    # The file maya_get_scene_name.py writes (its default RESULT_PATH). Own
+    # function so tests can point it at a temp file.
+    return (Join-Path $ScriptDir "..\d4_anim_sample\_scene_name_result.txt")
+}
+
+function Show-PrefixBusy {
+    # T87 top busy bar (look C): shows TopBusyBar and starts the segment's
+    # back-and-forth sweep (Get-BusyBarGeometry: 30% wide, X 0 -> Travel,
+    # AutoReverse, Forever). Only the ASYNC fill uses it: a synchronous call
+    # blocks the UI thread, so the bar could never be drawn or animated there.
+    $width = $topBusyBar.ActualWidth
+    if ($width -le 0) { $width = $window.ActualWidth }
+    if ($width -le 0) { $width = $window.Width }
+    $geo = Get-BusyBarGeometry -BarWidth $width -Fraction 0
+    $topBusyBarSegment.Width = $geo.SegmentWidth
+    $topBusyBar.Visibility = [System.Windows.Visibility]::Visible
+    try {
+        $anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+        $anim.From = 0
+        $anim.To = [double]$geo.Travel
+        $anim.Duration = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(900))
+        $anim.AutoReverse = $true
+        $anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+        $sb = New-Object System.Windows.Media.Animation.Storyboard
+        [System.Windows.Media.Animation.Storyboard]::SetTarget($anim, $topBusyBarSegment)
+        [System.Windows.Media.Animation.Storyboard]::SetTargetProperty($anim, (New-Object System.Windows.PropertyPath("(UIElement.RenderTransform).(TranslateTransform.X)")))
+        $sb.Children.Add($anim)
+        if ($script:prefixBusyStoryboard) { $script:prefixBusyStoryboard.Stop($topBusyBarSegment) }
+        $script:prefixBusyStoryboard = $sb
+        $sb.Begin($topBusyBarSegment, $true)
+    } catch {
+        # the bar still shows (static) if the animation cannot start
+    }
+}
+
+function Hide-PrefixBusy {
+    # Hides the top bar and stops its animation. Safe to call any number of
+    # times (every finish path of the async fill calls it).
+    try {
+        if ($script:prefixBusyStoryboard) { $script:prefixBusyStoryboard.Stop($topBusyBarSegment) }
+    } catch {}
+    $script:prefixBusyStoryboard = $null
+    $topBusyBar.Visibility = [System.Windows.Visibility]::Collapsed
+}
+
+function Start-SceneNameProcess {
+    # Starts send_to_maya.ps1 with maya_get_scene_name.py WITHOUT waiting
+    # (no redirected output, so it can never block on a full pipe). Own
+    # function so tests can hand back a fake process.
+    param([int]$TimeoutMs = 1500)
+    $queryScript = Get-ToolPath -ScriptDir $ScriptDir -Name "maya_get_scene_name.py"
+    $sendToMaya = Get-ToolPath -ScriptDir $ScriptDir -Name "send_to_maya.ps1"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell"
+    $psi.Arguments = "-ExecutionPolicy Bypass -File `"$sendToMaya`" -ScriptPath `"$queryScript`" -TimeoutMs $TimeoutMs"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.Start() | Out-Null
+    return $proc
+}
+
+function Get-PrefixAsyncElapsedMs {
+    # Milliseconds since the async fill started. Own function so tests can
+    # drive the time-out without waiting.
+    if (-not $script:prefixAsync) { return 0 }
+    return $script:prefixAsync.Watch.Elapsed.TotalMilliseconds
+}
+
+# The async fill's 100 ms poll (same DispatcherTimer pattern as the step
+# queue's pollTimer). 3 s total: powershell start-up + send_to_maya's own
+# 1.5 s Maya timeout + its 300 ms drain.
+$script:prefixAsync = $null
+$script:prefixAsyncTimeoutMs = 3000
+$script:prefixAsyncTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:prefixAsyncTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+$script:prefixAsyncTimer.Add_Tick({ Update-PrefixFillAsync })
+
+function Start-PrefixFillAsync {
+    # First connect / launch fill WITHOUT freezing the window: starts the
+    # Maya query, shows the top bar, and lets $script:prefixAsyncTimer poll.
+    # Returns $true when a fetch was started. Never a second one at a time,
+    # never during a run, never for typed text (Get-PrefixAsyncStartDecision).
+    param([string]$Trigger = "")
+    try {
+        $d = Get-PrefixAsyncStartDecision -Busy ([bool]$script:prefixAsync) -RunActive ($script:currentProcess -ne $null) -CurrentText $prefixBox.Text -LastAutoFill $script:prefixLastAutoFill
+        if (-not $d.Start) { return $false }
+        Remove-Item (Get-SceneNameResultPath) -ErrorAction SilentlyContinue
+        $proc = Start-SceneNameProcess -TimeoutMs 1500
+        $script:prefixAsync = [PSCustomObject]@{ Process = $proc; Trigger = $Trigger; Watch = [System.Diagnostics.Stopwatch]::StartNew() }
+        Show-PrefixBusy
+        $script:prefixAsyncTimer.Start()
+        return $true
+    } catch {
+        Stop-PrefixFillAsync -Silent
+        Write-Log "Prefix ($Trigger): could not ask Maya for the scene name -- $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Stop-PrefixFillAsync {
+    # Ends the async fill on every path (done, time-out, discard, cancel):
+    # timer stopped, process killed if still running, bar hidden, state
+    # cleared. Never throws; never leaves the bar visible.
+    param([switch]$Silent, [string]$LogLine = "")
+    $state = $script:prefixAsync
+    $script:prefixAsync = $null
+    try { $script:prefixAsyncTimer.Stop() } catch {}
+    if ($state -and $state.Process) {
+        try { if (-not $state.Process.HasExited) { $state.Process.Kill() } } catch {}
+        try { $state.Process.Dispose() } catch {}
+    }
+    Hide-PrefixBusy
+    if ($LogLine -and -not $Silent) { Write-Log $LogLine }
+}
+
+function Update-PrefixFillAsync {
+    # The async fill's tick: wait / complete / timeout / discard
+    # (Get-PrefixAsyncPollDecision). Completion applies the SAME decision as
+    # the click path (Get-PrefixSceneApplyResult) to the box text as it is
+    # NOW, so text typed while Maya was answering is never touched.
+    $state = $script:prefixAsync
+    if (-not $state) { try { $script:prefixAsyncTimer.Stop() } catch {}; return }
+    try {
+        $when = if ($state.Trigger) { " ($($state.Trigger))" } else { "" }
+        $decision = Get-PrefixAsyncPollDecision -HasExited ([bool]$state.Process.HasExited) -ElapsedMs (Get-PrefixAsyncElapsedMs) -TimeoutMs $script:prefixAsyncTimeoutMs -RunActive ($script:currentProcess -ne $null)
+        switch ($decision) {
+            "wait" { return }
+            "discard" { Stop-PrefixFillAsync -Silent; return }
+            "timeout" {
+                Stop-PrefixFillAsync -LogLine "Prefix$when`: Maya did not answer within $([Math]::Round($script:prefixAsyncTimeoutMs / 1000.0, 1)) s -- the box is unchanged."
+                return
+            }
+        }
+        $resultPath = Get-SceneNameResultPath
+        $raw = ""
+        if (Test-Path -LiteralPath $resultPath) { $raw = [IO.File]::ReadAllText($resultPath, (New-Object System.Text.UTF8Encoding($false))) }
+        $scene = ConvertFrom-SceneNameOutput -Output $raw
+        $r = Get-PrefixSceneApplyResult -Scene $scene -CurrentText $prefixBox.Text -LastAutoFill $script:prefixLastAutoFill -Trigger $state.Trigger
+        $script:prefixLastAutoFill = $r.LastAutoFill
+        if ($r.Changed) { $prefixBox.Text = $r.Text }
+        Update-PrefixHint
+        Stop-PrefixFillAsync -LogLine $r.LogLine
+    } catch {
+        Stop-PrefixFillAsync -LogLine "Prefix: scene name lookup failed -- $($_.Exception.Message)"
+    }
+}
+
+function Update-PrefixHint {
+    # The overlay placeholder is shown only while the box is empty.
+    $prefixHint.Visibility = if ([string]::IsNullOrEmpty($prefixBox.Text)) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+}
+
+function Update-PrefixFromScene {
+    # Asks Maya for the scene name and applies Get-PrefixFillDecision.
+    # Returns ONE log line or $null; the caller writes it (Preview/Start
+    # Recording write it AFTER Start-Steps, which clears the log box).
+    # Typed text is never touched, so Maya is not even asked then (unless
+    # -FromButton). Never throws.
+    param([string]$Trigger = "", [switch]$FromButton, [int]$TimeoutMs = 1500)
+    try {
+        if (-not (Test-PrefixFillNeeded -CurrentText $prefixBox.Text -LastAutoFill $script:prefixLastAutoFill -FromButton ([bool]$FromButton))) { return $null }
+        # an async connect/launch fill still in flight is superseded (never
+        # two queries writing the same result file); no top bar here: this
+        # call blocks the UI thread, so the bar could not be drawn anyway
+        if ($script:prefixAsync) { Stop-PrefixFillAsync -Silent }
+        $scene = Get-MayaSceneName -TimeoutMs $TimeoutMs
+        $r = Get-PrefixSceneApplyResult -Scene $scene -CurrentText $prefixBox.Text -LastAutoFill $script:prefixLastAutoFill -FromButton ([bool]$FromButton) -Trigger $Trigger
+        $script:prefixLastAutoFill = $r.LastAutoFill
+        if ($r.Changed) { $prefixBox.Text = $r.Text }
+        Update-PrefixHint
+        if ($r.LogLine) { return $r.LogLine }
+        return $null
+    } catch {
+        return "Prefix: scene name lookup failed -- $($_.Exception.Message)"
+    }
+}
+
+function Get-RecordingNamePrefix {
+    # The prefix as the files will use it, read once per Start Recording.
+    return (Get-SafePrefix -Prefix $prefixBox.Text)
+}
+
+function Get-PrefixRunLogLine([string]$SafePrefix, [string]$Axis) {
+    if (-not $SafePrefix) { return "Prefix empty: the videos keep OBS's own names." }
+    $names = if ($Axis -eq "All") { "$SafePrefix`_front_back_HH_mm.<ext> and $SafePrefix`_left_right_HH_mm.<ext>" } elseif ($Axis -eq "FrontBack") { "$SafePrefix`_front_back_HH_mm.<ext>" } else { "$SafePrefix`_left_right_HH_mm.<ext>" }
+    return "Video names: $names (renamed after OBS stops; an existing file is never overwritten)."
 }
 
 function Update-CacheStatusIndicator {
@@ -3344,6 +3656,11 @@ function Set-ButtonsEnabled([bool]$enabled, $activeButton = $null) {
     $startFrameBox.IsEnabled = $enabled -and $startEndRadio.IsChecked
     $endFrameBox.IsEnabled = $enabled -and $startEndRadio.IsChecked
     $monitorComboBox.IsEnabled = $enabled
+    # T87: disabled during a run like every other input -- the prefix is
+    # read once at the Start Recording click, so an edit mid-run would be
+    # silently ignored; greying it out says so.
+    $prefixBox.IsEnabled = $enabled
+    $prefixFromSceneButton.IsEnabled = $enabled
 }
 
 function Set-ButtonRunningVisual($button, [bool]$running, [string]$runningLabel = "Stop") {
@@ -4278,7 +4595,9 @@ function Get-CaptureClickResult {
     # A problem preparing them never blocks the recording silently: the
     # run gets the plain steps, the log names the problem, the dot turns
     # amber (Get-CaptureStepsWithHooks).
-    $hookBuild = Get-CaptureStepsWithHooks -Axis $axis -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End -ToolVersion $script:ToolVersion
+    # T87: the Prefix box is read ONCE here, so both legs of "All" share it.
+    $namePrefix = Get-RecordingNamePrefix
+    $hookBuild = Get-CaptureStepsWithHooks -Axis $axis -ScriptDir $ScriptDir -StartFrame $range.Start -EndFrame $range.End -ToolVersion $script:ToolVersion -NamePrefix $namePrefix
     $script:hookBuildError = $hookBuild.Error
     Update-HookStatusIndicator
     $hookLog = @($hookBuild.Log)
@@ -4290,7 +4609,7 @@ function Get-CaptureClickResult {
     # OFF clipping estimate -- its click-time prompt needs the exact
     # resolved range, not just the Start, and must not pay for a second
     # Get-ResolvedTimeRange round trip to get it.
-    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start; ResolvedEnd = $range.End; HookLog = $hookLog }
+    return [PSCustomObject]@{ Steps = $steps; ErrorMessage = $null; ResolvedStart = $range.Start; ResolvedEnd = $range.End; HookLog = $hookLog; NamePrefix = $namePrefix; Axis = $axis }
 }
 
 $previewButton.Add_Click({
@@ -4299,6 +4618,11 @@ $previewButton.Add_Click({
     # button while something runs; only Start Recording's own run makes
     # PreviewButton clickable-but-inert-while-disabled the normal way.
     $axis = if ($allAxisRadio.IsChecked) { "All" } elseif ($frontBackRadio.IsChecked) { "FrontBack" } else { "LeftRight" }
+    # T87: fill the Prefix box from the scene first (only when empty or
+    # still auto-filled; Preview has no requirements gate, so only when the
+    # port answers). Logged after Start-Steps, which clears the log box.
+    $prefixLogMessage = $null
+    if (Test-MayaPortReachable) { $prefixLogMessage = Update-PrefixFromScene -Trigger "Preview" }
     # With All selected Preview shows the FIRST leg (Front/Back) only (user
     # decision 2026-09-24, option b) -- the two panel sets cannot coexist
     # (each panel script closes all four claude_view_* windows), so a
@@ -4339,6 +4663,7 @@ $previewButton.Add_Click({
     Start-Steps $steps
     if ($recenterLogMessage) { Write-Log $recenterLogMessage }
     if ($previewAxisNote) { Write-Log $previewAxisNote }
+    if ($prefixLogMessage) { Write-Log $prefixLogMessage }
 })
 
 $startRecordingButton.Add_Click({
@@ -4365,6 +4690,10 @@ $startRecordingButton.Add_Click({
         Show-DarkNotice -Title "Cannot Start Recording" -Message ("Fix the following before starting a recording:`n`n" + ($requirementFailures -join "`n`n"))
         return
     }
+    # T87: after the requirements gate (Maya answers), before any step is
+    # built: fill the Prefix box from the scene when allowed. Logged after
+    # Start-Steps (it clears the log box).
+    $prefixLogMessage = Update-PrefixFromScene -Trigger "Start Recording"
     # Frame-gate warning (2026-09-08): a SOFT gate, unlike the hard-block
     # checks above -- amber alone never blocks (matches Preview's glow-only
     # treatment), only the zero-tolerance floor does, and only with an
@@ -4451,7 +4780,21 @@ $startRecordingButton.Add_Click({
     if ($recenterLogMessage) { Write-Log $recenterLogMessage }
     if ($frameGateLogMessage) { Write-Log $frameGateLogMessage }
     foreach ($hookLine in @($result.HookLog)) { if ($hookLine) { Write-Log $hookLine } }
+    if ($prefixLogMessage) { Write-Log $prefixLogMessage }
+    Write-Log (Get-PrefixRunLogLine -SafePrefix $result.NamePrefix -Axis $result.Axis)
 })
+
+# T87: the 'use the Maya scene name' button -- the only thing allowed to
+# replace typed text.
+$prefixFromSceneButton.Add_Click({
+    if (-not (Test-MayaPortReachable)) {
+        Write-Log "Prefix: Maya is not connected -- open the command port first (Settings, Maya connection)."
+        return
+    }
+    $line = Update-PrefixFromScene -FromButton
+    if ($line) { Write-Log $line }
+})
+$prefixBox.Add_TextChanged({ Update-PrefixHint })
 
 $resetButton.Add_Click({
     # No toggle -- same reasoning as Preview, a fast one-shot step.
@@ -4698,6 +5041,21 @@ function Write-StartupSummary([bool]$MayaReachable) {
 }
 
 $script:mayaReachableAtStartup = Update-PortStatusIndicator
+# T87: the first-connect fill compares against this (Invoke-PortCheckTick);
+# the launch itself is handled once, after the window is first drawn
+# (ContentRendered never fires for the -NoShow test harness, so tests never
+# send anything to Maya from here).
+$script:lastPortReachable = $script:mayaReachableAtStartup
+$script:prefixLastAutoFill = ""
+$script:prefixLaunchFillDone = $false
+$window.Add_ContentRendered({
+    if ($script:prefixLaunchFillDone) { return }
+    $script:prefixLaunchFillDone = $true
+    if ($script:mayaReachableAtStartup -and $script:currentProcess -eq $null) {
+        Start-PrefixFillAsync -Trigger "Maya already open" | Out-Null
+    }
+})
+Update-PrefixHint
 $script:portCheckTimer.Start()
 Update-ObsPasswordStatusIndicator
 # T97: create user_hooks\ and any missing pre/post script from the shipped
