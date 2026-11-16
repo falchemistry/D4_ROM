@@ -25,9 +25,9 @@ Exits 0 if all checks pass, 1 otherwise. Takes a few seconds.
 Method: each keyer source is compiled with a file name inside a temporary
 directory, so its own `CACHE_DIR = <script dir>/../../d4_anim_sample` resolves
 to a temp d4_anim_sample holding SYNTHETIC cache + state files (nothing from
-the repo's d4_anim_sample or the user's files is read). The one hard-coded
-debug-file write at the end of each keyer is repointed to the temp dir, so no
-repo or user file is written. The live subject equals the cached subject
+the repo's d4_anim_sample or the user's files is read). If a keyer still
+has the old hard-coded debug-file write at its end (removed in T136), it is
+repointed to the temp dir, so no repo or user file is written. The live subject equals the cached subject
 (scale 1). Oracle: the independent visible-space walk (tracks the left edge of
 the frame the artist sees; first key = subject centre - Offset*world_per_px).
 """
@@ -222,9 +222,12 @@ def run_module(scene, lr, off_px, zoom=0.0, tolpct=None, start=None, gate=True, 
         path = os.path.join(_SCRIPTS, os.path.basename(LR_PATH if lr else FB_PATH))
         with open(LR_PATH if lr else FB_PATH, encoding="utf-8") as f:
             src = f.read()
-        assert _DEBUG_RE.search(src), "debug-file write line not found in %s (test needs updating)" % path
-        debug_repl = "open(%r, 'w')" % _DEBUG_OUT.replace(chr(92), "/")
-        src = _DEBUG_RE.sub(lambda m: debug_repl, src)
+        # T136/R3: the keyers no longer write a debug file. Older trees that
+        # still do get that write repointed to the temp dir; on the current
+        # tree a leftover hard-coded D:\ debug path would be a regression.
+        if _DEBUG_RE.search(src):
+            debug_repl = "open(%r, 'w')" % _DEBUG_OUT.replace(chr(92), "/")
+            src = _DEBUG_RE.sub(lambda m: debug_repl, src)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             exec(compile(src, path, "exec"), {"__name__": "key_from_cache_under_test"})

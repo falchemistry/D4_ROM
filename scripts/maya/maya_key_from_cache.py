@@ -687,6 +687,4 @@ finally:
     cmds.refresh(suspend=False)
 elapsed = time.time() - _t0
 print('Elapsed: %.2f sec' % elapsed)
-with open(r'D:\__backup\claude\maya_debug.txt', 'w') as f:
-    f.write('elapsed_sec=%.2f threshold_pct=%s scales=%s' % (elapsed, THRESHOLD_PCT, scale_cache))
 print('KEY_FROM_CACHE_OK')

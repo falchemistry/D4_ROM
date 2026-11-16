@@ -195,6 +195,89 @@ function Get-SourceAvgBrightness($ws, $sourceName) {
     }
 }
 
+# --- OBS exe lookup (T136 / R7) -----------------------------------------
+# Finds obs64.exe instead of assuming C:\Program Files\obs-studio. Order:
+# 1) a RUNNING obs64 process (that is the OBS the user actually uses),
+# 2) the install folder OBS's installer writes to the registry,
+# 3) the default install locations,
+# 4) an optional "exe: <full path to obs64.exe>" line in obs_config.txt
+#    (for a portable/unusual install; the file is git-ignored, so the real
+#    value is never shipped).
+# Returns Path (or $null), Source, and Tried (every location checked, in
+# order, for the "OBS not found at ..." message). The three -Running/
+# -Registry/-Default parameters exist so a test can inject fake inputs; real
+# callers pass only -ConfigText. Duplicated in maya_obs_capture.ps1 and
+# obs_monitor.ps1 on purpose (standalone scripts, no cross-file imports) --
+# tests\test_t136_dist_ready.ps1 checks the two copies stay identical.
+function Find-ObsExe {
+    param(
+        [string]$ConfigText = "",
+        [string[]]$RunningPaths = $null,
+        [string[]]$RegistryDirs = $null,
+        [string[]]$DefaultPaths = $null,
+        [string[]]$RegistryKeys = @("HKLM:\SOFTWARE\OBS Studio", "HKLM:\SOFTWARE\WOW6432Node\OBS Studio", "HKCU:\SOFTWARE\OBS Studio")
+    )
+    # Every candidate is handled on its own: a stale registry value (missing
+    # drive, quotes, illegal characters) or an unreadable process must move on
+    # to the next location, never abort the lookup (T136 fix round).
+    if ($null -eq $RunningPaths) {
+        $RunningPaths = @()
+        foreach ($proc in @(Get-Process -Name "obs64" -ErrorAction SilentlyContinue)) {
+            try { $RunningPaths += [string]$proc.Path } catch { }
+        }
+    }
+    if ($null -eq $RegistryDirs) {
+        $RegistryDirs = @()
+        foreach ($key in $RegistryKeys) {
+            try { $RegistryDirs += [string](Get-ItemProperty -LiteralPath $key -ErrorAction Stop).'(default)' } catch { }
+        }
+    }
+    if ($null -eq $DefaultPaths) {
+        $DefaultPaths = @("C:\Program Files\obs-studio\bin\64bit\obs64.exe")
+        foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+            if ($base) { $DefaultPaths += ($base.TrimEnd('\') + "\obs-studio\bin\64bit\obs64.exe") }
+        }
+    }
+    $candidates = @()
+    foreach ($p in $RunningPaths) {
+        try { if ($p) { $candidates += [PSCustomObject]@{ Source = "running process"; Path = $p } } } catch { }
+    }
+    foreach ($d in $RegistryDirs) {
+        try {
+            $dir = ([string]$d).Trim().Trim('"').TrimEnd('\')
+            if ($dir) { $candidates += [PSCustomObject]@{ Source = "registry"; Path = ($dir + "\bin\64bit\obs64.exe") } }
+        } catch { }
+    }
+    foreach ($p in $DefaultPaths) {
+        try { if ($p) { $candidates += [PSCustomObject]@{ Source = "default location"; Path = $p } } } catch { }
+    }
+    try {
+        $exeLine = [regex]::Match($ConfigText, '(?m)^[ \t]*exe:[ \t]*(.+?)[ \t\r]*$')
+        if ($exeLine.Success) {
+            $configured = $exeLine.Groups[1].Value.Trim().Trim('"')
+            if ($configured) { $candidates += [PSCustomObject]@{ Source = "exe: line in obs_config.txt"; Path = $configured } }
+        }
+    } catch { }
+    $tried = @()
+    foreach ($c in $candidates) {
+        if ($tried -notcontains $c.Path) { $tried += $c.Path }
+        $isFile = $false
+        try { $isFile = Test-Path -LiteralPath $c.Path -PathType Leaf } catch { $isFile = $false }
+        if ($isFile) {
+            return [PSCustomObject]@{ Path = $c.Path; Source = $c.Source; Tried = $tried }
+        }
+    }
+    return [PSCustomObject]@{ Path = $null; Source = ""; Tried = $tried }
+}
+
+function Get-ObsNotFoundMessage($Tried) {
+    $list = @($Tried)
+    $first = if ($list.Count) { $list[0] } else { "(no location to try)" }
+    $msg = "OBS not found at $first"
+    if ($list.Count -gt 1) { $msg += " (also tried: " + (($list | Select-Object -Skip 1) -join "; ") + ")" }
+    return $msg + ". Install OBS Studio, or add a line 'exe: <full path to obs64.exe>' to scripts\obs_config.txt."
+}
+
 try {
     $configPath = Join-Path $ScriptDir "obs_config.txt"
     $configText = Get-Content $configPath -Raw
@@ -207,10 +290,13 @@ try {
         # Ensure-ObsRunning -- duplicated, not shared, matching this
         # project's established convention (see this file's own header
         # comment). Bounded at 60s, same as that copy.
-        $obsExe = "C:\Program Files\obs-studio\bin\64bit\obs64.exe"
         $running = Get-Process -Name "obs64" -ErrorAction SilentlyContinue
         if (-not $running) {
-            Start-Process -FilePath $obsExe -WorkingDirectory (Split-Path $obsExe)
+            $found = Find-ObsExe -ConfigText $configText
+            if (-not $found.Path) {
+                throw (Get-ObsNotFoundMessage $found.Tried)
+            }
+            Start-Process -FilePath $found.Path -WorkingDirectory (Split-Path $found.Path)
         }
         $waited = 0
         while (-not (Test-ObsPortReachable -ObsHost $host_ -Port $port)) {

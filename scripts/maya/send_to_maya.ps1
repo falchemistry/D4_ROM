@@ -31,15 +31,30 @@ param(
     [int]$TimeoutMs = 1200000
 )
 
+function ConvertTo-PyPathLiteral {
+    # A Python expression for a path, safe inside the one-line payload: a
+    # readable raw string normally; with an apostrophe (which would end a
+    # raw string, and cannot be backslash-escaped in one: Python keeps the
+    # backslash, so C:\tools\John's\x.py became C:\tools\John\'s\x.py,
+    # T136/R8) the UTF-8 bytes are hex-encoded -- bytearray.fromhex works
+    # in Python 2 and 3 and needs no quotes but its own single ones. Same
+    # helper as rom_launcher_logic.ps1's (this script stays standalone, like
+    # the rest of this project's small scripts, so it carries its own copy).
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not $Path.Contains("'")) { return "r'$Path'" }
+    $hex = -join ([Text.Encoding]::UTF8.GetBytes($Path) | ForEach-Object { $_.ToString("x2") })
+    return "bytearray.fromhex('$hex').decode('utf-8')"
+}
+
 if (-not $Code -and -not $ScriptPath) {
     Write-Error "Provide -ScriptPath <file.py> or -Code '<python code>'"
     exit 1
 }
 
 if ($ScriptPath) {
-    $resolvedPath = (Resolve-Path $ScriptPath).Path
-    $escapedPath = $resolvedPath.Replace("'", "\'")
-    $source = "exec(compile(open(r'$escapedPath').read(), r'$escapedPath', 'exec'), {})"
+    $resolvedPath = (Resolve-Path -LiteralPath $ScriptPath).Path
+    $pyPath = ConvertTo-PyPathLiteral $resolvedPath
+    $source = "exec(compile(open($pyPath).read(), $pyPath, 'exec'), {})"
 } else {
     $source = $Code
 }

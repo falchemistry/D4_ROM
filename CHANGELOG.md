@@ -1,3 +1,7 @@
+## 1.2.1 - 2026-11-16
+
+- Fixed: dist-ready quick fixes (T136): the two keyer scripts no longer write a debug file outside the tool folder; send_to_maya handles install paths with an apostrophe or brackets; OBS is found from the running process, the registry, the default folders or obs_config.txt and a missing OBS is named in a clear message; build_dist refuses an unsafe output folder. Added tests for each.
+
 ## 1.2.0 - 2026-10-26
 
 - Added: ROM video prefix box (last row of Settings, with a 'use scene name' button) filled from the Maya scene name on Preview, Start Recording, first connect and launch; never overwrites text you typed, follows a scene change while you have not edited it.

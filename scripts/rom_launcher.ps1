@@ -28,7 +28,7 @@ $ScriptDir = $PSScriptRoot
 # count) -- shown in the window title so a user/screenshot/bug report can
 # say which build they're on, and so a stale d4_rom_dist copy is
 # distinguishable from the current source at a glance.
-$script:ToolVersion = "1.2.0"
+$script:ToolVersion = "1.2.1"
 
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"

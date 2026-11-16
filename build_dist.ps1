@@ -32,6 +32,77 @@ param(
     [string]$DistDir = (Join-Path (Split-Path $PSScriptRoot -Parent) "d4_rom_dist")
 )
 
+function Get-DistDirProblem {
+    # Returns "" when $DistDir is safe to wipe and rebuild, else one sentence
+    # saying why not. Refused: the tool root, a parent folder of it, anything
+    # inside it, AND (T136 fix round) anything that IS a tool copy under another
+    # name -- a UNC admin-share alias (\localhost\C$\...), a mapped/subst drive,
+    # a junction or symlink -- found by the dev-only files a dist never holds
+    # (build_dist.ps1, build_exe.ps1, the tests\ and exe_src\ folders), in the
+    # folder itself, in any of its parents, or in a folder directly inside it.
+    # ROM_Launcher.exe is NOT a marker: the dist ships it, and rebuilding over a
+    # previous dist must keep working. Any error here stops the build (fail closed).
+    param([string]$DistDir, [string]$ToolRoot)
+    $cmp = [StringComparison]::OrdinalIgnoreCase
+    # A drive or share root ('C:\', 'C:', 'd:/', '\\server\share\', '\\localhost\C$\')
+    # is refused from the text as typed, before any path is resolved: a bare 'C:'
+    # means "the current folder of drive C", so resolving first would hide it.
+    $typed = (([string]$DistDir).Trim().Trim('"')) -replace '/', '\'
+    if ($typed -match '^[A-Za-z]:\\*$' -or $typed -match '^\\\\[^\\]+\\[^\\]+\\*$') {
+        return "it is a drive or share root ($DistDir)"
+    }
+    $root = ConvertTo-DistFullPath $ToolRoot
+    $rootLeaf = [IO.Path]::GetFileName($root)
+    $candidates = @(ConvertTo-DistFullPath $DistDir)
+    # a junction/symlink: judge where it points as well as its own name
+    try {
+        $item = Get-Item -LiteralPath $candidates[0] -Force -ErrorAction Stop
+        if ($item.LinkType -and $item.Target) { foreach ($t in @($item.Target)) { $candidates += (ConvertTo-DistFullPath $t) } }
+    } catch { }
+    foreach ($dist in $candidates) {
+        # a root reached another way (a ..\ segment, a junction target, an admin-share alias)
+        if ($dist -match '^[A-Za-z]:$' -or $dist -match '^\\\\[^\\]+\\[^\\]+$' -or $dist -eq "") { return "it is a drive or share root ($dist\)" }
+        if ($dist.Equals($root, $cmp)) { return "it is the tool folder itself ($root)" }
+        if ($root.StartsWith($dist + "\", $cmp)) { return "it contains the tool folder ($root), so rebuilding would delete the tool" }
+        if ($dist.StartsWith($root + "\", $cmp)) { return "it is inside the tool folder ($root), so rebuilding would delete part of the tool" }
+        $dir = $dist
+        while ($dir) {
+            $hit = Get-DistToolMarker $dir
+            if ($hit) { return "it is, or sits inside, a copy of the tool folder ($hit found in $dir), so rebuilding would delete tool files" }
+            $dir = [IO.Path]::GetDirectoryName($dir)
+        }
+        if (Test-Path -LiteralPath $dist -PathType Container) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $dist -Directory -Force -ErrorAction SilentlyContinue)) {
+                $hit = Get-DistToolMarker $child.FullName
+                if ($hit) { return "it contains a copy of the tool folder ($($child.FullName): $hit), so rebuilding would delete the tool" }
+            }
+        }
+    }
+    return ""
+}
+
+function ConvertTo-DistFullPath([string]$Path) {
+    # Full path, no trailing backslash, and a local admin-share UNC alias
+    # (\localhost\C$\x, \127.0.0.1\C$\x, \<this PC>\C$\x) turned back into C:\x
+    $full = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+    $me = [regex]::Escape($env:COMPUTERNAME)
+    $m = [regex]::Match($full, '^\\\\(localhost|127\.0\.0\.1|\[::1\]|' + $me + '(\.[^\\]*)?)\\([A-Za-z])\$(\\.*)?$', 'IgnoreCase')
+    if ($m.Success) { $full = $m.Groups[3].Value.ToUpper() + ":" + $m.Groups[4].Value }
+    return $full.TrimEnd('\')
+}
+
+function Get-DistToolMarker([string]$Dir) {
+    # Name of the first dev-only item found directly in $Dir, else ""
+    $base = $Dir.TrimEnd('\') + "\"
+    foreach ($f in @("build_dist.ps1", "build_exe.ps1")) {
+        if (Test-Path -LiteralPath ($base + $f) -PathType Leaf) { return $f }
+    }
+    foreach ($d in @("tests", "exe_src")) {
+        if (Test-Path -LiteralPath ($base + $d) -PathType Container) { return "$d\" }
+    }
+    return ""
+}
+
 # $ErrorActionPreference = "Stop" + the try/catch below: a build that only
 # HALF-completes (e.g. ROM_Launcher.exe skipped because a running instance
 # still had it locked) previously continued past that with default
@@ -43,6 +114,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 try {
+    # T136 (R14): the next steps run Remove-Item -Recurse -Force on whatever
+    # -DistDir names. Refuse a folder that is the tool itself, one of its
+    # parents (it would wipe the tool with it) or anything inside it, BEFORE
+    # anything is deleted. Paths are compared as full paths, case-insensitive
+    # and ignoring a trailing backslash (a relative -DistDir is resolved
+    # against the current folder), local UNC admin-share aliases are mapped
+    # back to the drive path, and any folder holding the tool's own dev-only
+    # files is refused whatever its name (see Get-DistDirProblem).
+    $distProblem = Get-DistDirProblem -DistDir $DistDir -ToolRoot $PSScriptRoot
+    if ($distProblem) {
+        throw "refusing to build into -DistDir '$DistDir': $distProblem. Nothing was deleted. Pick a separate, empty or previous-dist folder (the default is the sibling d4_rom_dist)."
+    }
     # A user's own pre/post scripts (T97) are never deleted by a rebuild:
     # if this dist folder holds them, refuse instead of wiping it.
     if (Test-Path -LiteralPath (Join-Path $DistDir "user_hooks")) {
